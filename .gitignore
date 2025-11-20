@@ -179,3 +179,12 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# --- Project Specific Additions ---
+# Data files (often too large for Git)
+*.csv
+*.txt
+
+# PyTorch Model Weights
+*.pt
+*.pth
