@@ -375,6 +375,32 @@ Execution
             inspect per-RUL-bin metrics,
 
             visualize worst engines & correlations.
+    
+## 🧪 Additional Experiment: LSTM with Temporal Attention
+
+As an extension to the baseline LSTM, an **attention mechanism over the time dimension** was tested:
+
+- Architecture: same input features and training setup as the final model,  
+  but with an LSTM followed by a **simple additive attention layer** over all time steps.
+- Goal: allow the model to focus on the most informative parts of the 30-cycle history instead of only using the last hidden state.
+
+### Results
+
+On FD001, this **attention-based model (V3)** did **not** outperform the baseline LSTM (V2):
+
+| Version | Model                 | Global RMSE (cycles) | MAE (cycles) | Bias (pred–true) | NASA PHM08 Score |
+|--------|------------------------|----------------------:|-------------:|-----------------:|-----------------:|
+| V2     | LSTM (no attention)    | ~13.4                 | ~9.5         | +2.1             | ~359             |
+| V3     | LSTM + time attention  | ~15.4                 | ~10.7        | +3.8             | ~560             |
+
+Observations:
+
+- The attention model showed **higher RMSE and MAE** and a **larger positive bias** (more optimistic predictions).
+- The **NASA PHM08 score increased significantly**, indicating a higher penalty, especially for late (over-optimistic) predictions.
+- Outlier units (engines with the largest per-unit RMSE) were **not improved**, and in some cases became worse.
+
+**Conclusion:**  
+In this configuration, the added attention did not provide a benefit and even slightly degraded performance and practical risk metrics. For this reason, the repository uses the **plain LSTM with physics-informed features and asymmetric RUL-weighted loss (V2)** as the **final reference model**, while the attention-based variant remains included as an optional experimental architecture.
 
 🔭 Future Work
 
@@ -392,7 +418,7 @@ This project is part of a broader “Mechanical Engineer Assistant” vision and
 
         Risk-aware decision-making based on confidence levels.
 
-    NASA Scoring Metric
+    NASA Scoring Metric (done)
 
         Implement the official asymmetric NASA RUL score
         (heavier penalties for late predictions) to evaluate practical risk.
