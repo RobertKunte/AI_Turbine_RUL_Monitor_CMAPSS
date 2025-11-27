@@ -27,12 +27,16 @@ from .config import (
     NUM_LAYERS,
     OUTPUT_SIZE,
     LEARNING_RATE,
-    NUM_EPOCHS
+    NUM_EPOCHS,
+    GLOBAL_FEATURE_COLS,
+    GLOBAL_DROP_COLS 
 )
-from .data_loading import load_cmapps_subset, get_feature_drop_cols
+from .data_loading import load_cmapps_subset, get_feature_drop_cols, load_cmapps_global
 from .additional_features import create_physical_features
 from .model import LSTMRULPredictor
 from .loss import rul_asymmetric_weighted_loss
+from src.uncertainty import mc_dropout_predict
+from .models.lstm_rul_mcdo import LSTMRULPredictorMCDropout
 
 # -------------------------------------------------------------------
 # Helper: NASA PHM08 scoring function
@@ -69,69 +73,72 @@ def nasa_phm08_score(y_true, y_pred):
 # -------------------------------------------------------------------
 # Helper: Sequence building
 # -------------------------------------------------------------------
-def build_sequences_from_df(df, feature_cols, sequence_length):
+
+def build_sequences_from_df(
+    df: pd.DataFrame,
+    feature_cols,
+    sequence_length: int,
+    group_cols=("UnitNumber",),
+):
     """
-    Build sliding window sequences for training from a unit-wise DataFrame.
+    Build sliding-window sequences from a DataFrame.
 
-    Args:
-        df (pd.DataFrame): must contain columns 'UnitNumber', 'TimeInCycles', 'RUL' and feature_cols
-        feature_cols (list of str): columns to be used as model input features
-        sequence_length (int): length of the sequence (e.g. 30)
-
-    Returns:
-        X (np.ndarray): shape (N, sequence_length, F)
-        y (np.ndarray): shape (N,)
+    group_cols: tuple of columns to group by, e.g. ("FD_ID", "UnitNumber")
     """
     X_list, y_list = [], []
 
-    for unit_id, df_unit in df.groupby("UnitNumber"):
+    for _, df_unit in df.groupby(list(group_cols)):
         df_unit_sorted = df_unit.sort_values("TimeInCycles")
         feat = df_unit_sorted[feature_cols].values
         rul = df_unit_sorted["RUL"].values
 
-        if len(feat) >= sequence_length:
-            for i in range(len(feat) - sequence_length + 1):
-                X_list.append(feat[i : i + sequence_length])
-                y_list.append(rul[i + sequence_length - 1])
+        if len(df_unit_sorted) < sequence_length:
+            continue
 
-    X = np.array(X_list)
-    y = np.array(y_list)
+        for i in range(len(df_unit_sorted) - sequence_length + 1):
+            X_list.append(feat[i:i + sequence_length])
+            y_list.append(rul[i + sequence_length - 1])
 
+    X = np.array(X_list, dtype=np.float32)
+    y = np.array(y_list, dtype=np.float32).reshape(-1, 1)
     return X, y
 
 
-def build_last_sequences_from_df(df, feature_cols, sequence_length):
+def build_last_sequences_from_df(
+    df: pd.DataFrame,
+    feature_cols,
+    sequence_length: int,
+    group_cols=("UnitNumber",),
+):
     """
-    Build one sequence per unit: the last sequence_length time steps.
-    For units shorter than sequence_length, pad at the beginning
-    by repeating the first row.
+    Build only the LAST sequence per unit (for final RUL prediction).
 
-    Returns:
-        X (np.ndarray): shape (n_units, sequence_length, F)
-        unit_ids (list): list of UnitNumbers
+    - Ensures *every* unit produces exactly one sequence.
+    - If a unit has fewer than `sequence_length` rows, we pad at the *beginning*
+      by repeating the first row (healthy state assumption).
     """
-    X_list, unit_ids = [], []
+    X_list = []
+    unit_keys = []
 
-    for unit_id, df_unit in df.groupby("UnitNumber"):
+    for key, df_unit in df.groupby(list(group_cols)):
         df_unit_sorted = df_unit.sort_values("TimeInCycles")
-        feat = df_unit_sorted[feature_cols].values
-        n = len(feat)
+        feat = df_unit_sorted[feature_cols].values  # shape: (T, F)
 
-        if n >= sequence_length:
-            seq = feat[-sequence_length:]
+        T = feat.shape[0]
+        if T < sequence_length:
+            pad_len = sequence_length - T
+            # Repeat the first row (early, healthy state) pad_len times
+            pad = np.repeat(feat[:1, :], pad_len, axis=0)
+            feat_padded = np.vstack([pad, feat])
         else:
-            pad_len = sequence_length - n
-            # repeat the first row pad_len times at the beginning
-            pad_block = np.repeat(feat[0:1, :], pad_len, axis=0)
-            seq = np.vstack([pad_block, feat])
+            feat_padded = feat
 
-        X_list.append(seq)
-        unit_ids.append(unit_id)
+        # Take the last `sequence_length` rows
+        X_list.append(feat_padded[-sequence_length:])
+        unit_keys.append(key)
 
-    X = np.array(X_list)
-    return X, unit_ids
-
-
+    X = np.array(X_list, dtype=np.float32)
+    return X, unit_keys
 
 # -------------------------------------------------------------------
 # Helper: Train / Val loop
@@ -250,9 +257,10 @@ def train_and_evaluate_fd(
     loss_fn,
     num_epochs=NUM_EPOCHS,
     max_rul=MAX_RUL,
-    results_root="results",
+    results_root="../results",
     batch_size=64,
     random_seed=42,
+    use_condition_id: bool = False,
 ):
     """
     Train a local RUL model for a given C-MAPSS subset (FD001–FD004)
@@ -298,8 +306,26 @@ def train_and_evaluate_fd(
     df_train_feat = df_train_phys.drop(columns=drop_cols, errors="ignore")
     df_test_feat = df_test_phys.drop(columns=drop_cols, errors="ignore")
 
-    non_feature_cols = ["UnitNumber", "RUL", "TimeInCycles"]
-    feature_cols = [c for c in df_train_feat.columns if c not in non_feature_cols]
+    base_cols = df_train_feat.columns.tolist()
+    if use_condition_id:
+        # ConditionID-Ansatz:
+        # - Settings raus
+        # - ConditionID bleibt als Feature drin
+        exclude = ["UnitNumber", "TimeInCycles", "RUL", "MaxTime",
+                   "Setting1", "Setting2", "Setting3"]
+        feature_cols = [c for c in base_cols if c not in exclude]
+        print(f"[{fd_id}] Using CONDITION-ID feature set")
+    else:
+        # Physikalischer Ansatz:
+        # - Settings drin
+        # - ConditionID nur für Logging/Analyse, NICHT als Feature
+        exclude = ["UnitNumber", "TimeInCycles", "RUL", "MaxTime",
+                   "ConditionID"]
+        feature_cols = [c for c in base_cols if c not in exclude]
+        print(f"[{fd_id}] Using PHYSICAL (continuous settings) feature set")
+    if use_condition_id and fd_id in ["FD001", "FD003"]:
+        print(f"[WARN] use_condition_id=True for {fd_id}, but this is a single-condition dataset.")
+        print("       ConditionID will be constant 0 and adds no information.")
 
     print("Feature columns used for training:")
     print(feature_cols)
@@ -405,4 +431,177 @@ def train_and_evaluate_fd(
     torch.save(model.state_dict(), model_path)
     print(f"[{fd_id}] Saved model weights to: {model_path}")
 
-    return results_df, metrics
+    # 13) Alles Wichtige in einem Dict bündeln
+    results = {
+        "fd_id": fd_id,
+        "results_df": results_df,      # das alte DataFrame
+        "model": model,                # trainiertes PyTorch-Modell
+        "scaler": scaler,              # MinMaxScaler der Features
+        "feature_cols": feature_cols,  # Feature-Spalten, die ins Modell gehen
+        "y_test_true": y_test_true,    # True RUL für Test
+        "y_test_pred": y_test_pred,    # Predicted RUL für Test
+    }
+
+    return results, metrics
+
+
+def train_and_evaluate_global(
+    fd_ids=("FD001", "FD002", "FD003", "FD004"),
+    model_class=LSTMRULPredictor,
+    loss_fn=rul_asymmetric_weighted_loss,
+    num_epochs=NUM_EPOCHS,
+    batch_size=64,
+    results_root="../results/global",
+    use_mc_dropout: bool = False,
+    n_mc_samples: int = 50,
+):
+    import os
+    os.makedirs(results_root, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1) Load all subsets
+    df_train_raw, test_dfs_raw, test_ruls = load_cmapps_global(
+        fd_ids=fd_ids, max_rul=MAX_RUL
+    )
+
+    # 2) Add physics features
+    df_train_phys = create_physical_features(df_train_raw.copy())
+    test_dfs_phys = {
+        fd: create_physical_features(df.copy())
+        for fd, df in test_dfs_raw.items()
+    }
+
+    # 3) Drop unused columns (global)
+    df_train_feat = df_train_phys.drop(columns=GLOBAL_DROP_COLS, errors="ignore")
+    test_dfs_feat = {
+        fd: df.drop(columns=GLOBAL_DROP_COLS, errors="ignore")
+        for fd, df in test_dfs_phys.items()
+    }
+
+    # 4) Scale features globally
+    feature_cols = GLOBAL_FEATURE_COLS
+    scaler = MinMaxScaler()
+    df_train_feat[feature_cols] = scaler.fit_transform(df_train_feat[feature_cols])
+
+    for fd, df in test_dfs_feat.items():
+        df[feature_cols] = scaler.transform(df[feature_cols])
+
+    # 5) Build global training sequences
+    X_train, y_train = build_sequences_from_df(
+        df_train_feat, feature_cols,
+        sequence_length=SEQUENCE_LENGTH,
+        group_cols=("FD_ID", "UnitNumber")
+    )
+
+    # convert to tensors + DataLoader
+    train_dataset = torch.utils.data.TensorDataset(
+        torch.tensor(X_train), torch.tensor(y_train)
+    )
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True
+    )
+
+    # 6) Init model
+    input_size = X_train.shape[2]
+    model = model_class(
+        input_size=input_size,
+        hidden_size=HIDDEN_SIZE,
+        num_layers=NUM_LAYERS,
+        output_size=1,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    # 7) Training loop (nur Train, Val optional global)
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            optimizer.zero_grad()
+            preds = model(xb)
+            loss = loss_fn(preds, yb)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * xb.size(0)
+
+        epoch_loss = running_loss / len(train_dataset)
+        print(f"[GLOBAL] Epoch [{epoch+1}/{num_epochs}] - Train: {epoch_loss:.4f}")
+
+    print("Global training completed.")
+
+    # 8) Evaluation per FD subset
+    all_true = []
+    all_pred = []
+    all_fd = []
+
+    model.eval()  # Grundzustand (MC-Dropout schalten wir in uncertainty.py)
+    for fd_idx, fd_id in enumerate(fd_ids):
+        df_test_fd = test_dfs_feat[fd_id]
+        y_true_fd = test_ruls[fd_id]
+
+        X_test_fd, unit_keys = build_last_sequences_from_df(
+            df_test_fd, feature_cols,
+            sequence_length=SEQUENCE_LENGTH,
+            group_cols=("FD_ID", "UnitNumber")
+        )
+
+        X_test_tensor = torch.tensor(X_test_fd)
+
+        # --- MC-Dropout oder normale Vorhersage ---
+        if use_mc_dropout:
+            y_mean_fd, y_std_fd = mc_dropout_predict(
+                model,
+                X_test_tensor,
+                n_samples=n_mc_samples,
+                device=device,
+                max_rul=MAX_RUL,
+            )
+            y_pred_fd = y_mean_fd
+        else:
+            with torch.no_grad():
+                y_pred_fd = model(X_test_tensor.to(device)) \
+                    .cpu().numpy().reshape(-1)
+            y_pred_fd = np.minimum(y_pred_fd, MAX_RUL)
+
+        # Truth ebenfalls clampen
+        y_true_fd = np.minimum(y_true_fd, MAX_RUL)
+
+        # Metrics pro FD
+        metrics_fd = compute_basic_metrics(y_true_fd, y_pred_fd)
+        print(f"[GLOBAL] Metrics for {fd_id}: {metrics_fd}")
+
+        # sammeln für globale Metrik
+        all_true.append(y_true_fd)
+        all_pred.append(y_pred_fd)
+        all_fd.extend([fd_id] * len(y_true_fd))
+
+        # CSV pro FD (inkl. Unsicherheit, falls vorhanden)
+        out_data = {
+            "FD": fd_id,
+            "UnitIndex": np.arange(len(y_true_fd)),
+            "TrueRUL": y_true_fd,
+            "PredRUL_mean": y_pred_fd,
+        }
+        if use_mc_dropout:
+            out_data["PredRUL_std"] = y_std_fd
+
+        out_df = pd.DataFrame(out_data)
+        out_path = os.path.join(results_root, f"{fd_id}_global_predictions.csv")
+        out_df.to_csv(out_path, index=False)
+
+    all_true = np.concatenate(all_true)
+    all_pred = np.concatenate(all_pred)
+
+    global_metrics = compute_basic_metrics(all_true, all_pred)
+    print("[GLOBAL] Overall metrics across all FDs:", global_metrics)
+
+    # Save global metrics
+    metrics_df = pd.DataFrame(global_metrics, index=[0])
+    metrics_df.to_csv(os.path.join(results_root, "global_metrics.csv"), index=False)
+
+    return model, scaler, global_metrics

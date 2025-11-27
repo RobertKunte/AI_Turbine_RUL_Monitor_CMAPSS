@@ -1,68 +1,65 @@
 # 🤖 AI-Based Turbine RUL Monitor  
 ## Physics-Informed LSTM for C-MAPSS FD001–FD004
 
-## 💡 Project Overview & Problem Statement
+## 💡 Project Overview
 
-This project implements a **Prognostics and Health Management (PHM)** pipeline to predict the **Remaining Useful Life (RUL)** of turbofan engines using the NASA **C-MAPSS** datasets.
+This repository implements a **Prognostics and Health Management (PHM)** pipeline to predict the **Remaining Useful Life (RUL)** of turbofan engines using the NASA **C-MAPSS** datasets (FD001–FD004).
 
-Unplanned failures in critical energy assets are extremely costly – they cause forced outages, expensive emergency repairs, and revenue loss. The goal here is to:
+Unplanned failures in gas turbines and similar assets are extremely costly. The goal of this project is:
 
-> **Predict the remaining life of an engine early and reliably, so that maintenance can be planned instead of reacting to failures.**
+> **Predict the remaining life of an engine early and reliably so that maintenance can be planned instead of reacting to failures.**
 
-This repository currently focuses on:
+The project currently provides:
 
-- The **NASA C-MAPSS subsets FD001–FD004**
-- A **physics-informed LSTM model** implemented in PyTorch
-- A **modular training & evaluation pipeline** with:
-  - Per-unit error analysis
-  - NASA PHM08 scoring
+- A **modular PyTorch pipeline** for all four C-MAPSS subsets
+- **Physics-informed LSTM models** (local per FD + global across FD001–FD004)
+- **Risk-aware RUL loss** (asymmetric, RUL-weighted)
+- **Uncertainty estimation** via Monte Carlo Dropout
+- Detailed evaluation:
+  - RMSE / MAE / Bias / NASA PHM08 Score
+  - Per-FD and global metrics
   - Correlations with physically meaningful features
 
 ---
 
-## 📊 Datasets & Problem Setup
+## 📊 Datasets & Objective
 
 ### C-MAPSS subsets
 
-The project supports all four standard C-MAPSS subsets:
+| Subset | Train Engines | Test Engines | Conditions | Fault Modes               |
+|--------|---------------|-------------|------------|---------------------------|
+| FD001  | 100           | 100         | 1          | 1 (HPC)                   |
+| FD002  | 260           | 259         | 6          | 1 (HPC)                   |
+| FD003  | 100           | 100         | 1          | 2 (HPC + Fan)             |
+| FD004  | 248           | 249         | 6          | 2 (HPC + Fan)             |
 
-| Subset | Train Engines | Test Engines | Conditions | Fault Modes                    |
-|--------|---------------|-------------|------------|--------------------------------|
-| FD001  | 100           | 100         | 1          | 1 (HPC degradation)            |
-| FD002  | 260           | 259         | 6          | 1 (HPC degradation)            |
-| FD003  | 100           | 100         | 1          | 2 (HPC + Fan degradation)      |
-| FD004  | 248           | 249         | 6          | 2 (HPC + Fan degradation)      |
+Each record contains:
 
-Each dataset includes:
+- `UnitNumber`, `TimeInCycles`
+- 3 operating settings: `Setting1`, `Setting2`, `Setting3`
+- 21 sensors: `Sensor1` … `Sensor21`
 
-- `UnitNumber` (engine ID)  
-- `TimeInCycles` (discrete time step)  
-- 3 operating settings (`Setting1`, `Setting2`, `Setting3`)  
-- 21 sensor signals (`Sensor1` … `Sensor21`)
+### Prediction Task
 
-### Objective
-
-For each engine in the test set (FD00X):
+For each engine in the test set:
 
 - Predict the **RUL at the last observed cycle**
-- Ground truth labels come from `RUL_FD00X.txt`
-- RUL is **clamped** to a maximum value to focus on the degradation regime (see below)
+- Ground truth is taken from `RUL_FD00X.txt`
+- RUL is **clamped** to a maximum of `MAX_RUL = 125` cycles to focus on the degradation regime and avoid unbounded “early-life” RUL.
 
 ---
 
 ## 🔬 Preprocessing & Physics-Informed Features
 
-### 1. Standard Preprocessing
+### Standard Preprocessing
 
-For each subset FD00X:
+Per subset FD00X:
 
-1. **Train/Test loading**
+1. **Load data**
 
-   - Training: `train_FD00X.txt`  
-   - Test: `test_FD00X.txt`  
-   - Labels: `RUL_FD00X.txt`
+   - `train_FD00X.txt`, `test_FD00X.txt`, `RUL_FD00X.txt`
 
-2. **RUL computation (train set)**
+2. **RUL computation (train)**
 
    For each engine:
 
@@ -71,137 +68,120 @@ For each subset FD00X:
    MAX_RUL = 125
    RUL = np.minimum(RUL, MAX_RUL)
 
-Motivation:
-Early life often shows no visible degradation – predicting arbitrarily large RUL values is not useful. Clamping RUL forces the model to focus on the critical wear-out phase.
-
     Feature selection
 
-        Remove constant or uninformative sensors (e.g. Sensor1, Sensor5, Sensor10)
+        Drop uninformative / constant sensors (e.g. Sensor1, Sensor5, Sensor10)
 
-        For FD001/FD003 (single condition), Setting3 is also dropped
+        For FD001 / FD003 (single condition): drop Setting3
 
-        MaxTime is dropped after computing RUL
+        MaxTime is only used to compute RUL and then removed
 
-        TimeInCycles is kept in the DataFrame (for sorting), but not used as a model input feature
+        TimeInCycles is kept for sorting, but not used as model input
 
     Scaling
 
-        All continuous input features are scaled to [0, 1] using MinMaxScaler
+        All continuous input features scaled to [0, 1] (MinMaxScaler)
 
-        The scaler is fitted on the training data and reused for the test data
+        Scaler fitted on train data and reused for test data
+
+        For the global model a single global scaler is fitted over all FDs
 
     Sequence generation
 
-        Sequence length: SEQUENCE_LENGTH = 30 cycles
+        Sequence length: SEQUENCE_LENGTH = 30
 
         Training:
 
-            Sliding windows over each engine:
+            Sliding windows per engine
 
-                For each engine, build all possible windows of length 30
-
-                The RUL label is the RUL at the last time step of the window
+            Label = RUL at last step of the window
 
         Testing:
 
-            For each engine, build one sequence:
+            If length ≥ 30: last 30 steps
 
-                If the engine has ≥ 30 time steps: the last 30 steps
+            Otherwise: pad with first row to length 30
 
-                If shorter: pad the beginning by repeating the first row until length 30
+    Final shapes per FD:
 
-    Final training input shape (per FD):
+        X_train: (N_sequences, 30, n_features)
 
-    X_train: (N_sequences, 30, n_features)
-    y_train: (N_sequences,)
+        y_train: (N_sequences,)
 
-2. Physics-Informed Features
+⚙️ Physics-Informed Features
 
-On top of the raw sensors, three physically motivated features are added:
-a) HPC Efficiency Proxy (Effizienz_HPC_Proxy)
+On top of selected sensors, three physically motivated features are added:
 
-Based on total pressure and total temperature:
+    HPC Efficiency Proxy – Effizienz_HPC_Proxy
 
 Effizienz_HPC_Proxy = Sensor12 / Sensor7
 
-Interpretation:
-A crude proxy for compressor efficiency / thermodynamic state at the HPC/HPT interface.
-b) Exhaust Gas Temperature Drift (EGT_Drift)
+Crude proxy for compressor efficiency / thermodynamic state at the HPC/HPT interface.
 
-    Sensor17 is the Exhaust Gas Temperature (EGT)
+Exhaust Gas Temperature Drift – EGT_Drift
 
-For each engine, we compute a baseline over the first cycles (healthy reference):
-
-EGT_base = mean(Sensor17 for TimeInCycles <= 10, per UnitNumber)
+EGT_base (per Unit) = mean(Sensor17 over first 10 cycles)
 EGT_Drift = Sensor17 - EGT_base
 
-Interpretation:
-Captures the temperature increase relative to the healthy state – strongly correlated with degradation.
-c) Fan–HPC Degradation Ratio (Fan_HPC_Ratio)
+Captures the temperature rise relative to the healthy baseline; strongly correlated with degradation.
 
-Ratio of fan speed to high-pressure compressor speed:
+Fan–HPC Degradation Ratio – Fan_HPC_Ratio
 
-Fan_HPC_Ratio = Sensor2 / Sensor3
+    Fan_HPC_Ratio = Sensor2 / Sensor3
 
-Interpretation:
-Changes in this ratio may indicate aerodynamic or mechanical degradation in the flow path.
-Correlation Insights (FD001 test set)
+    Changes in this ratio may indicate aerodynamic or mechanical degradation in the flow path.
 
-    EGT_Drift vs TrueRUL: strong negative correlation (~ −0.65)
+On FD001, for example:
 
-    Fan_HPC_Ratio vs TrueRUL: strong positive correlation (~ +0.61)
+    EGT_Drift vs True RUL: strong negative correlation
 
-    PredRUL shows similarly strong correlations to these features
+    Fan_HPC_Ratio vs True RUL: strong positive correlation
 
-👉 The trained model is clearly using the physics-informed features, not just the raw sensors.
-🧠 Model Architecture & Training
-1. LSTM Model
+    Predicted RUL shows similar correlations → the model actually uses these physics-informed signals.
 
-The current reference model is a plain LSTM with physics-informed inputs:
+🧠 Model Architecture & Loss
+LSTM-Based RUL Predictor
 
-    Architecture:
+Reference model (local and global):
 
-        2-layer LSTM with batch_first=True
+    Architecture
 
-        Hidden size: HIDDEN_SIZE = 50
+        2-layer LSTM, batch_first=True
 
-        Final fully connected layer: hidden_size → 1 for scalar RUL prediction
+        Hidden size: typically HIDDEN_SIZE = 50 (locals), 64 (global variant)
 
-    Input:
+        Final fully connected layer: hidden_size → 1 for scalar RUL
 
-        Sequences of shape (batch_size, 30, n_features)
+    Input
 
-        n_features = selected sensors + 3 physics-informed features
+        (batch_size, 30, n_features)
 
-    Output:
+        n_features = selected sensors + settings + 3 physics features
+
+    Output
 
         Scalar RUL prediction per sequence
 
-        During evaluation, predictions are clamped to [0, MAX_RUL]
+        During evaluation predictions are clamped to [0, MAX_RUL]
 
-2. Loss Function: Asymmetric, RUL-weighted
+Asymmetric, RUL-Weighted Loss
 
-Two loss variants were tested:
+To reflect safety requirements, over-optimistic predictions (too large RUL) should be penalized more than conservative ones.
 
-    Baseline: nn.MSELoss()
+Key ideas:
 
-    Current best: custom asymmetric, RUL-weighted loss
+    Overestimation (pred > target) gets a higher penalty
 
-    Overestimation (pred > target) is penalized more strongly than underestimation (safety)
+    Low RUL (near end-of-life) receives higher weight than large RUL
 
-    Low-RUL samples (close to failure) get higher weight than high-RUL samples
+Implementation (simplified):
 
 def rul_asymmetric_weighted_loss(
     pred, target,
     over_factor=2.0,
     min_rul_weight=1.0,
-    max_rul_weight=0.3
+    max_rul_weight=0.3,
 ):
-    """
-    Custom loss for RUL:
-    - Overestimation (pred > target) is penalized stronger than underestimation.
-    - Low RUL values are weighted higher than large RUL values.
-    """
     pred = pred.view(-1)
     target = target.view(-1)
 
@@ -209,145 +189,47 @@ def rul_asymmetric_weighted_loss(
     over  = torch.clamp(error, min=0.0)   # overestimation
     under = torch.clamp(-error, min=0.0)  # underestimation
 
-    # Asymmetric penalty (MSE-like but harsher on overestimation)
     base_loss = over_factor * over**2 + under**2
 
-    # Higher weights for small RUL (end-of-life is more critical)
     t_norm = target / (target.max() + 1e-6)  # [0, 1]
     weights = max_rul_weight + (min_rul_weight - max_rul_weight) * (1.0 - t_norm)
 
-    weighted_loss = weights * base_loss
-    return weighted_loss.mean()
+    return (weights * base_loss).mean()
 
-    Optimizer: Adam with lr = 1e-3
+    Optimizer: Adam (lr = 1e-3)
 
-    Epochs: typically 25 for the final runs
+    Epochs: typically ~25 for local models, similar for global runs
 
-    Batching: standard DataLoader mini-batches
+🌍 Operating Conditions: Continuous Settings vs. ConditionID
 
-📈 Evaluation Setup
+For the multi-condition subsets FD002 and FD004, settings are provided as:
 
-The evaluation is done via a dedicated training & analysis pipeline:
-1. Modular Training (per FD subset)
+    Setting1, Setting2, Setting3 (e.g. altitude, throttle, environment)
 
-src/training.py provides:
+Two encodings were compared:
 
-res_fd001, metrics_fd001 = train_and_evaluate_fd(
-    fd_id="FD001",
-    model_class=LSTMRULPredictor,
-    loss_fn=rul_asymmetric_weighted_loss,
-)
+    Continuous settings (default)
 
-For each subset FD00X, this function:
+        Use Setting1/2/3 directly as continuous input features
 
-    Loads and preprocesses the data
+        Closest to physical reality (continuous operating envelope)
 
-    Adds physics-informed features
+    Discrete ConditionID (7 clusters)
 
-    Builds sequences
+        Round (Setting1, Setting2, Setting3) and map triples to a small set of discrete IDs
 
-    Trains an LSTM model with the asymmetric loss
+        Model sees a single numeric ConditionID instead of three settings
 
-    Evaluates on the test set and computes:
+Result:
+RMSE / MAE are very similar, but continuous settings yield slightly better NASA scores and are physically more realistic.
+Therefore, continuous settings are used as the default encoding, and ConditionID remains an optional experimental variant.
+📊 Key Results
+1. Local Per-FD Models (Physics-Informed LSTM)
 
-        MSE, RMSE, MAE, Bias (Pred − True)
+Local LSTM models are trained separately per FD with physics-informed features and asymmetric RUL-loss.
 
-        NASA PHM08 score (asymmetric RUL metric)
-
-    Saves:
-
-        Predictions as CSV
-
-        Model weights as .pt file
-
-Typical output CSV (per FD):
-
-results/FD001/FD001_predictions_local.csv
-results/FD002/FD002_predictions_local.csv
-...
-
-with at least:
-
-    UnitNumber
-
-    TimeInCycles (last observed cycle)
-
-    TrueRUL
-
-    PredRUL
-
-    Effizienz_HPC_Proxy
-
-    EGT_Drift
-
-    Fan_HPC_Ratio
-
-    FD_ID
-
-    ModelType ("local" for per-FD models)
-
-2. Detailed Evaluation & Analysis
-
-A dedicated evaluation notebook (e.g. notebooks/3_local_evaluation.ipynb) provides:
-
-    Global metrics per dataset:
-
-        RMSE, MAE, Bias, NASA score
-
-    RUL-bin analysis:
-
-        Bins like 0–25, 25–50, 50–100, 100–200 cycles
-
-        RMSE, MAE, Bias per bin
-
-    Per-unit error analysis:
-
-        RMSE / MAE / Bias per UnitNumber
-
-        Top-10 worst engines (outliers)
-
-    Correlation matrix between:
-
-        TrueRUL, PredRUL
-
-        Effizienz_HPC_Proxy, EGT_Drift, Fan_HPC_Ratio
-
-    Visualizations:
-
-        TrueRUL vs PredRUL scatter plots
-
-        Residuals (Pred − True) vs TrueRUL
-
-        Feature vs RUL scatter plots
-
-This yields a much richer picture than a single scalar metric.
-🎯 Key Results
-1. FD001-focused experiments (history)
-
-On C-MAPSS FD001 test data:
-Configuration	RMSE (cycles)	Comment
-Simple LSTM, no physics features, MSE loss	~44.7	Initial baseline
-LSTM + physics features (EGT_Drift, Fan/HPC, HPC proxy)	~19.1	Large gain from physics-informed features
-LSTM + physics features + asymmetric RUL-weighted loss	~16.0	FD001-only “best run” (pre-modular version)
-
-Additional observations for the FD001-only best run:
-
-    Correlation between TrueRUL and PredRUL ≈ 0.93
-
-    Physics features are clearly used:
-
-        EGT_Drift and Fan_HPC_Ratio strongly correlated with predictions
-
-    Worst-case units still show errors on the order of 30–48 cycles
-
-    Global average error is significantly reduced compared to the simple baseline
-
-2. Local models for all FD subsets (current modular V4)
-
-Using the modular pipeline with physics-informed features and the asymmetric RUL-weighted loss, local LSTM models are trained per FD subset (same architecture, per-FD training).
-
-Global metrics (test sets, clamped RUL, latest run):
-FD	MSE	RMSE (cycles)	MAE (cycles)	Bias (pred−true)	NASA PHM08 Score
+Test metrics (latest modular run, clamped RUL):
+FD	MSE	RMSE	MAE	Bias (pred−true)	NASA PHM08
 FD001	304.10	17.44	13.29	−7.88	342.57
 FD002	371.03	19.26	15.03	−5.55	1713.73
 FD003	205.97	14.35	10.54	−2.58	278.03
@@ -355,237 +237,214 @@ FD004	528.53	22.99	16.94	−9.40	2631.68
 
 Interpretation:
 
-    FD001: solid performance, in line with prior FD001-only experiments; NASA-score is low (~343)
+    FD001 & FD003: good performance; FD003 is the best subset (low RMSE, low NASA score)
 
-    FD003: best-performing subset (RMSE ≈ 14.35, NASA ≈ 278), despite two fault modes – physics features help distinguish degradation patterns
+    FD002 & FD004: multi-condition subsets remain more challenging; RMSE reasonable, but NASA scores higher
 
-    FD002 & FD004: multi-condition subsets (6 operating conditions) remain challenging:
+2. Global LSTM Model (FD001–FD004 Combined)
 
-        RMSE still reasonable, but NASA-score significantly higher
+A single global LSTM is trained on all four subsets simultaneously:
 
-        Indicates some late / over-optimistic predictions in certain operating regimes
+    Shared feature scaler across FD001–FD004
 
-This provides a strong local baseline against which future global models (joint FD001–FD004 training with condition encodings) can be compared.
-🧪 Additional Experiment: LSTM with Temporal Attention (FD001)
+    Inputs: sensor subset, 3 continuous settings, 3 physics features
 
-As an extension to the baseline LSTM, an attention mechanism over the time dimension was tested:
+    Same architecture (2-layer LSTM) and loss as local models
 
-    Same input features and training setup as the physics-informed LSTM
+    Evaluation is still per FD + aggregated
 
-    Architecture: LSTM followed by a simple additive attention layer over all time steps
+Global model (baseline, without MC-Dropout uncertainty)
 
-    Goal: allow the model to focus on the most informative parts of the 30-cycle history instead of using only the last hidden state
+From a previous global run:
+FD	Local RMSE	Global RMSE	Local NASA	Global NASA
+FD001	17.44	14.84	342.6	447.4
+FD002	19.26	17.33	1713.7	1395.6
+FD003	14.35	15.21	278.0	428.5
+FD004	22.99	18.08	2631.7	1622.1
 
-Results (FD001)
-Version	Model	RMSE (cycles)	MAE (cycles)	Bias (pred–true)	NASA PHM08 Score
-V2	LSTM (no attention)	~13–17	~9–13	small	~340–360
-V3	LSTM + time attention	higher	higher	more positive	significantly ↑
+    Strong gains on FD002 and FD004 (multi-condition, multi-fault)
+
+    Slight degradation on FD003 (simpler subset where specialization helps)
+
+    Overall global RMSE improves vs. naïve per-FD models
+
+Conclusion:
+
+    A single global physics-informed LSTM can learn universal degradation patterns and significantly improve performance on complex operating conditions (FD002 / FD004).
+
+🌫️ Uncertainty Estimation with Dropout
+3.1 MC-Dropout Model for FD001
+
+For FD001, a dedicated architecture LSTMRUL_MCDO is used:
+
+    Same LSTM structure, but with Dropout layers kept active at inference (MC-Dropout)
+
+    A small helper in src/uncertainty.py:
+
+        enable_mc_dropout(model): forces all Dropout layers into “train” mode
+
+        mc_dropout_predict(model, X_tensor, n_samples=50):
+        runs multiple stochastic forward passes and returns:
+
+            mean prediction
+
+            predictive standard deviation
+
+Results (FD001):
+
+    RMSE improves to ≈ 12.9 cycles, better than the standard local LSTM run (~17.4 in the modular setup, ~16–13 in earlier FD001-only experiments)
+
+    Predictive standard deviation correlates strongly with the absolute error
+
+    Engines with:
+
+        Clear degradation → lower uncertainty
+
+        Long periods of “flat” RUL (many cycles close to MAX_RUL = 125 due to clamping) → higher uncertainty
+
+Interpretation:
+
+    MC-Dropout successfully identifies where the model is less sure (e.g. under-informative sequences)
+
+    Uncertainty can be used as a risk indicator for engineers (e.g. “double-check this asset”)
+
+3.2 Global LSTM with Dropout (Regularization Variant)
+
+A second global run was performed with a Dropout-enhanced LSTM (regularization, single deterministic prediction per sample).
+
+Global Dropout Model – Per-FD Metrics:
+FD	MSE	RMSE	MAE	Bias (pred−true)	NASA PHM08
+FD001	251.97	15.87	12.06	−4.33	365.06
+FD002	434.36	20.84	16.09	−11.52	1836.59
+FD003	236.08	15.37	11.27	−2.97	447.60
+FD004	463.59	21.53	15.48	−9.29	2662.79
+
+Global metrics across all FDs:
+
+    MSE: 390.77
+
+    RMSE: 19.77
+
+    MAE: 14.62
+
+    Bias: −8.51 (overall slightly pessimistic)
+
+    NASA PHM08: 5312.04
 
 Observations:
 
-    The attention model showed higher RMSE and MAE
+    Compared to the best global model without dropout, RMSE is somewhat higher, especially on FD002/FD004.
 
-    Larger positive bias → more optimistic predictions (late failures)
+    The global Dropout model shows a consistently negative Bias (pessimistic RUL), which is in line with the asymmetric loss that discourages over-optimistic predictions.
 
-    NASA PHM08 score increased significantly
+    This variant provides a useful regularized baseline and a starting point to extend MC-Dropout uncertainty from FD001 to the full global setup.
 
-    Outlier units (engines with the largest per-unit RMSE) were not improved
-
-Conclusion:
-In this configuration, the added attention did not provide a benefit and even slightly degraded performance and risk metrics.
-For this reason, the repository uses the plain LSTM with physics-informed features and asymmetric RUL-weighted loss as the reference model (V2/V4), while the attention-based variant remains an optional experimental architecture.
-🧾 Changelog / Version History
-v4 – Modular Multi-Subset Pipeline (current)
-
-    Added support for all four C-MAPSS subsets FD001–FD004
-
-    Introduced a modular Python package structure under src/:
-
-        config.py – hyperparameters & dataset definitions
-
-        data_loading.py – loading & RUL computation per FD
-
-        additional_features.py – physics-informed features
-
-        training.py – generic training & evaluation per FD
-
-        model.py, losses.py – model and custom loss (optional)
-
-    Implemented per-FD local LSTM models with:
-
-        Physics-informed features
-
-        Asymmetric RUL-weighted loss
-
-        NASA PHM08 scoring
-
-    Produced a consistent metrics table for FD001–FD004 (see above)
-
-v3 – Temporal Attention Experiment (FD001)
-
-    Added a simple time attention mechanism on top of the LSTM
-
-    Experimentally evaluated on FD001
-
-    Result: no improvement, sometimes worse RMSE / NASA
-
-    Kept as an experimental architecture, not as the default
-
-v2 – Physics-Informed RUL Model (FD001)
-
-    Added physics-inspired features:
-
-        EGT_Drift (Exhaust Gas Temperature Drift)
-
-        Fan_HPC_Ratio (Fan/HPC speed ratio)
-
-        Effizienz_HPC_Proxy (pressure/temperature proxy)
-
-    Introduced RUL clamping at 125 cycles to focus on degradation regime
-
-    Implemented asymmetric, RUL-weighted loss:
-
-        Overestimation penalized more than underestimation
-
-        Higher weight for low-RUL samples (near end-of-life)
-
-    Added evaluation notebook to:
-
-        analyze per-unit errors
-
-        compute RUL-bin metrics
-
-        visualize feature correlations
-
-    Achieved RMSE ≈ 16 cycles on FD001 (previously ~44.7)
-
-v1 – Initial Baseline Model (FD001)
-
-    Basic 2-layer LSTM model in PyTorch
-
-    Used raw sensor data from C-MAPSS FD001 with minimal feature selection
-
-    Standard MSE loss, trained with Adam
-
-    Achieved RMSE ≈ 44.7 cycles on FD001
-
-    Provided initial data loading, preprocessing, and training notebook
-
-🛠️ Reproduction & Setup
-Prerequisites
-
-    Python 3.10
-
-    Recommended: Miniconda for environment management
-
-Environment Setup
-
-# Create and activate environment
-conda create -n turbine_ai python=3.10
-conda activate turbine_ai
-
-# Install packages
-pip install torch torchvision torchaudio pandas matplotlib scikit-learn jupyter ipykernel
-
-Data
-
-Download the C-MAPSS text files into ./data/raw:
-
-data/raw/
-├─ train_FD001.txt
-├─ test_FD001.txt
-├─ RUL_FD001.txt
-├─ train_FD002.txt
-├─ test_FD002.txt
-├─ RUL_FD002.txt
-├─ train_FD003.txt
-├─ test_FD003.txt
-├─ RUL_FD003.txt
-├─ train_FD004.txt
-├─ test_FD004.txt
-└─ RUL_FD004.txt
-
-Project structure (simplified):
+🧱 Project Structure
 
 AI_Turbine_RUL_Monitor_CMAPSS/
 ├─ data/
-│  └─ raw/
+│  └─ raw/                # raw C-MAPSS text files
 ├─ results/
-│  ├─ FD001/
+│  ├─ FD001/              # per-FD local model outputs
 │  ├─ FD002/
 │  ├─ FD003/
-│  └─ FD004/
+│  ├─ FD004/
+│  └─ global/             # global model predictions & weights
 ├─ notebooks/
 │  ├─ 1_fd001_exploration.ipynb
 │  ├─ 2_training_local_models.ipynb
-│  └─ 3_local_evaluation.ipynb
+│  ├─ 3_local_evaluation.ipynb
+│  └─ 3_global_model_evaluation.ipynb
 └─ src/
    ├─ __init__.py
    ├─ config.py
    ├─ data_loading.py
    ├─ additional_features.py
    ├─ training.py
-   ├─ model.py          # optional, if you move LSTMRULPredictor here
-   └─ losses.py         # optional, for custom loss
+   ├─ models/
+   │  ├─ lstm_rul.py
+   │  └─ lstm_rul_mcdo.py
+   └─ uncertainty.py
 
-Execution
-A) Train & export predictions (local models FD001–FD004)
+🚀 How to Run
+1. Environment
+
+conda create -n turbine_ai python=3.10
+conda activate turbine_ai
+
+pip install torch torchvision torchaudio pandas matplotlib scikit-learn jupyter ipykernel
+
+2. Data
+
+Download the C-MAPSS files into ./data/raw:
+
+data/raw/
+├─ train_FD001.txt   ├─ test_FD001.txt   ├─ RUL_FD001.txt
+├─ train_FD002.txt   ├─ test_FD002.txt   ├─ RUL_FD002.txt
+├─ train_FD003.txt   ├─ test_FD003.txt   ├─ RUL_FD003.txt
+├─ train_FD004.txt   ├─ test_FD004.txt   └─ RUL_FD004.txt
+
+3. Train Local Models (FD001–FD004)
 
     Open notebooks/2_training_local_models.ipynb
 
     Select the turbine_ai kernel
 
+    Run all cells:
+
+        Train one LSTM per FD
+
+        Save predictions & weights under results/FD00X/
+
+4. Evaluate & Analyze
+
+    Open notebooks/3_local_evaluation.ipynb and 3_global_model_evaluation.ipynb
+
     Run all cells to:
 
-        Train one model per FD subset
-
-        Save per-FD predictions and model weights under results/FD00X/
-
-B) Evaluation & analysis
-
-    Open notebooks/3_local_evaluation.ipynb
-
-    Run all cells to:
-
-        Load the per-FD prediction files
+        Load prediction CSVs
 
         Compute metrics (RMSE / MAE / Bias / NASA)
 
-        Inspect RUL-bin metrics
+        Inspect RUL-bins, per-unit errors
 
-        Visualize worst engines & correlations with physics-informed features
+        Visualize correlations and degradation behaviour
 
-🔭 Future Work
+🔭 Roadmap / Future Work
 
-This project is part of a broader “Mechanical Engineer Assistant” vision and can be extended in several directions:
+This repository is part of a broader “Mechanical Engineer AI Assistant” vision.
+
+Planned next steps:
 
     Seq2Seq / World Models
 
-        Predict full multi-step future sensor trajectories, not just final RUL
+        Encoder–decoder architectures (LSTM/GRU) to predict full future sensor trajectories and/or RUL sequences
 
-        Use this for scenario simulation and “what-if” analysis
+        Basis for “what-if” simulations and scenario analysis
 
-    Uncertainty Quantification
+    Hyperparameter Optimization (Optuna + PyTorch Lightning)
 
-        Monte Carlo Dropout / Deep Ensembles for predictive intervals
+        Systematic tuning of:
 
-        Risk-aware decision-making based on confidence levels
+            LSTM size, depth, dropout
 
-    Global Model Across FD001–FD004
+            Loss weights (asymmetry, RUL vs. sensor)
 
-        Train a single LSTM on all subsets jointly
+            Sequence length and feature sets
 
-        Encode operating conditions and FD-ID (e.g. via embeddings)
+    Extended Uncertainty Quantification
 
-        Compare global vs. local models per FD
+        Apply MC-Dropout and/or deep ensembles to the global model
+
+        Add calibration plots and risk-aware decision rules
 
     Deployment
 
-        Wrap the model into a REST API or a Streamlit dashboard for:
+        Simple REST API or Streamlit dashboard for:
 
-            live RUL monitoring per asset
+            Online RUL monitoring per asset
 
-            feature & trend visualizations for engineers
+            Physics-feature plots and trend analysis for engineers
 
 📞 Contact & License
 
@@ -593,6 +452,6 @@ This project is part of a broader “Mechanical Engineer Assistant” vision and
 
     LinkedIn: https://www.linkedin.com/in/robertkunte/
 
-    License: MIT License
+    License: MIT
 
-If you’re working on turbomachinery, PHM, or physics-informed ML and want to exchange ideas, feel free to reach out!
+If you are working on turbomachinery, PHM or physics-informed ML and would like to exchange ideas, feel free to reach out!
