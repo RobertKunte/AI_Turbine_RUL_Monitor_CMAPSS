@@ -142,6 +142,85 @@ def build_last_sequences_from_df(
     X = np.array(X_list, dtype=np.float32)
     return X, unit_keys
 
+def build_eol_sequences_from_df(
+    df,
+    feature_cols,
+    past_len: int,
+    max_rul: int = None,
+    unit_col: str = "unit_nr",
+    cycle_col: str = "cycle",
+    rul_col: str = "RUL",
+    mode: str = "train",
+    random_seed: int = 42,
+):
+    """
+    Build EOL-style sequences: exactly ONE sample per engine.
+
+    - mode="train": pick a random truncation point BEFORE failure
+                    → wie im NASA-Setting (Trajektorie wird vor dem Failure abgeschnitten)
+    - mode="test":  use the last available cycle in df (z.B. df_test von NASA)
+
+    Args:
+        df: pandas DataFrame with at least [unit_col, cycle_col, rul_col] and feature_cols.
+        feature_cols: list of feature column names (e.g. GLOBAL_FEATURE_COLS)
+        past_len: length of the encoder sequence (e.g. 30)
+        max_rul: optional RUL clamp (e.g. MAX_RUL), if None no clamping.
+        unit_col: name of the engine ID column (default "unit_nr")
+        cycle_col: name of the time/cycle column (default "cycle")
+        rul_col: name of the RUL column (default "RUL")
+        mode: "train" or "test"
+        random_seed: for reproducible random truncation in train mode
+
+    Returns:
+        X_eol: torch.FloatTensor, shape [num_engines, past_len, num_features]
+        y_eol: torch.FloatTensor, shape [num_engines]
+    """
+    rng = np.random.RandomState(random_seed)
+    sequences = []
+    targets = []
+
+    # Grupiere nach Einheit (Engine)
+    for unit_id, df_unit in df.groupby(unit_col):
+        # Zeitlich sortieren
+        df_unit = df_unit.sort_values(cycle_col)
+
+        if len(df_unit) < past_len:
+            # zu kurz, wird übersprungen
+            continue
+
+        if mode == "test":
+            # Letzter verfügbarer Zyklus für diese Engine (wie NASA-Test)
+            end_idx = len(df_unit)  # exklusiv
+        elif mode == "train":
+            # Wähle einen zufälligen Zeitpunkt zwischen past_len und letzterem Zyklus
+            # so dass wir ein Fenster [end_idx - past_len, end_idx) bauen können
+            end_idx = rng.randint(past_len, len(df_unit) + 1)
+        else:
+            raise ValueError(f"Unknown mode='{mode}' in build_eol_sequences_from_df")
+
+        window = df_unit.iloc[end_idx - past_len : end_idx]  # [past_len rows]
+
+        # Features
+        X_seq = window[feature_cols].to_numpy(dtype=np.float32)  # [past_len, F]
+
+        # Ziel-RUL: RUL am EOL-Evaluationspunkt (letzte Zeile des Fensters)
+        rul_eol = float(window[rul_col].iloc[-1])
+        if max_rul is not None:
+            rul_eol = min(rul_eol, max_rul)
+
+        sequences.append(X_seq)
+        targets.append(rul_eol)
+
+    if len(sequences) == 0:
+        raise ValueError("No EOL sequences built – check past_len and data grouping.")
+
+    X_eol_np = np.stack(sequences, axis=0)  # [N_engines, past_len, F]
+    y_eol_np = np.array(targets, dtype=np.float32)  # [N_engines]
+
+    X_eol = torch.from_numpy(X_eol_np)
+    y_eol = torch.from_numpy(y_eol_np)
+
+    return X_eol, y_eol
 # -------------------------------------------------------------------
 # Helper: Train / Val loop
 # -------------------------------------------------------------------
