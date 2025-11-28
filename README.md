@@ -18,7 +18,7 @@ The project has evolved in several stages:
 |--------------------------------------|-----------------------|---------------------------------------------------|--------------------------------------------|
 | Local physics-informed LSTM          | FD001–FD004 (separate)| Per-FD RMSE ≈ 14–23 cycles                        | Sum over FDs ≈ **4.97×10³**                |
 | Global physics-informed LSTM         | FD001–FD004 (joint)   | Overall global RMSE ≈ **16.4** cycles             | Sum over FDs ≈ **3.89×10³**                |
-| **Global Seq2Seq World Model (V6)**  | FD001–FD004 (joint)   | End-of-life error (|pred–true|) ≈ **1.9** cycles* | Mean NASA ≈ **0.33** per engine (653 units)|
+| **Global Seq2Seq World Model (V6)**  | FD001–FD004 (joint)   | End-of-life error (pred–true) ≈ **1.9** cycles*   | Mean NASA ≈ **0.33** per engine (653 units)|
 
 \* World Model metric is computed at the **end-of-life horizon** of the predicted RUL trajectory (Seq2Seq rollout), not as a single-step RMSE like the LSTM predictors.
 
