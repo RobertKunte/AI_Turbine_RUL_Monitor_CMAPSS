@@ -1,34 +1,6 @@
 
 # 🚀 AI-Based Turbine RUL Monitor – Physics-Informed World Models
 
-<<<<<<< HEAD
-### *Deep Learning for Turbofan Prognostics on NASA C-MAPSS (FD001–FD004)*
-=======
-This repository implements a physics-informed **Remaining Useful Life (RUL)** monitoring pipeline for turbofan engines based on the NASA **C-MAPSS FD001–FD004** datasets.  
-
-The project has evolved in several stages:
-
-- **Local physics-informed LSTM models (per FD)** with asymmetric, risk-aware RUL loss  
-- A **single global LSTM** trained jointly on FD001–FD004  
-- **Uncertainty estimation** via Monte Carlo Dropout  
-- **V6 (new): a global Seq2Seq “World Model”** that predicts full future RUL trajectories
-
-### High-Level Model Comparison (latest runs)
-
-| Model Type                            | Scope                 | Error Metric (test)                               | NASA PHM08 (test)                          |
-|--------------------------------------|-----------------------|---------------------------------------------------|--------------------------------------------|
-| Local physics-informed LSTM          | FD001–FD004 (separate)| Per-FD RMSE ≈ 14–23 cycles                        | Sum over FDs ≈ **4.97×10³**                |
-| Global physics-informed LSTM         | FD001–FD004 (joint)   | Overall global RMSE ≈ **16.4** cycles             | Sum over FDs ≈ **3.89×10³**                |
-| **Global Seq2Seq World Model (V6)**  | FD001–FD004 (joint)   | End-of-life error (pred–true) ≈ **1.9** cycles*   | Mean NASA ≈ **0.33** per engine (653 units)|
-
-\* World Model metric is computed at the **end-of-life horizon** of the predicted RUL trajectory (Seq2Seq rollout), not as a single-step RMSE like the LSTM predictors.
-
-> **Key takeaway:**  
-> The global Seq2Seq World Model learns a smooth, well-calibrated RUL trajectory across all four datasets, with very low end-of-life error and a strongly risk-sensitive NASA score. It complements the direct LSTM RUL predictors and prepares the ground for full physics-informed “world models” of turbomachinery.
->>>>>>> 03aaff4e0eee0e1cd30fd003ddabb32c8d0bf692
-
----
-
 ## 🔍 **Quick Benchmark Summary**
 
 This repository implements and compares several classes of RUL prediction models:
