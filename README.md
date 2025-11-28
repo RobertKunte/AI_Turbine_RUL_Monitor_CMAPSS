@@ -1,20 +1,49 @@
 # 🤖 AI-Based Turbine RUL Monitor  
-## Physics-Informed LSTM for C-MAPSS FD001–FD004
+## Physics-Informed LSTM & Seq2Seq World Model for C-MAPSS FD001–FD004
+
+## 🔎 Abstract (V6 – World Model)
+
+This repository implements a physics-informed **Remaining Useful Life (RUL)** monitoring pipeline for turbofan engines based on the NASA **C-MAPSS FD001–FD004** datasets.  
+
+The project has evolved in several stages:
+
+- **Local physics-informed LSTM models (per FD)** with asymmetric, risk-aware RUL loss  
+- A **single global LSTM** trained jointly on FD001–FD004  
+- **Uncertainty estimation** via Monte Carlo Dropout  
+- **V6 (new): a global Seq2Seq “World Model”** that predicts full future RUL trajectories
+
+### High-Level Model Comparison (latest runs)
+
+| Model Type                            | Scope                 | Error Metric (test)                               | NASA PHM08 (test)                          |
+|--------------------------------------|-----------------------|---------------------------------------------------|--------------------------------------------|
+| Local physics-informed LSTM          | FD001–FD004 (separate)| Per-FD RMSE ≈ 14–23 cycles                        | Sum over FDs ≈ **4.97×10³**                |
+| Global physics-informed LSTM         | FD001–FD004 (joint)   | Overall global RMSE ≈ **16.4** cycles             | Sum over FDs ≈ **3.89×10³**                |
+| **Global Seq2Seq World Model (V6)**  | FD001–FD004 (joint)   | End-of-life error (|pred–true|) ≈ **1.9** cycles* | Mean NASA ≈ **0.33** per engine (653 units)|
+
+\* World Model metric is computed at the **end-of-life horizon** of the predicted RUL trajectory (Seq2Seq rollout), not as a single-step RMSE like the LSTM predictors.
+
+> **Key takeaway:**  
+> The global Seq2Seq World Model learns a smooth, well-calibrated RUL trajectory across all four datasets, with very low end-of-life error and a strongly risk-sensitive NASA score. It complements the direct LSTM RUL predictors and prepares the ground for full physics-informed “world models” of turbomachinery.
+
+---
 
 ## 💡 Project Overview
 
 This repository implements a **Prognostics and Health Management (PHM)** pipeline to predict the **Remaining Useful Life (RUL)** of turbofan engines using the NASA **C-MAPSS** datasets (FD001–FD004).
 
-Unplanned failures in gas turbines and similar assets are extremely costly. The goal of this project is:
+Unplanned failures in gas turbines and related assets are extremely costly. The goal of this project is:
 
 > **Predict the remaining life of an engine early and reliably so that maintenance can be planned instead of reacting to failures.**
 
 The project currently provides:
 
 - A **modular PyTorch pipeline** for all four C-MAPSS subsets
-- **Physics-informed LSTM models** (local per FD + global across FD001–FD004)
-- **Risk-aware RUL loss** (asymmetric, RUL-weighted)
-- **Uncertainty estimation** via Monte Carlo Dropout
+- **Physics-informed LSTM models**
+  - Local models per FD
+  - A single global model across FD001–FD004
+- A **risk-aware RUL loss** (asymmetric, RUL-weighted)
+- **Uncertainty estimation** via Monte Carlo Dropout (FD001 & global variants)
+- A **Seq2Seq World Model (V6)** predicting future RUL trajectories
 - Detailed evaluation:
   - RMSE / MAE / Bias / NASA PHM08 Score
   - Per-FD and global metrics
@@ -84,7 +113,7 @@ Per subset FD00X:
 
         Scaler fitted on train data and reused for test data
 
-        For the global model a single global scaler is fitted over all FDs
+        For the global model, a single global scaler is fitted over all FDs
 
     Sequence generation
 
@@ -133,36 +162,38 @@ Fan–HPC Degradation Ratio – Fan_HPC_Ratio
 
 On FD001, for example:
 
-    EGT_Drift vs True RUL: strong negative correlation
+    EGT_Drift vs. True RUL: strong negative correlation
 
-    Fan_HPC_Ratio vs True RUL: strong positive correlation
+    Fan_HPC_Ratio vs. True RUL: strong positive correlation
 
     Predicted RUL shows similar correlations → the model actually uses these physics-informed signals.
 
-🧠 Model Architecture & Loss
-LSTM-Based RUL Predictor
+🧠 LSTM-Based RUL Predictor
+Architecture
 
 Reference model (local and global):
 
-    Architecture
+    2-layer LSTM, batch_first=True
 
-        2-layer LSTM, batch_first=True
+    Hidden size:
 
-        Hidden size: typically HIDDEN_SIZE = 50 (locals), 64 (global variant)
+        HIDDEN_SIZE = 50 (local models)
 
-        Final fully connected layer: hidden_size → 1 for scalar RUL
+        HIDDEN_SIZE = 64 (global model)
 
-    Input
+    Final fully connected layer: hidden_size → 1 for scalar RUL
 
-        (batch_size, 30, n_features)
+Input:
 
-        n_features = selected sensors + settings + 3 physics features
+    Shape (batch_size, 30, n_features)
 
-    Output
+    n_features = selected sensors + settings + 3 physics features
 
-        Scalar RUL prediction per sequence
+Output:
 
-        During evaluation predictions are clamped to [0, MAX_RUL]
+    Scalar RUL prediction per sequence
+
+    During evaluation predictions are clamped to [0, MAX_RUL]
 
 Asymmetric, RUL-Weighted Loss
 
@@ -174,7 +205,7 @@ Key ideas:
 
     Low RUL (near end-of-life) receives higher weight than large RUL
 
-Implementation (simplified):
+Simplified implementation:
 
 def rul_asymmetric_weighted_loss(
     pred, target,
@@ -196,9 +227,9 @@ def rul_asymmetric_weighted_loss(
 
     return (weights * base_loss).mean()
 
-    Optimizer: Adam (lr = 1e-3)
+    Optimizer: Adam (typically lr = 1e-3)
 
-    Epochs: typically ~25 for local models, similar for global runs
+    Epochs: ~25 for local models, similar for global runs
 
 🌍 Operating Conditions: Continuous Settings vs. ConditionID
 
@@ -221,12 +252,16 @@ Two encodings were compared:
         Model sees a single numeric ConditionID instead of three settings
 
 Result:
-RMSE / MAE are very similar, but continuous settings yield slightly better NASA scores and are physically more realistic.
+
+    RMSE / MAE are very similar,
+
+    but continuous settings yield slightly better NASA scores and are physically more realistic.
+
 Therefore, continuous settings are used as the default encoding, and ConditionID remains an optional experimental variant.
-📊 Key Results
+📊 Key Results – LSTM Models
 1. Local Per-FD Models (Physics-Informed LSTM)
 
-Local LSTM models are trained separately per FD with physics-informed features and asymmetric RUL-loss.
+Local LSTM models are trained separately per FD with physics-informed features and the asymmetric RUL loss.
 
 Test metrics (latest modular run, clamped RUL):
 FD	MSE	RMSE	MAE	Bias (pred−true)	NASA PHM08
@@ -249,13 +284,11 @@ A single global LSTM is trained on all four subsets simultaneously:
 
     Inputs: sensor subset, 3 continuous settings, 3 physics features
 
-    Same architecture (2-layer LSTM) and loss as local models
+    Same architecture and loss as local models
 
     Evaluation is still per FD + aggregated
 
-Global model (baseline, without MC-Dropout uncertainty)
-
-From a previous global run:
+Global model (baseline, without MC-Dropout uncertainty):
 FD	Local RMSE	Global RMSE	Local NASA	Global NASA
 FD001	17.44	14.84	342.6	447.4
 FD002	19.26	17.33	1713.7	1395.6
@@ -269,45 +302,32 @@ FD004	22.99	18.08	2631.7	1622.1
     Overall global RMSE improves vs. naïve per-FD models
 
 Conclusion:
-
-    A single global physics-informed LSTM can learn universal degradation patterns and significantly improve performance on complex operating conditions (FD002 / FD004).
-
+A single global physics-informed LSTM can learn universal degradation patterns and significantly improve performance on complex operating conditions (FD002 / FD004).
 🌫️ Uncertainty Estimation with Dropout
 3.1 MC-Dropout Model for FD001
 
-For FD001, a dedicated architecture LSTMRUL_MCDO is used:
+For FD001, a dedicated architecture LSTMRUL_MCDropout is used:
 
     Same LSTM structure, but with Dropout layers kept active at inference (MC-Dropout)
 
-    A small helper in src/uncertainty.py:
+    Helper functions in src/uncertainty.py:
 
-        enable_mc_dropout(model): forces all Dropout layers into “train” mode
+        enable_mc_dropout(model)
 
-        mc_dropout_predict(model, X_tensor, n_samples=50):
-        runs multiple stochastic forward passes and returns:
-
-            mean prediction
-
-            predictive standard deviation
+        mc_dropout_predict(model, X_tensor, n_samples=50)
 
 Results (FD001):
 
-    RMSE improves to ≈ 12.9 cycles, better than the standard local LSTM run (~17.4 in the modular setup, ~16–13 in earlier FD001-only experiments)
+    RMSE improves to ≈ 12.9 cycles, better than the standard local LSTM run
 
     Predictive standard deviation correlates strongly with the absolute error
 
-    Engines with:
-
         Clear degradation → lower uncertainty
 
-        Long periods of “flat” RUL (many cycles close to MAX_RUL = 125 due to clamping) → higher uncertainty
+        Long periods of “flat” RUL (due to clamping) → higher uncertainty
 
 Interpretation:
-
-    MC-Dropout successfully identifies where the model is less sure (e.g. under-informative sequences)
-
-    Uncertainty can be used as a risk indicator for engineers (e.g. “double-check this asset”)
-
+MC-Dropout successfully identifies where the model is less sure (e.g. under-informative sequences). Uncertainty can be used as a risk indicator for engineers (“double-check this asset”).
 3.2 Global LSTM with Dropout (Regularization Variant)
 
 A second global run was performed with a Dropout-enhanced LSTM (regularization, single deterministic prediction per sample).
@@ -337,7 +357,115 @@ Observations:
 
     The global Dropout model shows a consistently negative Bias (pessimistic RUL), which is in line with the asymmetric loss that discourages over-optimistic predictions.
 
-    This variant provides a useful regularized baseline and a starting point to extend MC-Dropout uncertainty from FD001 to the full global setup.
+    This variant provides a useful regularized baseline and the starting point to extend MC-Dropout uncertainty from FD001 to the full global setup.
+
+🌐 V6: Global Seq2Seq World Model (RUL Trajectory Prediction)
+Architecture (src/models/world_model.py)
+
+The World Model is implemented as a sequence-to-sequence encoder–decoder:
+
+    Encoder: multi-layer LSTM over past sequences (past_len = 30 cycles)
+
+    Decoder: multi-layer LSTM that rolls out a future RUL trajectory (horizon = 20 cycles)
+
+    A small projection head maps hidden states to a scalar RUL at each future step
+
+    Teacher forcing during training, open-loop rollout during evaluation
+
+class WorldModelEncoderDecoder(nn.Module):
+    # Encoder: past sequence  (30 cycles)
+    # Decoder: predicts future RUL (20 cycles)
+    # Implemented in src/models/world_model.py
+
+Training (src/world_model_training.py, notebooks/6_world_model_training.ipynb)
+
+Global training is performed over all four subsets (FD001–FD004):
+
+    Inputs: same feature set as the global LSTM
+
+        selected sensors
+
+        3 operating settings
+
+        3 physics-informed features (Effizienz_HPC_Proxy, EGT_Drift, Fan_HPC_Ratio)
+
+    Targets: future RUL sequences of length horizon = 20
+
+    Loss: MSE over the entire predicted RUL trajectory
+
+    Training utilities:
+
+        build_seq2seq_samples_from_df(...)
+
+        build_world_model_dataset_from_df(...)
+
+        train_world_model_global(...) with
+
+            train/val split
+
+            best-model tracking (min. val loss)
+
+            optional early stopping
+
+            checkpoint saving to results/world_model/world_model_global_best.pt
+
+Example training log from V6:
+
+[WorldModel] Epoch 1/25  - train: 6450.12, val: 4425.84
+...
+[WorldModel] Epoch 7/25  - train:    8.04, val:    7.23
+[WorldModel] Epoch 10/25 - train:    4.74, val:    3.58
+[WorldModel] Epoch 15/25 - train:    2.57, val:    3.00  <-- best model
+Early stopping triggered after 20 epochs (no improvement for 5 epochs).
+Loaded best model with val_loss=3.0046
+
+Evaluation
+
+Two key evaluation modes are implemented in world_model_training.py:
+
+    Trajectory-Level Error (all future steps)
+
+        MSE / RMSE over all (engine, future_step) samples
+
+        Example (train/global rollout):
+
+            MSE ≈ 21.96, RMSE ≈ 4.69 over ~147k future RUL samples
+
+    End-of-Life NASA Score (test set)
+
+        For each engine:
+
+            Take the rolled-out future RUL trajectory at the end of the horizon
+
+            Compare the last predicted RUL to the true RUL at failure
+
+            Compute per-engine error and NASA PHM08 penalty
+
+        Implemented in compute_nasa_score_from_world_model(...)
+
+V6 Test-Set NASA for the World Model:
+
+{
+ 'num_engines': 653,
+ 'mean_error':      1.65,   # mean(pred - true) at end-of-life
+ 'mean_abs_error':  1.90,   # |pred - true|
+ 'nasa_score_sum':  215.32,
+ 'nasa_score_mean': 0.33,   # per engine
+}
+
+Interpretation:
+
+    The World Model is slightly optimistic at end-of-life (+1.65 cycles), but very close to unbiased.
+
+    Average end-of-life error is ≈ 1.9 cycles.
+
+    The mean NASA score ≈ 0.33 per engine indicates very low risk of late RUL predictions, especially compared to the LSTM baselines (which have NASA sums in the O(10³–10⁴) range across all FDs).
+
+This makes the V6 World Model a strong candidate for:
+
+    Scenario simulation (“what happens to RUL if operation continues like this?”)
+
+    Downstream decision-making, where both the shape of the RUL trajectory and the risk at end-of-life matter.
 
 🧱 Project Structure
 
@@ -349,22 +477,33 @@ AI_Turbine_RUL_Monitor_CMAPSS/
 │  ├─ FD002/
 │  ├─ FD003/
 │  ├─ FD004/
-│  └─ global/             # global model predictions & weights
+│  ├─ global/             # global LSTM model predictions & weights
+│  └─ world_model/        # V6 world model checkpoints & diagnostics
 ├─ notebooks/
 │  ├─ 1_fd001_exploration.ipynb
-│  ├─ 2_training_local_models.ipynb
-│  ├─ 3_local_evaluation.ipynb
-│  └─ 3_global_model_evaluation.ipynb
+│  ├─ 1a_fd002_exploration.ipynb
+│  ├─ 2_training_single_datasets.ipynb
+│  ├─ 3_evaluation_global_model.ipynb
+│  ├─ 3a_evaluation_all_datasets.ipynb
+│  ├─ 4_global_lstm.ipynb
+│  ├─ 4a_global_lstm_dropout.ipynb
+│  ├─ 5_training_uncertainty_dropout_analysis.ipynb
+│  └─ 6_world_model_training.ipynb          # V6 Seq2Seq world model
 └─ src/
    ├─ __init__.py
    ├─ config.py
    ├─ data_loading.py
    ├─ additional_features.py
    ├─ training.py
+   ├─ world_model_training.py               # dataset builders + training + eval
    ├─ models/
    │  ├─ lstm_rul.py
-   │  └─ lstm_rul_mcdo.py
-   └─ uncertainty.py
+   │  ├─ lstm_rul_mcdo.py
+   │  └─ world_model.py                     # WorldModelEncoderDecoder
+   ├─ loss.py
+   ├─ model.py
+   ├─ uncertainty.py
+   └─ eval_utils.py / train_utils.py        # helper utilities (optional)
 
 🚀 How to Run
 1. Environment
@@ -386,29 +525,49 @@ data/raw/
 
 3. Train Local Models (FD001–FD004)
 
-    Open notebooks/2_training_local_models.ipynb
+    Open notebooks/2_training_single_datasets.ipynb
 
     Select the turbine_ai kernel
 
-    Run all cells:
+    Run all cells to:
 
         Train one LSTM per FD
 
         Save predictions & weights under results/FD00X/
 
-4. Evaluate & Analyze
+4. Train Global LSTM Model
 
-    Open notebooks/3_local_evaluation.ipynb and 3_global_model_evaluation.ipynb
+    Open notebooks/4_global_lstm.ipynb
 
     Run all cells to:
 
-        Load prediction CSVs
+        Train the global physics-informed LSTM
 
-        Compute metrics (RMSE / MAE / Bias / NASA)
+        Save global predictions & weights under results/global/
 
-        Inspect RUL-bins, per-unit errors
+5. Train V6 World Model (Seq2Seq)
 
-        Visualize correlations and degradation behaviour
+    Open notebooks/6_world_model_training.ipynb
+
+    Run all cells to:
+
+        Build global Seq2Seq datasets
+
+        Train the WorldModelEncoderDecoder
+
+        Save best checkpoint to results/world_model/world_model_global_best.pt
+
+        Evaluate end-of-life error and NASA score on the global test set
+
+6. Evaluate & Analyze
+
+    Use notebooks/3_local_evaluation.ipynb and 3a_evaluation_all_datasets.ipynb for local/global LSTMs
+
+    Use notebooks/6_world_model_training.ipynb for:
+
+        RUL trajectory visualizations
+
+        End-of-life NASA evaluation for the World Model
 
 🔭 Roadmap / Future Work
 
@@ -416,25 +575,25 @@ This repository is part of a broader “Mechanical Engineer AI Assistant” visi
 
 Planned next steps:
 
-    Seq2Seq / World Models
+    Extended World Models
 
-        Encoder–decoder architectures (LSTM/GRU) to predict full future sensor trajectories and/or RUL sequences
+        Predict full multi-step sensor trajectories (not just RUL)
 
-        Basis for “what-if” simulations and scenario analysis
+        Combine with physics constraints / PINNs
 
-    Hyperparameter Optimization (Optuna + PyTorch Lightning)
+    Hyperparameter Optimization
 
-        Systematic tuning of:
+        Optuna + PyTorch Lightning for joint tuning of:
 
             LSTM size, depth, dropout
 
-            Loss weights (asymmetry, RUL vs. sensor)
+            Loss weights (RUL vs. sensor vs. physics constraints)
 
             Sequence length and feature sets
 
     Extended Uncertainty Quantification
 
-        Apply MC-Dropout and/or deep ensembles to the global model
+        Apply MC-Dropout and/or deep ensembles to the global and world models
 
         Add calibration plots and risk-aware decision rules
 
@@ -444,7 +603,7 @@ Planned next steps:
 
             Online RUL monitoring per asset
 
-            Physics-feature plots and trend analysis for engineers
+            Physics feature plots and trend analysis for engineers
 
 📞 Contact & License
 

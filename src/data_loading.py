@@ -203,3 +203,18 @@ def load_cmapps_global(fd_ids=FD_IDS_GLOBAL,
 
     df_train_all = pd.concat(train_frames, ignore_index=True)
     return df_train_all, test_dfs, test_ruls
+
+def load_cmapps_global_test():
+    """
+    Lädt alle Test-Sets FD001–FD004, fügt FD_ID hinzu
+    und liefert ein einheitliches DataFrame zurück.
+    """
+    dfs = []
+    for fd_id in ["FD001", "FD002", "FD003", "FD004"]:
+        df_train, df_test, rul_test = load_cmapps_subset(fd_id)
+
+        df_test = df_test.copy()
+        df_test["FD_ID"] = fd_id
+        dfs.append(df_test)
+
+    return pd.concat(dfs, ignore_index=True)
