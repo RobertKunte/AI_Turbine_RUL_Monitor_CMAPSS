@@ -224,3 +224,304 @@ class WorldModelEncoderDecoderMultiTask(nn.Module):
         traj_outputs = torch.cat(outputs, dim=1)   # (B, H, 1)
 
         return traj_outputs, eol_pred
+
+
+class WorldModelEncoderDecoderMultiTaskV9(nn.Module):
+    """
+    V9: Seq2Seq World Model with improved EOL head
+
+    - Encoder: LSTM over past_len sensor+physics features
+    - Decoder: LSTM that predicts a RUL trajectory of length `horizon`
+    - EOL head:
+        * takes the FULL encoder output over time
+        * applies attention pooling over time dimension
+        * then an MLP to predict a single scalar RUL (EOL-style)
+
+    This is a drop-in replacement for the previous
+    WorldModelEncoderDecoderMultiTask class: same forward signature.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 64,
+        num_layers: int = 2,
+        output_size: int = 1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.output_size = output_size
+
+        # -------------------------
+        # Encoder
+        # -------------------------
+        self.encoder = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        # -------------------------
+        # Decoder
+        # -------------------------
+        # We autoregress on the RUL itself: input_size = output_size (=1)
+        self.decoder = nn.LSTM(
+            input_size=output_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        # Map decoder hidden -> RUL (per time step)
+        self.fc_out = nn.Linear(hidden_size, output_size)
+
+        # -------------------------
+        # EOL Head: Attention pooling + MLP
+        # -------------------------
+
+        # Simple additive attention over encoder outputs:
+        # scores_t = v^T * tanh(W * h_t)
+        self.eol_attn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1),   # score per time step
+        )
+
+        # MLP on the pooled encoder representation
+        self.eol_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1),  # scalar RUL
+        )
+        
+        # V10.1: Use PyTorch's default initialization (no special bias/weight init)
+        # This allows the model to learn from scratch without being biased towards a mean RUL
+        # Previously: bias.fill_(90.0) and gain=0.1 caused collapse to constant predictions
+
+    def forward(
+        self,
+        encoder_inputs: torch.Tensor,          # (B, L_past, F)
+        decoder_targets: Optional[torch.Tensor] = None,  # (B, H, 1) or None
+        teacher_forcing_ratio: float = 0.5,
+        horizon: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args
+        ----
+        encoder_inputs : (B, L_past, F)
+        decoder_targets : (B, H, 1) or None
+            Ground-truth RUL trajectory. Used for teacher forcing and to
+            determine `horizon` if not given.
+        teacher_forcing_ratio : float
+        horizon : int or None
+            Number of future steps. If None and decoder_targets is given,
+            horizon = decoder_targets.shape[1].
+
+        Returns
+        -------
+        traj_outputs : (B, H, 1)
+            Predicted RUL trajectory.
+        eol_pred : (B, 1)
+            Predicted scalar RUL at the evaluation point (EOL-style).
+        """
+        batch_size = encoder_inputs.size(0)
+
+        # -------------------------
+        # Encoder
+        # -------------------------
+        enc_out, (h_n, c_n) = self.encoder(encoder_inputs)
+        # enc_out: (B, L_past, hidden_size)
+
+        # -------------------------
+        # EOL Head with Attention Pooling
+        # -------------------------
+        # Compute attention scores per time step
+        # attn_scores: (B, L_past, 1)
+        attn_scores = self.eol_attn(enc_out)  # (B, L_past, 1)
+        attn_weights = torch.softmax(attn_scores, dim=1)  # (B, L_past, 1) - softmax over time dimension
+
+        # Weighted sum over time → pooled representation (B, hidden_size)
+        # CRITICAL: Ensure gradients flow through attention pooling
+        # enc_out: (B, L_past, hidden_size), attn_weights: (B, L_past, 1)
+        # Broadcasting: (B, L_past, hidden_size) * (B, L_past, 1) -> (B, L_past, hidden_size)
+        enc_pooled = (enc_out * attn_weights).sum(dim=1)  # (B, hidden_size)
+
+        # EOL prediction
+        eol_pred = self.eol_head(enc_pooled)  # (B, 1)
+
+        # -------------------------
+        # Decoder
+        # -------------------------
+        # Determine horizon
+        if decoder_targets is not None and horizon is None:
+            horizon = decoder_targets.size(1)
+        if horizon is None:
+            raise ValueError("Either decoder_targets or horizon must be provided.")
+
+        # Initial decoder input:
+        if decoder_targets is not None:
+            # use first GT RUL as start token
+            dec_input = decoder_targets[:, 0:1, :]   # (B, 1, 1)
+        else:
+            # fall back to EOL prediction as start (in pure inference)
+            dec_input = eol_pred.unsqueeze(1)        # (B, 1, 1)
+
+        dec_hidden = (h_n, c_n)  # start from encoder hidden state
+
+        outputs = []
+        for t in range(horizon):
+            dec_out, dec_hidden = self.decoder(dec_input, dec_hidden)
+            step_pred = self.fc_out(dec_out)  # (B, 1, 1)
+            outputs.append(step_pred)
+
+            # Teacher forcing or autoregressive feeding
+            if decoder_targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                if t + 1 < decoder_targets.size(1):
+                    dec_input = decoder_targets[:, t + 1 : t + 2, :]
+                else:
+                    dec_input = step_pred
+            else:
+                dec_input = step_pred
+
+        traj_outputs = torch.cat(outputs, dim=1)  # (B, H, 1)
+
+        return traj_outputs, eol_pred
+
+
+class WorldModelEncoderDecoderMultiTaskV11(nn.Module):
+    """
+    V11: World Model mit SEPARATEM EOL-Encoder.
+
+    Wichtigste Änderung gegenüber V9/V10:
+    - Trajektorien-Encoder und EOL-Encoder sind GETRENNT
+    - Kein Shared-Encoder mehr, der für beide Tasks optimiert werden muss
+    - Vermeidet Kollaps des EOL-Zweigs durch widersprüchliche Gradienten
+
+    Architektur:
+    - encoder_traj: LSTM für Trajektorien-Vorhersage
+    - decoder_traj: LSTM-Decoder für Trajektorien
+    - encoder_eol: SEPARATER LSTM für EOL-Vorhersage
+    - eol_head: MLP auf letztem Hidden-State von encoder_eol
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size_traj: int = 64,
+        hidden_size_eol: int = 64,
+        num_layers_traj: int = 2,
+        num_layers_eol: int = 2,
+        output_size: int = 1,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        self.input_size = input_size
+        self.hidden_size_traj = hidden_size_traj
+        self.hidden_size_eol = hidden_size_eol
+        self.num_layers_traj = num_layers_traj
+        self.num_layers_eol = num_layers_eol
+        self.output_size = output_size
+
+        # --- Trajektorien-Encoder/Decoder ---
+        self.encoder_traj = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size_traj,
+            num_layers=num_layers_traj,
+            batch_first=True,
+            dropout=dropout if num_layers_traj > 1 else 0.0,
+        )
+
+        self.decoder_traj = nn.LSTM(
+            input_size=output_size,
+            hidden_size=hidden_size_traj,
+            num_layers=num_layers_traj,
+            batch_first=True,
+            dropout=dropout if num_layers_traj > 1 else 0.0,
+        )
+
+        self.fc_traj = nn.Linear(hidden_size_traj, output_size)
+
+        # --- Separater EOL-Encoder ---
+        self.encoder_eol = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size_eol,
+            num_layers=num_layers_eol,
+            batch_first=True,
+            dropout=dropout if num_layers_eol > 1 else 0.0,
+        )
+
+        # EOL-Head: MLP auf letztem Hidden-State
+        self.eol_head = nn.Sequential(
+            nn.Linear(hidden_size_eol, hidden_size_eol),
+            nn.ReLU(),
+            nn.Linear(hidden_size_eol, hidden_size_eol // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size_eol // 2, 1),
+        )
+
+    def forward(
+        self,
+        encoder_inputs: torch.Tensor,  # (B, L, F)
+        decoder_targets: Optional[torch.Tensor] = None,  # (B, H, 1) oder None
+        teacher_forcing_ratio: float = 0.5,
+        horizon: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass für Multi-Task World Model V11.
+
+        Returns:
+            traj_outputs: (B, H, 1) - Trajektorien-Vorhersagen
+            eol_pred: (B, 1) - EOL-Vorhersage
+        """
+        B = encoder_inputs.size(0)
+
+        # --- Trajektorienpfad ---
+        enc_traj_out, (h_n_traj, c_n_traj) = self.encoder_traj(encoder_inputs)
+
+        if decoder_targets is not None and horizon is None:
+            horizon = decoder_targets.size(1)
+        if horizon is None:
+            raise ValueError("Either decoder_targets or horizon must be provided.")
+
+        # Decoder-Input initialisieren
+        if decoder_targets is not None:
+            dec_input = decoder_targets[:, 0:1, :]  # (B, 1, 1)
+        else:
+            # Start token: z.B. letztes true RUL oder 0
+            dec_input = torch.zeros(B, 1, 1, device=encoder_inputs.device)
+
+        dec_hidden = (h_n_traj, c_n_traj)
+        traj_outputs = []
+
+        for t in range(horizon):
+            dec_out, dec_hidden = self.decoder_traj(dec_input, dec_hidden)
+            step_pred = self.fc_traj(dec_out)  # (B, 1, 1)
+            traj_outputs.append(step_pred)
+
+            # Teacher Forcing
+            if decoder_targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                if t + 1 < decoder_targets.size(1):
+                    dec_input = decoder_targets[:, t + 1 : t + 2, :]
+                else:
+                    dec_input = step_pred
+            else:
+                dec_input = step_pred
+
+        traj_outputs = torch.cat(traj_outputs, dim=1)  # (B, H, 1)
+
+        # --- EOL-Pfad (separat) ---
+        enc_eol_out, (h_n_eol, c_n_eol) = self.encoder_eol(encoder_inputs)
+        h_last_eol = h_n_eol[-1]  # (B, hidden_size_eol)
+        eol_pred = self.eol_head(h_last_eol)  # (B, 1)
+
+        return traj_outputs, eol_pred

@@ -1,556 +1,418 @@
-
 # 🚀 AI-Based Turbine RUL Monitor – Physics-Informed World Models
 
-## 🔍 **Quick Benchmark Summary**
+End-to-end **PHM pipeline** for NASA C-MAPSS FD001–FD004, combining:
 
-This repository implements and compares several classes of RUL prediction models:
-
-### **Your results (FD001, EOL evaluation):**
-
-| Model                           | RMSE     | NASA    | Notes                                          |
-| ------------------------------- | -------- | ------- | ---------------------------------------------- |
-| **Local LSTM (V4)**             | **17.4** | 342     | Strong classical baseline                      |
-| **Global LSTM (V5)**            | ~14.8    | ~447    | Best RMSE among internal models                |
-| **World Model V7/V8 (MT)**      | 41–42    | 280–320 | Great safety (NASA), weak RMSE                 |
-| **World Model + EOL Regressor** | ~40.9    | 220     | Best NASA among World Models after calibration |
-
-### **Recent literature (FD001, typical RMSE):**
-
-| Architecture                                                        | FD001 RMSE | Sources |
-| ------------------------------------------------------------------- | ---------- | ------- |
-| **Transformer variants (GCU-Transformer, reweighted Transformers)** | **11–13**  |         |
-| **CNN/LSTM hybrids, improved labeling**                             | 12–15      |         |
-| **XGBoost + engineered RUL labels**                                 | ~12.9      |         |
-
-**Interpretation:**
-
-* Your **LSTM baselines** are competitive with older DL methods (≈15–20 RMSE).
-* Your **World Models** excel at **trajectory prediction, uncertainty, and NASA**, but are not optimized for RMSE.
-* Literature SOTA achieves **11–13 cycles RMSE**, usually via Transformers + convolution front-ends + sample reweighting.
-
-This README explains how your work fits into this landscape and how it extends classical PHM approaches toward *trajectory-aware, physics-informed, safety-first World Models*.
+- **Physics-informed LSTM baselines** (per FD + global)
+- **World-Model–style seq2seq degradation models**
+- **EOL-focused metrics** (RMSE, MAE, Bias, NASA PHM08)
+- A clear separation between:
+  - **Sharp EOL prediction** and  
+  - **Trajectory, uncertainty & safety evaluation**
 
 ---
 
-# 📘 1. Overview
+## 🔍 0. Quick Benchmark Summary
 
-This repository implements a complete **Prognostics & Health Management (PHM)** workflow for turbofan engines using NASA C-MAPSS FD001–FD004.
+### 0.1 Current core baselines – EOL-Full-LSTM (per FD, EOL evaluation)
+
+Single LSTM model trained per dataset (FD001–FD004), with:
+
+- Windowed sequences (past_len = 30)
+- Labels = **RUL at the last cycle** of each window (capped at 125)
+- Engine-based train/val split (no leakage)
+- Physics-informed features enabled
+
+**Pointwise metrics (all validation samples):**
+
+| Dataset | Engines | Samples | RMSE (point) | MAE (point) | R² (point) | NASA (point, mean) |
+|--------:|--------:|--------:|-------------:|------------:|-----------:|--------------------:|
+| FD001   | 100     | 17 731  | **16.36**    | 11.87       | 0.845      | 8.37               |
+| FD002   | 260     | 46 219  | **19.18**    | 14.52       | 0.789      | 9.73               |
+| FD003   | 100     | 21 820  | **13.64**    | 9.47        | 0.891      | 4.99               |
+| FD004   | 249     | 54 028  | **21.24**    | 14.99       | 0.736      | 29.04              |
+
+**EOL metrics (one sample per engine, last cycle):**
+
+| Dataset | Engines | RMSE (EOL) | MAE (EOL) | Bias (EOL) | NASA (EOL, mean) |
+|--------:|--------:|-----------:|----------:|-----------:|------------------:|
+| FD001   | 100     | **2.74**   | 2.58      | +2.58      | 0.30             |
+| FD002   | 260     | **4.59**   | 4.13      | +4.13      | 0.54             |
+| FD003   | 100     | **3.13**   | 2.92      | +2.92      | 0.35             |
+| FD004   | 249     | **9.30**   | 8.46      | +8.46      | 1.54             |
+
+👉 **Takeaway:**  
+Per-FD EOL-Full-LSTM models are **strong, physics-informed baselines**: good pointwise RMSE, **very low NASA scores at EOL** (safety), and near-zero or slightly positive bias.
+
+---
+
+### 0.2 Global FD001–FD004 EOL-Full-LSTM (single model for all FDs)
+
+A single EOL-Full-LSTM trained jointly on FD001–FD004:
+
+- Shared scaler + shared LSTM across all operating modes
+- Same physics features and windowing
+- Engine-based split on the **combined dataset**
+
+**Global validation metrics:**
+
+- **Pointwise (all samples):**
+  - RMSE ≈ **21.53** cycles
+  - MAE ≈ 15.82
+  - Bias ≈ −2.56
+  - R² ≈ 0.73
+
+- **EOL (per engine, last cycle across val engines):**
+  - RMSE_eol ≈ **17.47** cycles  
+  - MAE_eol ≈ 12.90  
+  - Bias_eol ≈ +11.62  
+  - NASA_mean ≈ **19.1**
+
+👉 **Takeaway:**  
+The global model is a **unified baseline** across all FD sets, but **per-FD models are clearly stronger** – especially in EOL RMSE and NASA. This matches the intuition that FD002/FD004 multi-condition / multi-fault behavior is easier to handle with specialized models (or more advanced encoders).
+
+---
+
+### 0.3 World Models vs. LSTM baselines (FD001, qualitative)
+
+From earlier experiments (V6–V8):
+
+| Model                              | FD001 RMSE (EOL) | NASA (EOL mean) | Notes                                                  |
+|------------------------------------|------------------|------------------|--------------------------------------------------------|
+| Local physics LSTM (old V4)        | ~17–18           | ~300–400         | Early per-FD baseline                                 |
+| Global LSTM (old V5)               | ~14–15           | ~400–450         | Joint FD001–FD004 model                               |
+| **Seq2Seq World Model (V6)**       | ≫40              | **≪ LSTM NASA**  | Trained on trajectories only (no explicit EOL head)   |
+| Multi-task World Model (V7/V8)     | ~41–42           | 280–320          | Joint traj + EOL training                             |
+| World Model + EOL Regressor (2-stg)| ~41              | ~220             | Calibrated EOL head on frozen encoder                 |
+
+👉 **Story in one sentence:**  
+LSTM baselines achieve **better RMSE**, while **World Models** shine in **trajectory modeling, safety (NASA), and interpretability**, especially when used as calibrated, simulation-style models rather than pure EOL predictors.
+
+---
+
+## 1. Project Overview
+
+This repository implements a complete **Prognostics & Health Management (PHM)** workflow for turbofan engines using the NASA **C-MAPSS** datasets FD001–FD004.
 
 The project bridges:
 
-* **Classical deep-learning RUL prediction** (LSTM, global models, physics-informed features)
-* **World-Model-based degradation forecasting** (seq2seq dynamics, safety metrics, uncertainty)
-* **Multi-task learning** (trajectory + End-of-Life prediction)
-* **NASA PHM08 exponential scoring** (overprediction-penalized)
+- **Classical deep-learning for RUL** (LSTM, global models, physics-informed features)
+- **World-Model–style degradation forecasting** (seq2seq dynamics, multi-step RUL trajectories)
+- **Multi-task models** (trajectory + EOL)
+- **Safety-focused scoring** with the NASA PHM08 exponential penalty for late predictions
 
-The goal is to create an architecture that can:
+The main goals:
 
-1. Predict **sharp RUL** at End-of-Life (EOL)
-2. Produce **20-step degradation trajectories**
-3. Offer **uncertainty** and **safety-focused** outputs
-4. Use **physics-informed features** for interpretability
-
----
-
-# 📁 2. Repository Structure
-
-```
-src/
-  models/
-    lstm_baseline.py
-    world_model.py
-    eol_regressor.py
-  data_loading.py
-  additional_features.py
-  world_model_training.py
-  evaluation.py
-
-notebooks/
-  V6, V7, V8 experiments
-
-results/
-  checkpoints/
-  metrics/
-  plots/
-```
+1. Build **reproducible, physics-informed baselines** on FD001–FD004  
+2. Add **World Models** for multi-step degradation trajectories & “what-if” scenarios  
+3. Evaluate models with both **RMSE** and **NASA** to balance accuracy and safety  
+4. Use **engineer-friendly features** to keep the model interpretable
 
 ---
 
-# ⚙️ 3. Physics-Informed Features
+## 2. Data & Operating Conditions
 
-To enhance interpretability and improve signal-to-noise ratio, three key degradation indicators were engineered:
+- **FD001 / FD003:** single operating condition, single fault mode  
+- **FD002 / FD004:** multiple operating conditions, multiple fault modes
 
-| Feature                 | Formula                   | Meaning                       |
-| ----------------------- | ------------------------- | ----------------------------- |
-| **Effizienz_HPC_Proxy** | Sensor12 / Sensor7        | Proxy for HPC efficiency loss |
-| **EGT_Drift**           | Sensor17 − EGT_base(unit) | Exhaust gas temperature drift |
-| **Fan_HPC_Ratio**       | Sensor2 / Sensor3         | Fan vs. HPC loading shift     |
+For FD002/FD004, operating conditions are provided as:
 
-These are inspired by real turbomachinery degradation physics and significantly stabilize training.
+- `Setting1`, `Setting2`, `Setting3` (e.g., altitude, Mach, operational condition)
 
----
+Two encodings were tested:
 
-# 🧠 4. Implemented Models
+1. **Continuous settings (default)**  
+   Directly use the three setting values as continuous features  
+   → **physically realistic** and slightly better NASA score.
 
-## **V2–V4 — Local LSTM per FD Set**
+2. **Discrete ConditionID (7 clusters)**  
+   Round `(S1, S2, S3)` and map each triple to a small integer ID  
+   → Similar RMSE / MAE, but less physically interpretable.
 
-* Fully literature-conform EOL setup (1 sample per engine)
-* Strong RMSE on FD001 (~17.4)
-
-## **V5 — Global LSTM**
-
-* Single model across FD001–FD004
-* Better condition generalization for FD002/FD004
-* FD001 RMSE ≈ 14.8
+**Default:** Continuous settings; `ConditionID` remains an optional experimental feature.
 
 ---
 
-## **V6 — Seq2Seq World Model (Trajectory Only)**
+## 3. Physics-Informed Features
 
-* LSTM Encoder → LSTM Decoder
-* Predicts full 20-step RUL trajectory
-* Excellent temporal stability, but **poor EOL accuracy**
-  (it was never trained for EOL).
+Three engineered features capture key turbomachinery degradation trends:
 
----
+| Feature               | Formula              | Meaning                                  |
+|----------------------|----------------------|------------------------------------------|
+| `Effizienz_HPC_Proxy`| Sensor12 / Sensor7   | Proxy for high-pressure compressor loss  |
+| `EGT_Drift`          | Sensor17 − EGT_base  | Exhaust gas temperature drift vs. healthy|
+| `Fan_HPC_Ratio`      | Sensor2 / Sensor3    | Fan vs. HPC loading shift                |
 
-## **V7 — Multi-Task World Model (Trajectory + EOL Head)**
+They:
 
-Adds:
-
-* EOL prediction head on encoder hidden state
-* Joint trajectory + EOL loss
-* Bias monitoring
-* NASA score integrated in evaluation
-
-**Raw FD001 metrics:**
-
-```
-RMSE: 41.8
-NASA: 321
-Bias: +12
-```
-
-### **Calibrated version (linear correction):**
-
-```
-RMSE: 40.1
-Bias: ~0
-NASA mean: 105.8 (excellent)
-```
-
-World Models deliver **great NASA** (safety) but not SOTA RMSE.
+- Reduce noise in raw sensors
+- Align model behavior with physical intuition
+- Stabilize training, especially across FD002/FD004
 
 ---
 
-## **V8 — Multi-Task + Physics Features + Stabilization**
+## 4. Model Families
 
-Improvements:
+### 4.1 Current Core: EOL-Full-LSTM (per FD)
 
-* Stronger EOL head (3-layer MLP)
-* Physics features
-* Better loss balancing
-* Smoothed trajectories
+**Idea:**  
+Train on **all windows along the trajectory**, but always predict the **RUL at the last cycle of the window** (EOL-centric label). This is closer to how an operator would use the model “today”.
 
-But:
+Key characteristics:
 
-* FD001 RMSE remains ~41–42
-* NASA remains ~280–320
+- Inputs: past 30 cycles (standardized sensors + settings + physics features)
+- Label: capped RUL at window end (0–125)
+- Split: **engine-based** (no leakage across windows)
+- Loss: MSE on RUL
+- Evaluation:
+  - pointwise metrics over all validation windows
+  - EOL metrics over **one sample per engine** (last cycle)  
+  - NASA PHM08 on EOL predictions
 
-The bottleneck is the **encoder representation**, not the head.
-
----
-
-## **EOL Regressor (Two-Stage Model)**
-
-To achieve sharp EOL RMSE:
-
-1. **Freeze World Model Encoder**
-2. Train an independent **EOL MLP** on EOL windows only
-3. Evaluate using literature-standard EOL RMSE, MAE, Bias, NASA
-
-**FD001 results:**
-
-```
-RMSE: 40.9
-NASA: 219.9
-Bias: +8.1
-```
-
-NASA improves significantly; RMSE remains World-Model-limited.
+These models form the **main baselines** reported in section 0.1.
 
 ---
 
-# 📚 5. Benchmark Comparison (Internal vs. Literature)
+### 4.2 Global FD001–FD004 EOL-Full-LSTM
 
-### **Internal Models**
+Single LSTM over all four FD sets:
 
-| Model / Version          | FD001 RMSE | FD001 NASA | Notes                      |
-| ------------------------ | ---------- | ---------- | -------------------------- |
-| **Local LSTM (V4)**      | **17.4**   | 342        | Good classic baseline      |
-| **Global LSTM (V5)**     | ~14.8      | ~447       | Best RMSE internally       |
-| **World Model V6**       | ~78        | 2160       | Trajectory-only model      |
-| **World Model V7**       | 41.8       | 321        | Strong NASA                |
-| **V7 (Calibrated)**      | 40.1       | **105.8**  | Best NASA                  |
-| **World Model V8**       | 41–42      | 280–320    | Stable but RMSE still high |
-| **World Model + EOLReg** | 40.9       | 219.9      | Better NASA, similar RMSE  |
-
----
-
-### **Literature Benchmarks (FD001)**
-
-| Paper / Method                                    | RMSE      | Score/NASA | Summary                                |   |
-| ------------------------------------------------- | --------- | ---------- | -------------------------------------- | - |
-| **Reweighted Transformer (Kim 2024)**             | **11.36** | 192.2      | Transformer + sample reweighting       |   |
-| **GCU-Transformer**                               | **11–12** | –          | Hybrid gated convolution + transformer |   |
-| **CTVAE / Health-Aware Transformer (Sadek 2025)** | 12.41     | –          | VAE + transformer, uncertainty-aware   |   |
-| **CNN for RUL (Li 2018)**                         | 12–15     | –          | Early evidence CNN > LSTM              |   |
-| **Enhanced LSTM (Elsherif 2025)**                 | 13.22     | 232.2      | Better RUL target generation           |   |
-| **XGBoost + RUL pre-generation**                  | ~12.9     | –          | Classic ML with engineered RUL labels  |   |
-
-**Conclusion:**
-Literature SOTA for FD001 sits consistently at **11–13 RMSE**, mostly achieved by:
-
-* Transformers with CNN front-ends
-* Attention-enhanced LSTMs
-* Improved RUL labeling or reweighting
-* Variational latent-state models
-
-Your project targets *World Model explainability + safety (NASA)* rather than raw RMSE.
-
----
-
-# 🧪 6. Why RMSE and NASA Behave Differently
-
-* **RMSE** penalizes squared error → sensitive to systematic trends.
-* **NASA PHM08 Score** penalizes only **overprediction** exponentially (late warnings).
-
-World Models tend to:
-
-* Underpredict at high RUL → improves NASA.
-* Overpredict near failure → controlled by calibration.
-
-Thus:
-
-* **Low NASA is easier**
-* **Low RMSE requires a specialized EOL model**
-
----
-
-# 🚀 7. Roadmap (Phase 1–3)
-
-## **Phase 1 — Split the Problem**
-
-* World Model → **Trajectory, uncertainty, safety**
-* EOL Regressor → **Sharp RMSE**
-
-## **Phase 2 — Encoder Upgrades**
-
-* CNN + LSTM + Attention front-end
-* Lightweight Transformer encoders (GCU/health-aware)
-
-## **Phase 3 — Physics-Informed World Model**
-
-* Multi-head forecasting (sensors + RUL)
-* Variational latent-state dynamics (Deep State Space)
-* Mode-specific encoding for FD002/FD004
-* Full uncertainty propagation
-
----
-
-# 👤 8. Contact & License
-
-**Author:** Dr.-Ing. Robert Kunte
-**LinkedIn:** [https://www.linkedin.com/in/robertkunte/](https://www.linkedin.com/in/robertkunte/)
-**License:** MIT
-
-If you work on turbomachinery, PHM, or physics-informed ML and want to collaborate, feel free to reach out!
-
-<<<<<<< HEAD
-=======
-For the multi-condition subsets FD002 and FD004, settings are provided as:
-
-    Setting1, Setting2, Setting3 (e.g. altitude, throttle, environment)
-
-Two encodings were compared:
-
-    Continuous settings (default)
-
-        Use Setting1/2/3 directly as continuous input features
-
-        Closest to physical reality (continuous operating envelope)
-
-    Discrete ConditionID (7 clusters)
-
-        Round (Setting1, Setting2, Setting3) and map triples to a small set of discrete IDs
-
-        Model sees a single numeric ConditionID instead of three settings
+- Same windowing and feature set
+- Shared model & scaler
+- Learned across different fault modes and operating envelopes
 
 Result:
 
-    RMSE / MAE are very similar,
+- More **compact** and unified, but
+- **Weaker** than per-FD models on EOL metrics  
+  → especially important for safety-critical deployment.
 
-    but continuous settings yield slightly better NASA scores and are physically more realistic.
+This is still a useful **reference point** for research on:
 
-Therefore, continuous settings are used as the default encoding, and ConditionID remains an optional experimental variant.
-📊 Key Results – LSTM Models
-1. Local Per-FD Models (Physics-Informed LSTM)
+- Domain adaptation
+- Multi-condition encoders
+- Condition-aware attention mechanisms
 
-Local LSTM models are trained separately per FD with physics-informed features and the asymmetric RUL loss.
+---
 
-Test metrics (latest modular run, clamped RUL):
-FD	MSE	RMSE	MAE	Bias (pred−true)	NASA PHM08
-FD001	304.10	17.44	13.29	−7.88	342.57
-FD002	371.03	19.26	15.03	−5.55	1713.73
-FD003	205.97	14.35	10.54	−2.58	278.03
-FD004	528.53	22.99	16.94	−9.40	2631.68
+### 4.3 Legacy Baselines: Classical Global LSTM & MC-Dropout
 
-Interpretation:
+From earlier experiments (pre-EOL-Full pipeline):
 
-    FD001 & FD003: good performance; FD003 is the best subset (low RMSE, low NASA score)
+- **Local per-FD LSTM (V2–V4)**  
+  - Asymmetric loss to penalize over-optimistic RUL  
+  - RUL clamping  
+  - FD001 RMSE ≈ 17–18 cycles
 
-    FD002 & FD004: multi-condition subsets remain more challenging; RMSE reasonable, but NASA scores higher
+- **Global LSTM (V5)**  
+  - Single model across FD001–FD004  
+  - FD001 RMSE ≈ 14–15 cycles, strong performance especially on FD002/FD004  
+  - Acts as a first global physics-informed baseline
 
-2. Global LSTM Model (FD001–FD004 Combined)
+- **MC-Dropout LSTM on FD001**  
+  - Inference with dropout active (50 stochastic passes)  
+  - RMSE improved to ≈ 12.9 cycles in that setup  
+  - Predictive std correlates well with absolute error  
+  - Good demonstration of **uncertainty as a risk indicator** (“double-check this engine”).
 
-A single global LSTM is trained on all four subsets simultaneously:
+These runs are **kept as historical references** and as a bridge to the newer EOL-Full pipeline.
 
-    Shared feature scaler across FD001–FD004
+---
 
-    Inputs: sensor subset, 3 continuous settings, 3 physics features
+### 4.4 Seq2Seq World Models (V6–V8) & EOL Regressor
 
-    Same architecture and loss as local models
+#### V6 – Pure Trajectory World Model
 
-    Evaluation is still per FD + aggregated
+- Encoder–Decoder LSTM:
+  - Encoder: past 30 cycles
+  - Decoder: future 20-step RUL trajectory
+- Loss: MSE over entire predicted trajectory
+- Evaluated by:
+  - trajectory-level RMSE
+  - EOL NASA score based on the last step of the predicted trajectory
 
-Global model (baseline, without MC-Dropout uncertainty):
-FD	Local RMSE	Global RMSE	Local NASA	Global NASA
-FD001	17.44	14.84	342.6	447.4
-FD002	19.26	17.33	1713.7	1395.6
-FD003	14.35	15.21	278.0	428.5
-FD004	22.99	18.08	2631.7	1622.1
+Outcome (global test set):
 
-    Strong gains on FD002 and FD004 (multi-condition, multi-fault)
+- Very low **NASA mean** (~0.33 per engine)
+- Small mean EOL error (~1.9 cycles)
+- But **not optimized** for classical per-FD EOL RMSE
 
-    Slight degradation on FD003 (simpler subset where specialization helps)
+#### V7/V8 – Multi-Task World Model (Trajectory + EOL Head)
 
-    Overall global RMSE improves vs. naïve per-FD models
+Adds:
 
-Conclusion:
-A single global physics-informed LSTM can learn universal degradation patterns and significantly improve performance on complex operating conditions (FD002 / FD004).
-🌫️ Uncertainty Estimation with Dropout
-3.1 MC-Dropout Model for FD001
+- EOL head on encoder hidden state
+- Joint loss (trajectory + EOL)
+- NASA-based evaluation and bias monitoring
 
-For FD001, a dedicated architecture LSTMRUL_MCDropout is used:
+Characteristics:
 
-    Same LSTM structure, but with Dropout layers kept active at inference (MC-Dropout)
+- FD001 EOL RMSE still ~41–42 cycles
+- NASA significantly better than naive LSTM baselines
+- Stable calibration, but EOL accuracy limited by encoder representation
 
-    Helper functions in src/uncertainty.py:
+#### Two-Stage EOL Regressor
 
-        enable_mc_dropout(model)
+To push NASA further:
 
-        mc_dropout_predict(model, X_tensor, n_samples=50)
+1. Freeze the World Model encoder  
+2. Train a separate MLP on encoder outputs, **using only EOL windows**  
+3. Evaluate directly on EOL metrics
 
-Results (FD001):
+FD001 (historical run):
 
-    RMSE improves to ≈ 12.9 cycles, better than the standard local LSTM run
+- RMSE ≈ 40.9 cycles  
+- NASA mean ≈ 220  
+- Bias clearly improved w.r.t. the raw multi-task head
 
-    Predictive standard deviation correlates strongly with the absolute error
+👉 **Interpretation:**  
+World Models excel as **simulation & safety layers** (trajectory, NASA), while sharp EOL prediction is handled better by dedicated EOL-Full-LSTM models.
 
-        Clear degradation → lower uncertainty
+---
 
-        Long periods of “flat” RUL (due to clamping) → higher uncertainty
+## 5. Benchmark vs. Literature (FD001)
 
-Interpretation:
-MC-Dropout successfully identifies where the model is less sure (e.g. under-informative sequences). Uncertainty can be used as a risk indicator for engineers (“double-check this asset”).
-3.2 Global LSTM with Dropout (Regularization Variant)
+### 5.1 Internal vs. Literature RMSE (FD001, EOL-style)
 
-A second global run was performed with a Dropout-enhanced LSTM (regularization, single deterministic prediction per sample).
+| Model / Method                        | FD001 RMSE | NASA (if reported) | Comment                                  |
+|--------------------------------------|-----------:|--------------------:|------------------------------------------|
+| **EOL-Full-LSTM (this repo, FD001)** | **16.36**  | ~282                | Current physics-informed baseline        |
+| Legacy local LSTM (V4)               | ~17–18     | ~300–400            | Older baseline, clamped RUL              |
+| Global LSTM (V5, FD001 only)         | ~14–15     | ~400–450            | Early cross-FD experiment                |
+| World Model V7/V8                    | ~41–42     | 280–320             | Safety-focused, trajectory-aware         |
+| World Model + EOL Regressor          | ~41        | ~220                | Best NASA among World Models             |
 
-Global Dropout Model – Per-FD Metrics:
-FD	MSE	RMSE	MAE	Bias (pred−true)	NASA PHM08
-FD001	251.97	15.87	12.06	−4.33	365.06
-FD002	434.36	20.84	16.09	−11.52	1836.59
-FD003	236.08	15.37	11.27	−2.97	447.60
-FD004	463.59	21.53	15.48	−9.29	2662.79
+**Recent literature (typical FD001 EOL RMSE):**
 
-Global metrics across all FDs:
+| Architecture / Paper                            | FD001 RMSE | NASA / Score | Summary                                           |
+|-------------------------------------------------|-----------:|-------------:|---------------------------------------------------|
+| Reweighted Transformer (Kim 2024)               | **≈11.3**  | ≈192         | Transformer + sample reweighting                 |
+| GCU-Transformer variants                        | 11–12      | –            | Gated conv front-end + Transformer encoder       |
+| Health-aware / CTVAE-style Transformers         | ≈12.4      | –            | Latent health state + attention                  |
+| CNN-based RUL models (e.g., Li 2018, follow-ups)| 12–15      | –            | 1D CNN front-end, often better than plain LSTM   |
+| Enhanced LSTM with improved labeling            | ≈13.2      | ≈230         | Better RUL target generation & loss shaping      |
+| XGBoost + generative RUL labels                 | ≈12.9      | –            | Strong classic ML with heavy feature engineering |
 
-    MSE: 390.77
+👉 **Positioning of this repo:**  
 
-    RMSE: 19.77
+- **Not** trying to chase absolute SOTA RMSE on FD001  
+- Instead focusing on:
+  - clean, **physics-informed LSTM baselines**
+  - **EOL-consistent evaluation**
+  - **World-Model** concepts (trajectory, safety, uncertainty) for engineering applications
 
-    MAE: 14.62
+---
 
-    Bias: −8.51 (overall slightly pessimistic)
+## 6. Lessons Learned & Conceptual Evolution
 
-    NASA PHM08: 5312.04
+### 6.1 From “Toy LSTM” to Engineering-Grade Baseline
 
-Observations:
+**Early approach:**
 
-    Compared to the best global model without dropout, RMSE is somewhat higher, especially on FD002/FD004.
+- Single or per-FD LSTM on clamped RUL labels  
+- Sometimes mixed or sample-based splits (risk of leakage)  
+- Evaluation often **pointwise-only**, not strictly EOL-based  
+- Result: nice-looking RMSE, but not always comparable to literature / PHM practice
 
-    The global Dropout model shows a consistently negative Bias (pessimistic RUL), which is in line with the asymmetric loss that discourages over-optimistic predictions.
+**Current approach:**
 
-    This variant provides a useful regularized baseline and the starting point to extend MC-Dropout uncertainty from FD001 to the full global setup.
+- **Engine-based splits** only → no shared windows between train and val  
+- Clear separation between:
+  - **Pointwise metrics** (all windows)  
+  - **EOL metrics** (one sample per engine, last cycle)  
+- Explicit **RUL capping** to 125 and consistent labeling  
+- Per-FD and global variants, fully reproducible
 
-🌐 V6: Global Seq2Seq World Model (RUL Trajectory Prediction)
-Architecture (src/models/world_model.py)
+### 6.2 Why the Early Trajectory Approaches Misbehaved
 
-The World Model is implemented as a sequence-to-sequence encoder–decoder:
+When we initially tried trajectory-based / multi-step targets:
 
-    Encoder: multi-layer LSTM over past sequences (past_len = 30 cycles)
+- Window generation, target alignment, and splitting were **tightly coupled**
+- A small mistake (e.g. splitting by rows instead of engines) easily created **hidden leakage**
+- The model “saw” future parts of the same engine during training → **unrealistic validation scores**
 
-    Decoder: multi-layer LSTM that rolls out a future RUL trajectory (horizon = 20 cycles)
+The turning points:
 
-    A small projection head maps hidden states to a scalar RUL at each future step
+1. **Engine-based splitting utilities**  
+   (`create_full_dataloaders`, `build_full_eol_sequences_from_df`)  
+   → enforce that **no engine** appears in both train and val.
 
-    Teacher forcing during training, open-loop rollout during evaluation
+2. **EOL-centric labeling**  
+   Training on windows but predicting the RUL at the **end of the window**  
+   → matches the operational use case and the NASA evaluation.
 
-class WorldModelEncoderDecoder(nn.Module):
-    # Encoder: past sequence  (30 cycles)
-    # Decoder: predicts future RUL (20 cycles)
-    # Implemented in src/models/world_model.py
+3. **Separate evaluation paths** for:
+   - trajectory prediction (World Models)
+   - EOL prediction (LSTM baselines, EOL-Full-LSTM)
 
-Training (src/world_model_training.py, notebooks/6_world_model_training.ipynb)
+### 6.3 World Model vs. EOL-Full-LSTM – Conceptual Roles
 
-Global training is performed over all four subsets (FD001–FD004):
+- **EOL-Full-LSTM:**  
+  - “One-shot” RUL estimate from the last 30 cycles  
+  - Good RMSE & NASA when evaluated EOL-style  
+  - Directly comparable to most literature baselines
 
-    Inputs: same feature set as the global LSTM
+- **World Model:**  
+  - Learns a latent **dynamics model** of degradation  
+  - Can simulate multiple future steps and scenario variations  
+  - Better suited for:
+    - what-if analysis
+    - safety envelopes
+    - integration with digital twins / physics models
 
-        selected sensors
+👉 In a real plant, you would **combine** them:
 
-        3 operating settings
+- World Model for **trajectory & risk-aware simulation**  
+- EOL-Full-LSTM (or a refined EOL head) for **sharp decision thresholds** (e.g. maintenance scheduling).
 
-        3 physics-informed features (Effizienz_HPC_Proxy, EGT_Drift, Fan_HPC_Ratio)
+---
 
-    Targets: future RUL sequences of length horizon = 20
+## 7. Project Structure
 
-    Loss: MSE over the entire predicted RUL trajectory
-
-    Training utilities:
-
-        build_seq2seq_samples_from_df(...)
-
-        build_world_model_dataset_from_df(...)
-
-        train_world_model_global(...) with
-
-            train/val split
-
-            best-model tracking (min. val loss)
-
-            optional early stopping
-
-            checkpoint saving to results/world_model/world_model_global_best.pt
-
-Example training log from V6:
-
-[WorldModel] Epoch 1/25  - train: 6450.12, val: 4425.84
-...
-[WorldModel] Epoch 7/25  - train:    8.04, val:    7.23
-[WorldModel] Epoch 10/25 - train:    4.74, val:    3.58
-[WorldModel] Epoch 15/25 - train:    2.57, val:    3.00  <-- best model
-Early stopping triggered after 20 epochs (no improvement for 5 epochs).
-Loaded best model with val_loss=3.0046
-
-Evaluation
-
-Two key evaluation modes are implemented in world_model_training.py:
-
-    Trajectory-Level Error (all future steps)
-
-        MSE / RMSE over all (engine, future_step) samples
-
-        Example (train/global rollout):
-
-            MSE ≈ 21.96, RMSE ≈ 4.69 over ~147k future RUL samples
-
-    End-of-Life NASA Score (test set)
-
-        For each engine:
-
-            Take the rolled-out future RUL trajectory at the end of the horizon
-
-            Compare the last predicted RUL to the true RUL at failure
-
-            Compute per-engine error and NASA PHM08 penalty
-
-        Implemented in compute_nasa_score_from_world_model(...)
-
-V6 Test-Set NASA for the World Model:
-
-{
- 'num_engines': 653,
- 'mean_error':      1.65,   # mean(pred - true) at end-of-life
- 'mean_abs_error':  1.90,   # |pred - true|
- 'nasa_score_sum':  215.32,
- 'nasa_score_mean': 0.33,   # per engine
-}
-
-Interpretation:
-
-    The World Model is slightly optimistic at end-of-life (+1.65 cycles), but very close to unbiased.
-
-    Average end-of-life error is ≈ 1.9 cycles.
-
-    The mean NASA score ≈ 0.33 per engine indicates very low risk of late RUL predictions, especially compared to the LSTM baselines (which have NASA sums in the O(10³–10⁴) range across all FDs).
-
-This makes the V6 World Model a strong candidate for:
-
-    Scenario simulation (“what happens to RUL if operation continues like this?”)
-
-    Downstream decision-making, where both the shape of the RUL trajectory and the risk at end-of-life matter.
-
-🧱 Project Structure
-
+```text
 AI_Turbine_RUL_Monitor_CMAPSS/
 ├─ data/
-│  └─ raw/                # raw C-MAPSS text files
+│  └─ raw/                        # raw C-MAPSS text files
 ├─ results/
-│  ├─ FD001/              # per-FD local model outputs
-│  ├─ FD002/
-│  ├─ FD003/
-│  ├─ FD004/
-│  ├─ global/             # global LSTM model predictions & weights
-│  └─ world_model/        # V6 world model checkpoints & diagnostics
+│  ├─ fd001/                      # per-FD EOL-Full-LSTM runs
+│  ├─ fd002/
+│  ├─ fd003/
+│  ├─ fd004/
+│  ├─ eol_full_lstm/              # global FD001–FD004 EOL-Full-LSTM
+│  └─ world_model/                # V6–V8 World Model checkpoints & diagnostics
 ├─ notebooks/
 │  ├─ 1_fd001_exploration.ipynb
 │  ├─ 1a_fd002_exploration.ipynb
-│  ├─ 2_training_single_datasets.ipynb
+│  ├─ 2_training_single_datasets.ipynb   # per-FD EOL-Full-LSTM
 │  ├─ 3_evaluation_global_model.ipynb
-│  ├─ 3a_evaluation_all_datasets.ipynb
-│  ├─ 4_global_lstm.ipynb
-│  ├─ 4a_global_lstm_dropout.ipynb
-│  ├─ 5_training_uncertainty_dropout_analysis.ipynb
-│  └─ 6_world_model_training.ipynb          # V6 Seq2Seq world model
+│  ├─ 4_global_lstm.ipynb                # legacy global LSTM baselines
+│  ├─ 5_training_uncertainty_dropout.ipynb
+│  └─ 6_world_model_training.ipynb       # V6–V8 World Models
 └─ src/
-   ├─ __init__.py
    ├─ config.py
    ├─ data_loading.py
    ├─ additional_features.py
-   ├─ training.py
-   ├─ world_model_training.py               # dataset builders + training + eval
+   ├─ training.py                         # legacy LSTM training utils
+   ├─ world_model_training.py             # World Model + EOL-Full-LSTM pipeline
    ├─ models/
-   │  ├─ lstm_rul.py
-   │  ├─ lstm_rul_mcdo.py
-   │  └─ world_model.py                     # WorldModelEncoderDecoder
+   │  ├─ lstm_rul.py                      # LSTM baselines
+   │  ├─ lstm_rul_mcdo.py                 # MC-Dropout model
+   │  └─ world_model.py                   # WorldModelEncoderDecoder
    ├─ loss.py
-   ├─ model.py
    ├─ uncertainty.py
-   └─ eval_utils.py / train_utils.py        # helper utilities (optional)
+   └─ eval_utils.py / train_utils.py
 
-🚀 How to Run
-1. Environment
+8. How to Run
+8.1 Environment
 
 conda create -n turbine_ai python=3.10
 conda activate turbine_ai
 
-pip install torch torchvision torchaudio pandas matplotlib scikit-learn jupyter ipykernel
+pip install torch torchvision torchaudio \
+            pandas matplotlib scikit-learn jupyter ipykernel
 
-2. Data
+8.2 Data
 
-Download the C-MAPSS files into ./data/raw:
+Download C-MAPSS into ./data/raw:
 
 data/raw/
 ├─ train_FD001.txt   ├─ test_FD001.txt   ├─ RUL_FD001.txt
@@ -558,7 +420,7 @@ data/raw/
 ├─ train_FD003.txt   ├─ test_FD003.txt   ├─ RUL_FD003.txt
 ├─ train_FD004.txt   ├─ test_FD004.txt   └─ RUL_FD004.txt
 
-3. Train Local Models (FD001–FD004)
+8.3 Train per-FD EOL-Full-LSTM baselines
 
     Open notebooks/2_training_single_datasets.ipynb
 
@@ -566,88 +428,88 @@ data/raw/
 
     Run all cells to:
 
-        Train one LSTM per FD
+        Build EOL-Full sequences per FD
 
-        Save predictions & weights under results/FD00X/
+        Train one LSTM per dataset
 
-4. Train Global LSTM Model
+        Save checkpoints & metrics into results/fd00X/
 
-    Open notebooks/4_global_lstm.ipynb
+8.4 Train global FD001–FD004 EOL-Full-LSTM
 
-    Run all cells to:
+    Either via a dedicated notebook (e.g. 3_evaluation_global_model.ipynb)
+    or via a script calling train_eol_full_lstm with multi_fd=True.
 
-        Train the global physics-informed LSTM
+    Outputs go to results/eol_full_lstm/.
 
-        Save global predictions & weights under results/global/
-
-5. Train V6 World Model (Seq2Seq)
+8.5 Train World Models
 
     Open notebooks/6_world_model_training.ipynb
 
-    Run all cells to:
+    Run to:
 
-        Build global Seq2Seq datasets
+        Build seq2seq datasets
 
-        Train the WorldModelEncoderDecoder
+        Train WorldModelEncoderDecoder
 
-        Save best checkpoint to results/world_model/world_model_global_best.pt
+        Save the best World Model to results/world_model/
 
-        Evaluate end-of-life error and NASA score on the global test set
+        Evaluate:
 
-6. Evaluate & Analyze
+            trajectory-level RMSE
 
-    Use notebooks/3_local_evaluation.ipynb and 3a_evaluation_all_datasets.ipynb for local/global LSTMs
+            EOL NASA score
 
-    Use notebooks/6_world_model_training.ipynb for:
+8.6 Uncertainty Experiments (MC-Dropout, legacy)
 
-        RUL trajectory visualizations
+    Use notebooks/5_training_uncertainty_dropout.ipynb
+    and src/uncertainty.py:
 
-        End-of-life NASA evaluation for the World Model
+        enable_mc_dropout(model)
 
-🔭 Roadmap / Future Work
+        mc_dropout_predict(model, X_tensor, n_samples=50)
+
+9. Roadmap
 
 This repository is part of a broader “Mechanical Engineer AI Assistant” vision.
 
 Planned next steps:
 
-    Extended World Models
+    Better encoders for FD002/FD004
 
-        Predict full multi-step sensor trajectories (not just RUL)
+        CNN + LSTM + attention front-ends
 
-        Combine with physics constraints / PINNs
+        Lightweight Transformer encoders (e.g. GCU-style)
 
-    Hyperparameter Optimization
+    Physics-informed World Models
 
-        Optuna + PyTorch Lightning for joint tuning of:
+        Multi-step prediction for sensors + RUL
 
-            LSTM size, depth, dropout
+        Integration with physics constraints / digital twins
 
-            Loss weights (RUL vs. sensor vs. physics constraints)
+        Residual modeling (sensor vs. “healthy” reference)
 
-            Sequence length and feature sets
+    Uncertainty & calibration
 
-    Extended Uncertainty Quantification
+        Extend MC-Dropout / deep ensembles to World Models
 
-        Apply MC-Dropout and/or deep ensembles to the global and world models
-
-        Add calibration plots and risk-aware decision rules
+        Calibration plots and risk-aware decision rules
 
     Deployment
 
         Simple REST API or Streamlit dashboard for:
 
-            Online RUL monitoring per asset
+            Online RUL monitoring per engine
 
-            Physics feature plots and trend analysis for engineers
+            Physics feature visualization
 
-📞 Contact & License
+            Scenario analysis with the World Model
 
-    Author: Dr.-Ing. Robert Kunte
+10. Contact & License
 
-    LinkedIn: https://www.linkedin.com/in/robertkunte/
+Author: Dr.-Ing. Robert Kunte
+LinkedIn: https://www.linkedin.com/in/robertkunte/
 
-    License: MIT
 
-If you are working on turbomachinery, PHM or physics-informed ML and would like to exchange ideas, feel free to reach out!
->>>>>>> 03aaff4e0eee0e1cd30fd003ddabb32c8d0bf692
+License: MIT
 
+If you work on turbomachinery, PHM, or physics-informed ML and want to collaborate, feel free to reach out!

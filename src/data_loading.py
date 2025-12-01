@@ -50,8 +50,80 @@ def _assign_condition_id(df: pd.DataFrame, cond_map, decimals: int = 3) -> pd.Da
     df["ConditionID"] = cond_ids
     return df
 
+def load_cmapps_subset(
+    fd_id,
+    data_dir=DEFAULT_DATA_DIR,
+    max_rul: int | None = 125,
+    clip_train: bool = True,
+    clip_test: bool = True,
+):
+    """
+    Load train, test, and RUL files for a given C-MAPSS subset (FD001–FD004)
+    and compute RUL for the training trajectories.
 
-def load_cmapps_subset(fd_id, data_dir=DEFAULT_DATA_DIR, max_rul=125):
+    WICHTIG:
+    - Berechnet IMMER eine rohe, ungeclippte RUL-Spalte: 'RUL_raw'
+    - Optional wird eine geclippte Variante 'RUL' erzeugt (für Kompatibilität)
+    - Clipping kann separat für Train/Test deaktiviert werden
+    """
+    assert fd_id in ["FD001", "FD002", "FD003", "FD004"], f"Unknown subset: {fd_id}"
+
+    train_path = os.path.join(data_dir, f"train_{fd_id}.txt")
+    test_path  = os.path.join(data_dir, f"test_{fd_id}.txt")
+    rul_path   = os.path.join(data_dir, f"RUL_{fd_id}.txt")
+
+    col_names = ["UnitNumber", "TimeInCycles", "Setting1", "Setting2", "Setting3"] + \
+                [f"Sensor{i}" for i in range(1, 22)]
+
+    df_train = pd.read_csv(train_path, sep=r"\s+", header=None, names=col_names)
+    df_test  = pd.read_csv(test_path,  sep=r"\s+", header=None, names=col_names)
+    rul_df   = pd.read_csv(rul_path,   sep=r"\s+", header=None)
+
+    # --------------------------------------------------
+    # 1) RUL für TRAIN (roh + optional geclipped)
+    # --------------------------------------------------
+    df_max_time = (
+        df_train.groupby("UnitNumber")["TimeInCycles"]
+        .max()
+        .reset_index()
+        .rename(columns={"TimeInCycles": "MaxTime"})
+    )
+    df_train = df_train.merge(df_max_time, on="UnitNumber", how="left")
+
+    # Rohe, NASA-konforme RUL (0 am letzten Zyklus)
+    df_train["RUL_raw"] = df_train["MaxTime"] - df_train["TimeInCycles"]
+
+    if clip_train and (max_rul is not None):
+        # Geclippte Variante wie in vielen Papers (für Vergleich)
+        df_train["RUL"] = np.minimum(df_train["RUL_raw"], max_rul)
+    else:
+        # Für unsere World-Model/EOL-Experimente: keine Clip-Verzerrung
+        df_train["RUL"] = df_train["RUL_raw"]
+
+    # --------------------------------------------------
+    # 2) True RUL für TEST
+    # --------------------------------------------------
+    # RUL-Datei gibt üblicherweise die "Rest-RUL" zum letzten beobachteten Test-Zyklus an
+    y_test_true_raw = rul_df[0].values.astype(float)
+
+    if clip_test and (max_rul is not None):
+        y_test_true = np.minimum(y_test_true_raw, max_rul)
+    else:
+        y_test_true = y_test_true_raw
+
+    # --------------------------------------------------
+    # 3) ConditionID hinzufügen (unverändert)
+    # --------------------------------------------------
+    df_train["ConditionID"] = 0
+    df_test["ConditionID"]  = 0
+
+    if fd_id in ["FD002", "FD004"]:
+        df_train, df_test = add_condition_id_from_rounded_settings(df_train, df_test)
+
+    return df_train, df_test, y_test_true
+
+
+def load_cmapps_subset_old(fd_id, data_dir=DEFAULT_DATA_DIR, max_rul=125):
     """
     Load train, test, and RUL files for a given C-MAPSS subset (FD001–FD004)
     and compute RUL for the training trajectories.
@@ -168,32 +240,26 @@ def add_condition_id_from_rounded_settings(df_train, df_test,
 
     return df_tr, df_te
 
-def load_cmapps_global(fd_ids=FD_IDS_GLOBAL,
-                       data_dir=DEFAULT_DATA_DIR,
-                       max_rul=125):
-    """
-    Load all requested C-MAPSS subsets and build ONE global training DataFrame
-    plus per-subset test DataFrames + true RUL arrays.
-
-    Returns
-    -------
-    df_train_all : pd.DataFrame
-        Global training dataframe with column 'FD_ID'.
-    test_dfs : dict[str, pd.DataFrame]
-        Mapping fd_id -> test dataframe with 'FD_ID' column.
-    test_ruls : dict[str, np.ndarray]
-        Mapping fd_id -> y_test_true (clamped).
-    """
+def load_cmapps_global(
+    fd_ids=FD_IDS_GLOBAL,
+    data_dir=DEFAULT_DATA_DIR,
+    max_rul: int | None = 125,
+    clip_train: bool = True,
+    clip_test: bool = True,
+):
     train_frames = []
     test_dfs = {}
     test_ruls = {}
 
     for fd_idx, fd_id in enumerate(fd_ids):
         df_train, df_test, y_test_true = load_cmapps_subset(
-            fd_id, data_dir=data_dir, max_rul=max_rul
+            fd_id,
+            data_dir=data_dir,
+            max_rul=max_rul,
+            clip_train=clip_train,
+            clip_test=clip_test,
         )
 
-        # Add FD_ID as integer (0..N-1)
         df_train["FD_ID"] = fd_idx
         df_test["FD_ID"] = fd_idx
 
