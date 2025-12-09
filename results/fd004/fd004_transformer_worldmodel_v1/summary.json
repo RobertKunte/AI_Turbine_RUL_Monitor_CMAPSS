@@ -1,9 +1,0 @@
-{
-  "experiment_name": "fd004_transformer_worldmodel_v1",
-  "dataset": "FD004",
-  "model_type": "transformer_world_model_v1",
-  "num_features": 349,
-  "past_len": 30,
-  "horizon": 20,
-  "val_loss": 6724901.581345566
-}
