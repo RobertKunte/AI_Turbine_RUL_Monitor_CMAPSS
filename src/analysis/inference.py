@@ -63,6 +63,7 @@ class EngineTrajectory:
     hi: np.ndarray  # shape (T,)
     true_rul: np.ndarray  # shape (T,)
     pred_rul: np.ndarray  # shape (T,)
+    hi_damage: Optional[np.ndarray] = None  # shape (T,) - optional damage-based HI trajectory
 
 
 def load_model_from_experiment(

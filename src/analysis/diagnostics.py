@@ -676,7 +676,7 @@ def compute_hi_trajectory_sliding(
     is_world_model: bool = False,
     is_world_model_v3: bool = False,
     max_rul: float = 125.0,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """
     Berechnet eine HI-Trajektorie für eine Engine mit Sliding Window:
     
@@ -697,6 +697,7 @@ def compute_hi_trajectory_sliding(
         cycles_hi: Zyklen, für die HI definiert ist (ab past_len)
         hi_vals:   HI-Werte pro Zyklus
         rul_vals:  RUL-Vorhersagen pro Zyklus (in Zyklen, gecappt auf [0, max_rul])
+        hi_damage_vals: Optional damage-based HI values (None if model doesn't have damage_head)
     """
     df_engine = df_engine.sort_values("TimeInCycles").copy()
     
@@ -712,7 +713,11 @@ def compute_hi_trajectory_sliding(
     
     hi_vals: List[float] = []
     rul_vals: List[float] = []
+    hi_damage_vals: List[float] = []
     hi_cycles: List[float] = []
+    
+    # Check if model has damage_head
+    has_damage_head = hasattr(model, 'damage_head') and model.damage_head is not None
     
     model.eval()
     with torch.no_grad():
@@ -813,10 +818,67 @@ def compute_hi_trajectory_sliding(
                 eol_val = max(0.0, min(float(max_rul), eol_val))
                 hi_vals.append(hi_last_val)
                 rul_vals.append(eol_val)
+                
+                # Extract damage HI if damage_head is available
+                if has_damage_head:
+                    try:
+                        # Get encoder output to pass to damage_head
+                        # For transformer_eol models, use the encode method
+                        enc_out = None
+                        cond_seq_for_damage = None
+                        
+                        if hasattr(model, 'encode'):
+                            # Use encode method to get encoder output sequence
+                            enc_out, _ = model.encode(x, cond_ids=cond_t, return_seq=True)
+                            # Prepare cond_seq for damage_head if needed
+                            if hasattr(model, 'use_cond_encoder') and model.use_cond_encoder:
+                                if hasattr(model, 'cond_feature_indices') and model.cond_feature_indices is not None:
+                                    cond_seq_for_damage = x[:, :, model.cond_feature_indices]
+                        else:
+                            # Fallback: try manual encoding for other model types
+                            if hasattr(model, 'transformer') and hasattr(model, 'input_proj'):
+                                x_proj = model.input_proj(x)
+                                # Apply condition embedding if available
+                                if hasattr(model, 'use_condition_embedding') and model.use_condition_embedding:
+                                    cond_emb = model.condition_embedding(cond_t)
+                                    cond_up = model.cond_proj(cond_emb)
+                                    cond_up = cond_up.unsqueeze(1).expand(-1, x_proj.shape[1], -1)
+                                    x_seq = x_proj + cond_up
+                                else:
+                                    x_seq = x_proj
+                                # Add continuous condition if available
+                                if hasattr(model, 'use_cond_encoder') and model.use_cond_encoder and hasattr(model, 'cond_encoder'):
+                                    if hasattr(model, 'cond_feature_indices') and model.cond_feature_indices is not None:
+                                        cond_seq_for_damage = x[:, :, model.cond_feature_indices]
+                                        cond_emb_seq = model.cond_encoder(cond_seq_for_damage)
+                                        x_seq = x_seq + cond_emb_seq
+                                x_pos = model.pos_encoding(x_seq)
+                                enc_out = model.transformer(x_pos)
+                        
+                        if enc_out is not None:
+                            # Call damage_head
+                            hi_seq_damage, _, _, _ = model.damage_head(enc_out, cond_seq=cond_seq_for_damage)
+                            hi_damage_val = float(hi_seq_damage[0, -1].item())
+                            hi_damage_vals.append(hi_damage_val)
+                        else:
+                            hi_damage_vals.append(None)
+                    except Exception as e:
+                        # If damage head extraction fails, append None
+                        # Uncomment for debugging: print(f"  Warning: Could not extract damage HI: {e}")
+                        hi_damage_vals.append(None)
+                else:
+                    hi_damage_vals.append(None)
             
             hi_cycles.append(cycles[idx])
     
-    return np.array(hi_cycles), np.array(hi_vals), np.array(rul_vals)
+    # Convert hi_damage_vals to numpy array, filtering out None values if any
+    hi_damage_array = None
+    if has_damage_head and len(hi_damage_vals) > 0 and any(v is not None for v in hi_damage_vals):
+        # Filter out None values and create array
+        valid_damage_vals = [v if v is not None else 0.0 for v in hi_damage_vals]
+        hi_damage_array = np.array(valid_damage_vals)
+    
+    return np.array(hi_cycles), np.array(hi_vals), np.array(rul_vals), hi_damage_array
 
 
 def build_trajectories(
@@ -865,7 +927,7 @@ def build_trajectories(
             continue
         
         # Compute HI *and* RUL trajectory using sliding window
-        cycles_hi, hi_vals, pred_rul_traj = compute_hi_trajectory_sliding(
+        cycles_hi, hi_vals, pred_rul_traj, hi_damage_vals = compute_hi_trajectory_sliding(
             df_engine=df_engine,
             feature_cols=feature_cols,
             scaler_dict=scaler_dict,
@@ -897,6 +959,7 @@ def build_trajectories(
             hi=hi_vals,  # HI values from sliding window
             true_rul=true_rul_traj,
             pred_rul=pred_rul_traj,
+            hi_damage=hi_damage_vals,  # Optional damage-based HI trajectory
         ))
     
     return trajectories
@@ -1044,6 +1107,11 @@ def plot_hi_rul_trajectories(
             ax1.set_ylim([0, 1.1])
         
         ax1.plot(traj.cycles, traj.hi, 'g-', linewidth=2, label='Health Index', alpha=0.7)
+        
+        # Plot damage HI if available
+        if traj.hi_damage is not None and len(traj.hi_damage) > 0:
+            ax1.plot(traj.cycles, traj.hi_damage, 'm--', linewidth=2, label='HI Damage', alpha=0.7)
+        
         ax1.set_xlabel('Time in Cycles')
         ax1.set_ylabel('Health Index', color='g')
         ax1.tick_params(axis='y', labelcolor='g')
