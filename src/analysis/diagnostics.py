@@ -873,10 +873,13 @@ def compute_hi_trajectory_sliding(
     
     # Convert hi_damage_vals to numpy array, filtering out None values if any
     hi_damage_array = None
-    if has_damage_head and len(hi_damage_vals) > 0 and any(v is not None for v in hi_damage_vals):
-        # Filter out None values and create array
-        valid_damage_vals = [v if v is not None else 0.0 for v in hi_damage_vals]
-        hi_damage_array = np.array(valid_damage_vals)
+    if has_damage_head and len(hi_damage_vals) > 0:
+        valid_count = sum(1 for v in hi_damage_vals if v is not None)
+        if valid_count > 0:
+            # Filter out None values and create array
+            valid_damage_vals = [v if v is not None else 0.0 for v in hi_damage_vals]
+            hi_damage_array = np.array(valid_damage_vals)
+        # Note: Logging is done at the build_trajectories level to avoid spam
     
     return np.array(hi_cycles), np.array(hi_vals), np.array(rul_vals), hi_damage_array
 
@@ -1523,12 +1526,46 @@ def run_diagnostics_for_run(
         y_true_eol = np.array(test_metrics_diag["y_true_eol"], dtype=float)
         unit_ids_test = np.arange(1, len(y_true_eol) + 1, dtype=int)
 
+        # Extract errors for plots
+        errors = rul_pred_full_np - y_true_eol
+        
+        # Get nasa_scores - evaluate_world_model_v3_eol uses compute_eol_errors_and_nasa internally
+        # but doesn't return nasa_scores, so we compute them here for consistency
+        from src.metrics import compute_eol_errors_and_nasa
+        nasa_stats_computed = compute_eol_errors_and_nasa(y_true_eol, rul_pred_full_np, max_rul=max_rul)
+        
+        # Create eol_metrics_dict with same structure as EOL model path
+        # Use metrics directly from evaluate_world_model_v3_eol (100% consistent with training)
+        eol_metrics_dict = {
+            "errors": errors,
+            "mean_error": test_metrics_diag["Bias"],
+            "std_error": float(np.std(errors)),
+            "mean_abs_error": test_metrics_diag["MAE"],
+            "median_error": float(np.median(errors)),
+            "mse": test_metrics_diag.get("MSE", float(np.mean(errors ** 2))),
+            "rmse": test_metrics_diag["RMSE"],
+            "mae": test_metrics_diag["MAE"],
+            "bias": test_metrics_diag["Bias"],
+            "r2": test_metrics_diag.get("R2", 0.0),
+            "nasa_scores": nasa_stats_computed["nasa_scores"],
+            "nasa_mean": test_metrics_diag["nasa_score_mean"],  # Use from evaluate_world_model_v3_eol
+            "nasa_sum": test_metrics_diag.get("nasa_score_sum", test_metrics_diag["nasa_score_mean"] * len(y_true_eol)),
+            "nasa_median": float(np.median(nasa_stats_computed["nasa_scores"])),
+            "num_engines": len(y_true_eol),
+        }
+
         # Sanity log (same style as training)
-        print(f"  Test RMSE (diagnostics): {test_metrics_diag['RMSE']:.2f} cycles")
-        print(f"  Test MAE  (diagnostics): {test_metrics_diag['MAE']:.2f} cycles")
-        print(f"  Test Bias (diagnostics): {test_metrics_diag['Bias']:.2f} cycles")
-        print(f"  Test R²   (diagnostics): {test_metrics_diag.get('R2', 0.0):.4f}")
-        print(f"  NASA Score (mean, diagnostics): {test_metrics_diag['nasa_score_mean']:.4f}")
+        print(f"  Test RMSE (from evaluate_world_model_v3_eol): {test_metrics_diag['RMSE']:.2f} cycles")
+        print(f"  Test MAE  (from evaluate_world_model_v3_eol): {test_metrics_diag['MAE']:.2f} cycles")
+        print(f"  Test Bias (from evaluate_world_model_v3_eol): {test_metrics_diag['Bias']:.2f} cycles")
+        print(f"  Test R²   (from evaluate_world_model_v3_eol): {test_metrics_diag.get('R2', 0.0):.4f}")
+        print(f"  NASA Score (mean, from evaluate_world_model_v3_eol): {test_metrics_diag['nasa_score_mean']:.4f}")
+        
+        # Validation: Check shapes and values (for debugging)
+        print(f"  EOL predictions shape: {rul_pred_full_np.shape}")
+        print(f"  True EOL shape: {y_true_eol.shape}")
+        print(f"  EOL predictions range: [{rul_pred_full_np.min():.2f}, {rul_pred_full_np.max():.2f}]")
+        print(f"  True EOL range: [{y_true_eol.min():.2f}, {y_true_eol.max():.2f}]")
     else:
         # EOL model path (EOLFullLSTMWithHealth, UniversalEncoderV3Attention, EOLFullTransformerEncoder, ...)
         # Safety check: ensure feature dimensions match scaler and model expectations
@@ -1564,7 +1601,16 @@ def run_diagnostics_for_run(
         # Extrahiere errors für Plots
         errors = rul_pred_full_np - y_true_eol
         
+        # Get nasa_scores - evaluate_on_test_data uses compute_eol_errors_and_nasa internally
+        # but nasa_scores may not be in the return dict, so we compute them for consistency
+        # However, since evaluate_on_test_data already caps values and computes metrics,
+        # we should use the same capped values for nasa_scores
+        from src.metrics import compute_eol_errors_and_nasa
+        nasa_stats_computed = compute_eol_errors_and_nasa(y_true_eol, rul_pred_full_np, max_rul=None)  # Already capped
+        
         # Verwende Metriken direkt von evaluate_on_test_data (keine Neuberechnung!)
+        # WICHTIG: pt und nasa_pt kommen direkt aus evaluate_on_test_data, das intern
+        # compute_eol_errors_and_nasa verwendet - also sind die Werte identisch!
         eol_metrics_dict = {
             "errors": errors,
             "mean_error": pt["bias"],
@@ -1576,10 +1622,10 @@ def run_diagnostics_for_run(
             "mae": pt["mae"],
             "bias": pt["bias"],
             "r2": pt["r2"],
-            "nasa_scores": nasa_pt.get("nasa_scores", compute_eol_errors_and_nasa(y_true_eol, rul_pred_full_np, max_rul=max_rul)["nasa_scores"]),
-            "nasa_mean": nasa_pt["score_mean"],
-            "nasa_sum": nasa_pt.get("score_sum", nasa_pt.get("score_mean", 0.0) * len(y_true_eol)),
-            "nasa_median": float(np.median(nasa_pt.get("nasa_scores", []))) if nasa_pt.get("nasa_scores") is not None else 0.0,
+            "nasa_scores": nasa_stats_computed["nasa_scores"],  # Use computed for consistency
+            "nasa_mean": nasa_pt["score_mean"],  # Use from evaluate_on_test_data (should match nasa_stats_computed)
+            "nasa_sum": nasa_pt.get("score_sum", nasa_pt["score_mean"] * len(y_true_eol)),
+            "nasa_median": float(np.median(nasa_stats_computed["nasa_scores"])),
             "num_engines": len(y_true_eol),
         }
 
@@ -1600,6 +1646,9 @@ def run_diagnostics_for_run(
     # ------------------------------------------------------------------
     # Idee: Modell bleibt bei ~45 Zyklen \"stehen\". Wir simulieren, wie gut
     # die Metrik wäre, wenn wir diesen Bias per Postprocessing korrigieren.
+    # Use rmse from eol_metrics_dict (works for both world model and EOL model paths)
+    rmse = eol_metrics_dict["rmse"]
+    
     y_pred_calib = rul_pred_full_np.copy()
     mask_floor = y_pred_calib < 65.0
     y_pred_calib[mask_floor] = y_pred_calib[mask_floor] - 45.0
@@ -1630,10 +1679,14 @@ def run_diagnostics_for_run(
     
     print(f"  Built trajectories for {len(trajectories)} engines")
     
-    # Check if any trajectories have damage HI
-    has_damage_hi = any(traj.hi_damage is not None and len(traj.hi_damage) > 0 for traj in trajectories)
+    # Check if any trajectories have damage HI (check all trajectories first)
+    trajectories_with_damage = [t for t in trajectories if t.hi_damage is not None and len(t.hi_damage) > 0]
+    has_damage_hi = len(trajectories_with_damage) > 0
     if has_damage_hi:
-        print(f"  ✓ Damage HI trajectories detected - will create separate damage plot")
+        print(f"  ✓ Damage HI trajectories detected: {len(trajectories_with_damage)}/{len(trajectories)} engines have damage HI")
+        print(f"    Will create separate damage plot")
+    else:
+        print(f"  ⚠️  No damage HI trajectories found (model may not have damage_head)")
     
     # Select degraded engines
     print("[6] Selecting degraded engines...")
@@ -1646,6 +1699,13 @@ def run_diagnostics_for_run(
     )
     
     print(f"  Selected {len(selected_trajectories)} degraded engines")
+    
+    # Check if selected trajectories have damage HI
+    selected_with_damage = [t for t in selected_trajectories if t.hi_damage is not None and len(t.hi_damage) > 0]
+    if has_damage_hi and len(selected_with_damage) > 0:
+        print(f"  ✓ {len(selected_with_damage)}/{len(selected_trajectories)} selected engines have damage HI - will plot")
+    elif has_damage_hi and len(selected_with_damage) == 0:
+        print(f"  ⚠️  Warning: Damage HI available but none in selected engines - damage plot may be empty")
     
     # Generate plots (save directly in experiment directory, not in diagnostics subfolder)
     print("[7] Generating publication plots...")
@@ -1684,14 +1744,21 @@ def run_diagnostics_for_run(
         print(f"  Saved HI+RUL trajectory plots for {len(selected_trajectories)} engines")
         
         # 4. Separate HI Damage trajectory plot (if damage HI is available)
-        if has_damage_hi:
+        # Check again on selected trajectories to ensure we have damage HI in the selected set
+        selected_with_damage = [t for t in selected_trajectories if t.hi_damage is not None and len(t.hi_damage) > 0]
+        if len(selected_with_damage) > 0:
+            print(f"  Creating HI Damage plot for {len(selected_with_damage)} engines with damage HI...")
             plot_hi_damage_trajectories(
                 trajectories=selected_trajectories,
                 out_path=experiment_dir / "hi_damage_10_degraded.png",
                 title=f"{dataset_name} Health Index Damage Trajectories – 10 degraded engines",
                 max_engines=10,
             )
-            print(f"  Saved HI Damage trajectory plots for {len(selected_trajectories)} engines")
+            print(f"  ✓ Saved HI Damage trajectory plots to {experiment_dir / 'hi_damage_10_degraded.png'}")
+        elif has_damage_hi:
+            print(f"  ⚠️  Skipping HI Damage plot: damage HI exists but not in selected degraded engines")
+        else:
+            print(f"  ℹ️  Skipping HI Damage plot: model does not have damage_head")
     else:
         print(f"  Skipping HI+RUL trajectory plot (no trajectories available)")
     

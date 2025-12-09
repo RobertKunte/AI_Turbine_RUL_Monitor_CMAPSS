@@ -732,6 +732,19 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         else:
             cond_feature_indices = None
 
+        # Damage head parameters (from encoder_kwargs or config['model'])
+        model_cfg_raw = config.get("model", {})
+        use_damage_head = encoder_kwargs.get("use_damage_head", model_cfg_raw.get("use_damage_head", False))
+        damage_L_ref = encoder_kwargs.get("L_ref", model_cfg_raw.get("L_ref", 300.0))
+        damage_alpha_base = encoder_kwargs.get("alpha_base", model_cfg_raw.get("alpha_base", 0.1))
+        damage_hidden_dim = encoder_kwargs.get("damage_hidden_dim", model_cfg_raw.get("damage_hidden_dim", 64))
+        
+        # Store in encoder_kwargs so they get saved to summary.json
+        encoder_kwargs["use_damage_head"] = use_damage_head
+        encoder_kwargs["L_ref"] = damage_L_ref
+        encoder_kwargs["alpha_base"] = damage_alpha_base
+        encoder_kwargs["damage_hidden_dim"] = damage_hidden_dim
+        
         model = EOLFullTransformerEncoder(
             input_dim=X_full.shape[-1],
             d_model=d_model,
@@ -747,6 +760,11 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             cond_in_dim=cond_in_dim,
             cond_encoder_dim=encoder_kwargs.get("cond_encoder_dim", None),
             use_cond_recon_head=encoder_kwargs.get("use_cond_recon_head", False),
+            # Damage head parameters
+            use_damage_head=use_damage_head,
+            damage_L_ref=damage_L_ref,
+            damage_alpha_base=damage_alpha_base,
+            damage_hidden_dim=damage_hidden_dim,
         )
 
         # If we inferred Cond_* feature indices, attach them to the model so it can

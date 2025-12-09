@@ -1589,11 +1589,17 @@ def train_eol_full_lstm(
                                             :, :, model.cond_feature_indices
                                         ]
 
-                                hi_seq_damage, _, _, _ = model.damage_head(
+                                hi_seq_damage, _, damage_seq_dbg, delta_damage_dbg = model.damage_head(
                                     enc_seq_dmg, cond_seq=cond_seq_dmg
                                 )
                                 damage_hi_loss = F.mse_loss(hi_seq_damage, hi_target_seq)
                                 loss = loss + damage_hi_weight * damage_hi_loss
+                                
+                                # ====================================================================
+                                # DEBUG: Sanity-Check des Damage-Heads (einmal pro 5 Epochen)
+                                # ====================================================================
+                                # Note: epoch wird später im Training-Loop verfügbar sein
+                                # Dieser Check wird im Training-Loop nach dem Forward gemacht
                         
                         # Condition calibration loss (sequence-based)
                         if hi_condition_calib_weight > 0.0:
@@ -2094,6 +2100,110 @@ def train_eol_full_lstm(
             # Always log condition reconstruction losses (0.0 if disabled)
             history["train_cond_loss"].append(train_cond_loss)
             history["val_cond_loss"].append(val_cond_loss)
+
+        # ====================================================================
+        # DEBUG: Loss-Balance Check (pro Epoch)
+        # ====================================================================
+        if use_health_head and train_component_losses is not None:
+            # Log damage_hi_loss explicitly (should already be in train_damage_hi_loss)
+            log_damage_hi = train_damage_hi_loss if damage_hi_weight > 0.0 else 0.0
+            
+            print(f"\n[DEBUG Loss-Balance] Epoch {epoch+1}:")
+            print(f"  RUL Loss (scaled):        {train_rul_loss:.4f}")
+            print(f"  HI Loss (standard):       {train_health_loss:.4f}")
+            if damage_hi_weight > 0.0:
+                print(f"  Damage HI Loss (raw):     {log_damage_hi:.4f}")
+                print(f"  Damage HI Loss (weighted): {damage_hi_weight * log_damage_hi:.4f}")
+            else:
+                print(f"  Damage HI Loss:            N/A (damage_hi_weight=0)")
+            print(f"  Mono Late (weighted):      {train_mono_late:.4f}")
+            print(f"  Mono Global (weighted):    {train_mono_global:.4f}")
+            print(f"  Smooth HI (weighted):      {train_smooth_hi:.4f}")
+            if hi_condition_calib_weight > 0.0:
+                print(f"  Calib Loss (weighted):     {train_calib_loss:.4f}")
+            if cond_recon_weight > 0.0:
+                print(f"  Cond Recon (weighted):     {train_cond_loss:.4f}")
+            print(f"  Total Loss:                {train_loss:.4f}")
+        
+        # ====================================================================
+        # DEBUG: Sanity-Check des Damage-Heads (einmal pro 5 Epochen)
+        # ====================================================================
+        if (
+            use_health_head
+            and hasattr(model, "use_cum_damage_head")
+            and getattr(model, "use_cum_damage_head", False)
+            and hasattr(model, "damage_head")
+            and getattr(model, "damage_head", None) is not None
+            and epoch % 5 == 0
+        ):
+            try:
+                # Use a sample batch from validation for consistency
+                model.eval()
+                with torch.no_grad():
+                    # Get a sample batch
+                    sample_batch = next(iter(val_loader))
+                    if len(sample_batch) == 4:
+                        X_sample, _, _, cond_ids_sample = sample_batch
+                    elif len(sample_batch) == 3:
+                        X_sample, _, _ = sample_batch
+                        cond_ids_sample = torch.zeros(len(X_sample), dtype=torch.int64, device=device)
+                    else:
+                        X_sample, _ = sample_batch
+                        cond_ids_sample = torch.zeros(len(X_sample), dtype=torch.int64, device=device)
+                    
+                    X_sample = X_sample[:1].to(device)  # Just one sample
+                    cond_ids_sample = cond_ids_sample[:1].to(device)
+                    
+                    # Get encoder output
+                    if hasattr(model, "encode"):
+                        enc_seq_sample, _ = model.encode(
+                            X_sample, cond_ids=cond_ids_sample, return_seq=True
+                        )
+                    else:
+                        # Fallback: manual encoding
+                        x_proj = model.input_proj(X_sample)
+                        if getattr(model, "use_condition_embedding", False):
+                            cond_emb = model.condition_embedding(cond_ids_sample)
+                            cond_up = model.cond_proj(cond_emb)
+                            cond_up = cond_up.unsqueeze(1).expand(-1, x_proj.shape[1], -1)
+                            x_seq = x_proj + cond_up
+                        else:
+                            x_seq = x_proj
+                        if getattr(model, "use_cond_encoder", False) and hasattr(model, "cond_encoder"):
+                            if hasattr(model, "cond_feature_indices") and model.cond_feature_indices is not None:
+                                cond_seq_sample = X_sample[:, :, model.cond_feature_indices]
+                                cond_emb_seq = model.cond_encoder(cond_seq_sample)
+                                x_seq = x_seq + cond_emb_seq
+                        x_pos = model.pos_encoding(x_seq)
+                        enc_seq_sample = model.transformer(x_pos)
+                    
+                    # Prepare cond_seq for damage_head
+                    cond_seq_for_damage = None
+                    if getattr(model, "use_cond_encoder", False):
+                        if hasattr(model, "cond_feature_indices") and model.cond_feature_indices is not None:
+                            cond_seq_for_damage = X_sample[:, :, model.cond_feature_indices]
+                    
+                    # Call damage_head
+                    hi_seq_dbg, hi_last_dbg, damage_seq_dbg, delta_damage_dbg = model.damage_head(
+                        enc_seq_sample, cond_seq=cond_seq_for_damage
+                    )
+                    
+                    hi_seq_min = hi_seq_dbg.min().item()
+                    hi_seq_max = hi_seq_dbg.max().item()
+                    damage_min = damage_seq_dbg.min().item()
+                    damage_max = damage_seq_dbg.max().item()
+                    
+                    print(
+                        f"[DEBUG damage_head] Epoch {epoch+1}: "
+                        f"hi_seq in [{hi_seq_min:.3f}, {hi_seq_max:.3f}], "
+                        f"damage in [{damage_min:.3f}, {damage_max:.3f}]"
+                    )
+                
+                # Restore training mode
+                model.train() if epoch < num_epochs - 1 else model.eval()
+            except Exception as e:
+                # Silent fail to avoid breaking training
+                pass
 
         # Scheduler
         scheduler.step(val_loss)

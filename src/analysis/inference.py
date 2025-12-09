@@ -688,6 +688,12 @@ def load_model_from_experiment(
         cond_in_dim = int(cond_in_dim_cfg) if cond_in_dim_cfg is not None else 0
         cond_encoder_dim = config.get("cond_encoder_dim", None)
         use_cond_recon_head = bool(config.get("use_cond_recon_head", False))
+        
+        # Damage head parameters (must match training configuration exactly)
+        use_damage_head = bool(config.get("use_damage_head", False))
+        damage_L_ref = float(config.get("L_ref", 300.0))
+        damage_alpha_base = float(config.get("alpha_base", 0.1))
+        damage_hidden_dim = int(config.get("damage_hidden_dim", 64))
 
         model = EOLFullTransformerEncoder(
             input_dim=input_dim,
@@ -705,6 +711,11 @@ def load_model_from_experiment(
             cond_in_dim=cond_in_dim,
             cond_encoder_dim=cond_encoder_dim,
             use_cond_recon_head=use_cond_recon_head,
+            # Damage head parameters (must match training exactly)
+            use_damage_head=use_damage_head,
+            damage_L_ref=damage_L_ref,
+            damage_alpha_base=damage_alpha_base,
+            damage_hidden_dim=damage_hidden_dim,
         )
 
         # Optional advanced RUL head (phys_v3/phys_v4 experiments).
