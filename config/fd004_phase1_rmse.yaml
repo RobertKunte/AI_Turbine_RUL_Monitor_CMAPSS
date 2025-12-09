@@ -1,0 +1,83 @@
+# FD004 Phase-1 Health-Head Configuration - RMSE-Optimized
+# This config represents the best RMSE-performing model from Phase 1 hyperparameter sweep
+
+experiment_name: fd004_phase1_l0.35_ml0.030_mg0.0030
+dataset: FD004
+
+# Model Architecture
+model:
+  type: EOLFullLSTMWithHealth
+  hidden_dim: 50
+  num_layers: 2
+  dropout: 0.1
+  bidirectional: false
+
+# Training Configuration
+training:
+  num_epochs: 80
+  batch_size: 256
+  learning_rate: 1e-4
+  weight_decay: 1e-4
+  patience: 8
+  use_mixed_precision: true
+  random_seed: 42
+  engine_train_ratio: 0.8
+  shuffle_engines: true
+
+# Data Configuration
+data:
+  past_len: 30
+  max_rul: 125
+  use_condition_wise_scaling: true
+  clip_train: false
+  clip_test: true
+
+# Feature Engineering
+features:
+  physics:
+    use_core: true
+    use_extended: false
+    use_residuals: false
+    use_temporal_on_physics: false
+  temporal:
+    add_temporal_features: true
+    short_windows: [5, 10]
+    long_windows: [30]
+    add_rolling_mean: true
+    add_rolling_std: false
+    add_trend: true
+    add_delta: true
+    delta_lags: [5, 10]
+
+# Multi-Task Health Head Configuration
+multi_task:
+  enabled: true
+  rul_beta: 45.0  # RUL weighting tau
+  health_loss_weight: 0.35  # lambda: trade-off between RUL and health loss
+  hi_condition_calib_weight: 0.0  # Condition calibration weight (disabled)
+  mono_late_weight: 0.03  # Late monotonicity weight
+  mono_global_weight: 0.003  # Global monotonicity weight
+  hi_plateau_threshold: 80.0  # RUL threshold for early-life plateau
+
+# Results Directory
+results:
+  base_dir: results/health_index/fd004
+
+# Notes
+notes: |
+  FD004 Phase-1 Health-Head configuration optimized for RMSE.
+  
+  Validation Metrics:
+    - RMSE: 24.56 cycles
+    - MAE: 19.29 cycles
+    - Bias: -8.97 cycles
+    - R²: 0.6465
+    - NASA Mean: 44.27
+  
+  Test Metrics:
+    - RMSE: 24.69 cycles
+    - MAE: 19.41 cycles
+    - Bias: -5.82 cycles
+    - R²: 0.6701
+    - NASA Mean: 43.98
+

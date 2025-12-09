@@ -1,0 +1,64 @@
+experiment_id: fd001_phase4_universal_v1_residual
+fd_id: FD001
+
+# Phase-4 residual / digital-twin baseline for FD001.
+# UniversalEncoderV1 with HI head, trained with residual features.
+
+model_class: RULHIUniversalModelV1
+encoder_type: universal_v1
+
+model:
+  # Sequence settings
+  past_len: 30          # length of input window
+  max_rul: 125          # RUL capping used in training/evaluation
+
+  # Encoder architecture (UniversalEncoderV1)
+  d_model: 48
+  num_layers: 3
+  nhead: 4
+  dim_feedforward: 256
+  dropout: 0.1
+  max_seq_len: 300
+
+  # Condition handling
+  use_condition_embedding: false   # FD001 has only one operating condition
+  num_conditions: 1
+  cond_emb_dim: 0
+
+loss:
+  # RUL loss weighting (see src/loss.py / training code)
+  rul_beta: 45.0
+
+  # Health Index loss weights
+  health_loss_weight: 0.35
+  mono_late_weight: 0.03
+  mono_global_weight: 0.003
+  hi_condition_calib_weight: 0.0
+
+  # HI target physics (plateau region)
+  hi_plateau_threshold: 80.0     # RUL above this → HI≈1.0
+  hi_eol_threshold: 25.0         # RUL tail zone for HI→0.0 (approximate)
+  hi_eol_weight: 4.0             # extra penalty for HI at EOL
+
+data:
+  use_physical_features: true
+  use_multi_scale_features: true
+  use_residual_features: true      # Phase-4 residual / digital-twin mode
+  condition_wise_scaling: true
+  condition_embeddings: false
+
+  unit_col: UnitNumber
+  cycle_col: TimeInCycles
+  rul_col: RUL
+
+training:
+  batch_size: 256
+  lr: 0.0001
+  num_epochs: 80
+  weight_decay: 0.0001
+  optimizer: adam
+  scheduler: null
+  patience: 8
+  seed: 42
+
+

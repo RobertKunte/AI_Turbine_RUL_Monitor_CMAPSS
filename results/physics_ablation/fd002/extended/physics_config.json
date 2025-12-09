@@ -1,0 +1,11 @@
+{
+  "use_core": true,
+  "use_extended": true,
+  "use_residuals": false,
+  "use_temporal_on_physics": false,
+  "core_features": [
+    "HPC_Eff_Proxy",
+    "EGT_Drift",
+    "Fan_HPC_Ratio"
+  ]
+}

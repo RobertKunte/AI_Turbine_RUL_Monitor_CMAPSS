@@ -1,0 +1,82 @@
+# Base Phase-1 Health-Head Configuration for all datasets (FD001-FD004)
+# This config uses the best hyperparameters from FD004 Phase-1 sweep
+# The dataset field will be overwritten in the experiment script
+
+dataset: FD004  # Will be overwritten per dataset
+
+# Model Architecture
+model:
+  type: EOLFullLSTMWithHealth
+  hidden_dim: 50
+  num_layers: 2
+  dropout: 0.1
+  bidirectional: false
+
+# Training Configuration
+training:
+  num_epochs: 80
+  batch_size: 256
+  learning_rate: 0.0001  # 1e-4
+  weight_decay: 0.0001  # 1e-4
+  patience: 8
+  use_mixed_precision: true
+  random_seed: 42
+  engine_train_ratio: 0.8
+  shuffle_engines: true
+
+# Data Configuration
+data:
+  past_len: 30
+  max_rul: 125
+  use_condition_wise_scaling: true  # FD002/4: 7 conditions; FD001/3: 1 condition (still works)
+  clip_train: false
+  clip_test: true
+
+# Feature Engineering
+features:
+  physics:
+    use_core: true
+    use_extended: false
+    use_residuals: false
+    use_temporal_on_physics: false
+  temporal:
+    add_temporal_features: true
+    short_windows: [5, 10]
+    long_windows: [30]
+    add_rolling_mean: true
+    add_rolling_std: false
+    add_trend: true
+    add_delta: true
+    delta_lags: [5, 10]
+
+# Multi-Task Health Head Configuration
+# These are the best hyperparameters from FD004 Phase-1 sweep
+multi_task:
+  enabled: true
+  rul_beta: 45.0  # RUL weighting tau
+  health_loss_weight: 0.35  # lambda: trade-off between RUL and health loss
+  hi_condition_calib_weight: 0.0  # Condition calibration weight (disabled)
+  mono_late_weight: 0.03  # Late monotonicity weight (RUL < beta)
+  mono_global_weight: 0.003  # Global monotonicity weight (all cycles)
+  hi_plateau_threshold: 80.0  # RUL threshold for early-life plateau
+  hi_eol_threshold: 25.0  # RUL threshold for EOL-tail zone
+  hi_eol_weight: 10.0  # Extra weight for EOL health penalty
+
+# Results Directory
+results:
+  base_dir: results/health_index
+  phase_tag: phase1
+
+# Notes
+notes: |
+  Base Phase-1 Health-Head configuration for cross-dataset baseline.
+  
+  Hyperparameters derived from FD004 Phase-1 sweep (RMSE-optimized):
+    - rul_beta: 45.0
+    - health_loss_weight: 0.35
+    - mono_late_weight: 0.03
+    - mono_global_weight: 0.003
+    - hi_condition_calib_weight: 0.0
+  
+  This config will be applied to FD001, FD002, FD003, and FD004.
+

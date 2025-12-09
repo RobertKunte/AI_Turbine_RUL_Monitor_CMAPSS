@@ -1,0 +1,64 @@
+experiment_id: fd002_phase4_universal_v2_ms_cnn_d96_residual
+fd_id: FD002
+
+# Phase-4 residual / digital-twin baseline for FD002.
+# UniversalEncoderV2 (multi-scale CNN + Transformer) with HI head and residual features.
+
+model_class: RULHIUniversalModelV2
+encoder_type: universal_v2
+
+model:
+  # Sequence settings
+  past_len: 30
+  max_rul: 125
+
+  # Encoder architecture (UniversalEncoderV2)
+  d_model: 64           # or 96 for d96 variant; see src/experiment_configs.py
+  num_layers: 3
+  nhead: 4
+  dim_feedforward: 256  # defaults to 4 * d_model if None
+  dropout: 0.1
+  kernel_sizes: [3, 5, 9]
+  seq_encoder_type: transformer
+  use_layer_norm: true
+  max_seq_len: 300
+
+  # Condition handling (multi-condition dataset)
+  use_condition_embedding: true
+  num_conditions: 7
+  cond_emb_dim: 4
+
+loss:
+  rul_beta: 45.0
+
+  health_loss_weight: 0.30
+  mono_late_weight: 0.02
+  mono_global_weight: 0.003
+  hi_condition_calib_weight: 0.0
+
+  hi_plateau_threshold: 80.0
+  hi_eol_threshold: 25.0
+  hi_eol_weight: 4.0
+
+data:
+  use_physical_features: true
+  use_multi_scale_features: true
+  use_residual_features: true
+  condition_wise_scaling: true
+  condition_embeddings: true
+
+  unit_col: UnitNumber
+  cycle_col: TimeInCycles
+  rul_col: RUL
+
+training:
+  batch_size: 256
+  lr: 0.0001
+  num_epochs: 80
+  weight_decay: 0.0001
+  optimizer: adam
+  scheduler: null
+  patience: 10
+  seed: 42
+
+

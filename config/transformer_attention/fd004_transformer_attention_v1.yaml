@@ -1,0 +1,68 @@
+experiment_id: fd004_transformer_attention_v1
+fd_id: FD004
+
+# First Transformer + Attention encoder experiment on FD004.
+# Uses the Phase-4 residual feature pipeline (~464 features) and an
+# EOL-style multi-task head (RUL + HI) with monotonicity losses.
+
+model_class: UniversalEncoderV3Attention
+encoder_type: universal_v3_attention
+
+model:
+  # Sequence settings
+  past_len: 30
+  max_rul: 125
+
+  # Transformer encoder
+  d_model: 64
+  n_heads: 4
+  num_layers: 3
+  dim_feedforward: 256
+  dropout: 0.1
+
+  # Multi-scale CNN front-end (MS-CNN)
+  use_ms_cnn: true
+  kernel_sizes: [3, 5, 9]
+  max_seq_len: 300
+
+  # Condition handling (FD004 multi-condition)
+  use_condition_embedding: true
+  num_conditions: 7
+  cond_emb_dim: 4
+
+data:
+  use_physical_features: true
+  use_multi_scale_features: true
+  use_residual_features: true
+  condition_wise_scaling: true
+  condition_embeddings: true
+
+  unit_col: UnitNumber
+  cycle_col: TimeInCycles
+  rul_col: RUL
+
+loss:
+  # RUL loss weighting (as in Phase-4)
+  rul_beta: 45.0
+
+  # Health Index loss weights
+  health_loss_weight: 0.30
+  mono_late_weight: 0.02
+  mono_global_weight: 0.003
+  hi_condition_calib_weight: 0.0
+
+  hi_plateau_threshold: 80.0
+  hi_eol_threshold: 25.0
+  hi_eol_weight: 4.0
+
+training:
+  batch_size: 256
+  lr: 0.0001
+  num_epochs: 80
+  weight_decay: 0.0001
+  optimizer: adam
+  scheduler: null
+  patience: 10
+  seed: 42
+
+

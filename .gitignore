@@ -188,3 +188,7 @@ cython_debug/
 # PyTorch Model Weights
 *.pt
 *.pth
+
+#drive
+.tmp.drivedownload/
+.tmp.driveupload/

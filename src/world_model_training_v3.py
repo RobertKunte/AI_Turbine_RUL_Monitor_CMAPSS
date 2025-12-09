@@ -1,0 +1,1746 @@
+"""
+World Model v3 Training Functions.
+
+This module contains training functions for World Model v3 (UniversalEncoderV2 + HI Head).
+Separated from world_model_training.py to keep file sizes manageable.
+"""
+
+from typing import List, Dict, Any, Tuple, Optional
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import json
+import matplotlib.pyplot as plt
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.utils.data import TensorDataset, DataLoader
+except ImportError as exc:
+    raise ImportError(
+        "PyTorch is required for training routines. Please install torch."
+    ) from exc
+
+try:
+    from sklearn.preprocessing import StandardScaler
+except ImportError as exc:
+    raise ImportError(
+        "scikit-learn is required for preprocessing. Please install scikit-learn."
+    ) from exc
+
+from src.world_model_training import (
+    build_world_model_dataset_with_cond_ids,
+    compute_trajectory_step_weights,
+    WorldModelTrainingConfig,
+    build_seq2seq_samples_from_df,
+)
+from src.models.world_model import WorldModelUniversalV3
+from src.loss import monotonic_health_loss
+from src.training_utils import compute_global_trend_loss
+from src.metrics import compute_eol_errors_and_nasa
+from src.models.transformer_eol import EOLFullTransformerEncoder
+from src.models.transformer_world_model_v1 import TransformerWorldModelV1
+
+
+def train_world_model_universal_v3(
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    y_test_true: np.ndarray,
+    feature_cols: List[str],
+    dataset_name: str,
+    experiment_name: str,
+    d_model: int = 96,
+    num_layers: int = 3,
+    nhead: int = 4,
+    dim_feedforward: int = 384,
+    dropout: float = 0.1,
+    kernel_sizes: List[int] = None,
+    seq_encoder_type: str = "transformer",
+    decoder_num_layers: int = 2,
+    batch_size: int = 256,
+    num_epochs: int = 80,
+    lr: float = 0.0001,
+    weight_decay: float = 0.0001,
+    patience: int = 10,
+    engine_train_ratio: float = 0.8,
+    random_seed: int = 42,
+    world_model_config: Optional[WorldModelTrainingConfig] = None,
+    results_dir: Optional[Path] = None,
+    device: Optional[torch.device] = None,
+) -> Dict[str, Any]:
+    """
+    Train UniversalEncoderV2-based world model v3 with Health Index head.
+    
+    This function:
+    - Uses Phase 4 residual feature pipeline (464 features)
+    - Uses UniversalEncoderV2 as encoder
+    - Handles condition-wise scaling
+    - Supports configurable loss weights (traj, eol, hi, monotonicity)
+    - Evaluates EOL metrics
+    - Saves model, metrics, and diagnostics
+    
+    Args:
+        df_train: Training DataFrame with features and RUL
+        df_test: Test DataFrame with features
+        y_test_true: True RUL at EOL for test engines
+        feature_cols: List of feature column names
+        dataset_name: Dataset name (e.g., "FD004")
+        experiment_name: Experiment name
+        d_model: Model dimension for UniversalEncoderV2
+        num_layers: Number of encoder layers
+        nhead: Number of attention heads
+        dim_feedforward: Feedforward dimension
+        dropout: Dropout rate
+        kernel_sizes: CNN kernel sizes
+        seq_encoder_type: "transformer" or "lstm"
+        decoder_num_layers: Number of decoder LSTM layers
+        batch_size: Batch size
+        num_epochs: Number of training epochs
+        lr: Learning rate
+        weight_decay: Weight decay
+        patience: Early stopping patience
+        engine_train_ratio: Ratio of engines for training
+        random_seed: Random seed
+        world_model_config: WorldModelTrainingConfig with loss weights, horizon, etc.
+            If None, uses defaults (horizon=40, traj_weight=1.0, eol_weight=5.0, hi_weight=2.0)
+        results_dir: Directory to save results
+        device: PyTorch device
+    
+    Returns:
+        Dictionary with training results and metrics
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if results_dir is None:
+        results_dir = Path("results") / dataset_name.lower() / experiment_name
+    else:
+        results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    
+    if kernel_sizes is None:
+        kernel_sizes = [3, 5, 9]
+    
+    # Use provided config or create default for v3
+    if world_model_config is None:
+        world_model_config = WorldModelTrainingConfig(
+            forecast_horizon=40,
+            traj_loss_weight=1.0,
+            eol_loss_weight=5.0,
+            hi_loss_weight=2.0,
+            mono_late_weight=0.1,
+            mono_global_weight=0.1,
+        )
+    
+    past_len = world_model_config.past_len
+    # Allow an override for the decoder forecast horizon specific to WorldModelV1
+    horizon = int(getattr(world_model_config, "future_horizon", world_model_config.forecast_horizon))
+    max_rul = world_model_config.max_rul
+    use_condition_wise_scaling = world_model_config.use_condition_wise_scaling
+    
+    print(f"\n{'='*80}")
+    print(f"Training World Model v3: {experiment_name}")
+    print(f"Dataset: {dataset_name}, Features: {len(feature_cols)}")
+    print(f"  Horizon: {horizon}, Past len: {past_len}")
+    print(f"  Loss weights: traj={world_model_config.traj_loss_weight:.2f}, "
+          f"eol={world_model_config.eol_loss_weight:.2f}, "
+          f"hi={world_model_config.hi_loss_weight:.2f}")
+    print(f"  Monotonicity: late={world_model_config.mono_late_weight:.2f}, "
+          f"global={world_model_config.mono_global_weight:.2f}")
+    print(f"  EOL tail weighting: thr={world_model_config.eol_tail_rul_threshold}, "
+          f"w={world_model_config.eol_tail_weight:.2f}")
+    print(f"  HI fusion into EOL: use_hi_in_eol={world_model_config.use_hi_in_eol}, "
+          f"use_hi_slope_in_eol={world_model_config.use_hi_slope_in_eol}")
+    print(f"{'='*80}\n")
+    
+    # Compute trajectory step weights if needed
+    traj_step_weights = compute_trajectory_step_weights(
+        horizon=horizon,
+        weighting=world_model_config.traj_step_weighting,
+    ).to(device)
+    
+    # ===================================================================
+    # 1. Build sequences with condition IDs
+    # ===================================================================
+    print("[1] Building seq2seq sequences...")
+    X_train, Y_train, cond_ids_train = build_world_model_dataset_with_cond_ids(
+        df=df_train,
+        feature_cols=feature_cols,
+        target_col="RUL",
+        past_len=past_len,
+        horizon=horizon,
+        unit_col="UnitNumber",
+        cond_col="ConditionID",
+    )
+    
+    print(f"  Train sequences: {X_train.shape[0]}")
+    print(f"  Input shape: {X_train.shape}, Target shape: {Y_train.shape}")
+    
+    # Determine number of conditions
+    unique_conditions = torch.unique(cond_ids_train).cpu().numpy()
+    num_conditions = len(unique_conditions)
+    print(f"  Found {num_conditions} unique conditions: {unique_conditions}")
+    
+    # ===================================================================
+    # 2. Engine-based train/val split
+    # ===================================================================
+    print("\n[2] Creating engine-based train/val split...")
+    n_total = len(X_train)
+    n_val = int((1 - engine_train_ratio) * n_total)
+    n_train = n_total - n_val
+    
+    indices = torch.randperm(n_total, generator=torch.Generator().manual_seed(random_seed))
+    train_indices = indices[:n_train]
+    val_indices = indices[n_train:]
+    
+    X_train_split = X_train[train_indices]
+    Y_train_split = Y_train[train_indices]
+    cond_ids_train_split = cond_ids_train[train_indices]
+    
+    X_val = X_train[val_indices]
+    Y_val = Y_train[val_indices]
+    cond_ids_val = cond_ids_train[val_indices]
+    
+    print(f"  Train samples: {len(X_train_split)}, Val samples: {len(X_val)}")
+    
+    # ===================================================================
+    # 3. Condition-wise scaling
+    # ===================================================================
+    print("\n[3] Applying condition-wise feature scaling...")
+    scaler_dict = {}
+    X_train_scaled = X_train_split.clone()
+    X_val_scaled = X_val.clone()
+    
+    if use_condition_wise_scaling:
+        X_train_np = X_train_split.numpy()
+        X_val_np = X_val.numpy()
+        cond_ids_train_np = cond_ids_train_split.numpy()
+        cond_ids_val_np = cond_ids_val.numpy()
+        
+        for cond in unique_conditions:
+            cond = int(cond)
+            train_mask = (cond_ids_train_np == cond)
+            val_mask = (cond_ids_val_np == cond)
+            
+            scaler = StandardScaler()
+            # Fit on train data for this condition
+            X_train_cond_flat = X_train_np[train_mask].reshape(-1, X_train_np.shape[-1])
+            scaler.fit(X_train_cond_flat)
+            scaler_dict[cond] = scaler
+            
+            # Transform train
+            if train_mask.any():
+                X_train_scaled[train_mask] = torch.tensor(
+                    scaler.transform(X_train_cond_flat).reshape(-1, past_len, len(feature_cols)),
+                    dtype=torch.float32
+                )
+            
+            # Transform val
+            if val_mask.any():
+                X_val_cond_flat = X_val_np[val_mask].reshape(-1, X_val_np.shape[-1])
+                X_val_scaled[val_mask] = torch.tensor(
+                    scaler.transform(X_val_cond_flat).reshape(-1, past_len, len(feature_cols)),
+                    dtype=torch.float32
+                )
+        
+        print(f"  Fitted {len(scaler_dict)} condition-wise scalers")
+    else:
+        # Global scaling
+        scaler = StandardScaler()
+        X_train_flat = X_train_split.numpy().reshape(-1, len(feature_cols))
+        scaler.fit(X_train_flat)
+        scaler_dict[0] = scaler
+        
+        X_train_scaled = torch.tensor(
+            scaler.transform(X_train_flat).reshape(-1, past_len, len(feature_cols)),
+            dtype=torch.float32
+        )
+        X_val_flat = X_val.numpy().reshape(-1, len(feature_cols))
+        X_val_scaled = torch.tensor(
+            scaler.transform(X_val_flat).reshape(-1, past_len, len(feature_cols)),
+            dtype=torch.float32
+        )
+    
+    # Save scaler
+    import pickle
+    scaler_path = results_dir / "scaler.pkl"
+    with open(scaler_path, "wb") as f:
+        pickle.dump(scaler_dict, f)
+    print(f"  Saved scaler to {scaler_path}")
+    
+    # ===================================================================
+    # 4. Create dataloaders
+    # ===================================================================
+    print("\n[4] Creating dataloaders...")
+    train_dataset = TensorDataset(X_train_scaled, Y_train_split, cond_ids_train_split)
+    val_dataset = TensorDataset(X_val_scaled, Y_val, cond_ids_val)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    # ===================================================================
+    # 5. Initialize model
+    # ===================================================================
+    print("\n[5] Initializing World Model v3...")
+    model = WorldModelUniversalV3(
+        input_size=len(feature_cols),
+        d_model=d_model,
+        num_layers=num_layers,
+        nhead=nhead,
+        dim_feedforward=dim_feedforward,
+        dropout=dropout,
+        num_conditions=num_conditions if num_conditions > 1 else None,
+        cond_emb_dim=4,
+        kernel_sizes=kernel_sizes,
+        seq_encoder_type=seq_encoder_type,
+        use_layer_norm=True,
+        max_seq_len=300,
+        decoder_num_layers=decoder_num_layers,
+        horizon=horizon,
+        use_hi_in_eol=world_model_config.use_hi_in_eol,
+        use_hi_slope_in_eol=world_model_config.use_hi_slope_in_eol,
+    ).to(device)
+    
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"  Model parameters: {num_params:,}")
+    print(f"  Encoder: UniversalEncoderV2 (d_model={d_model}, num_layers={num_layers})")
+    print(f"  Decoder: LSTM (num_layers={decoder_num_layers}, horizon={horizon})")
+    print(f"  Heads: Trajectory, EOL, HI")
+    
+    # ===================================================================
+    # 6. Training loop
+    # ===================================================================
+    print("\n[6] Training model...")
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    mse_loss = nn.MSELoss()
+    
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_traj_loss": [],
+        "val_eol_loss": [],
+        "val_hi_loss": [],
+        "val_mono_late_loss": [],
+        "val_mono_global_loss": [],
+        "val_traj_weighted": [],
+        "val_eol_weighted": [],
+        "val_hi_weighted": [],
+        "val_mono_weighted": [],
+    }
+    
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+    best_model_path = results_dir / "world_model_v3_best.pt"
+    
+    for epoch in range(num_epochs):
+        # Training
+        model.train()
+        running_train_loss = 0.0
+        n_train_samples = 0
+        
+        for X_batch, Y_batch, cond_batch in train_loader:
+            X_batch = X_batch.to(device)
+            Y_batch = Y_batch.to(device)
+            cond_batch = cond_batch.to(device)
+            
+            optimizer.zero_grad()
+            
+            # Forward pass
+            outputs = model(
+                encoder_inputs=X_batch,
+                decoder_targets=Y_batch,
+                teacher_forcing_ratio=0.5,
+                horizon=horizon,
+                cond_ids=cond_batch if num_conditions > 1 else None,
+            )
+            
+            traj_pred = outputs["traj"]  # (B, H, 1) - predicted HI trajectory
+            eol_pred = outputs["eol"].squeeze(-1)  # (B,)   - predicted EOL RUL
+            hi_pred = outputs["hi"].squeeze(-1)    # (B,)   - predicted HI at current step
+
+            # ------------------------------------------------------------------
+            # Targets
+            # ------------------------------------------------------------------
+            target_traj_rul = Y_batch              # (B, H, 1) - future RUL trajectory
+            target_eol = Y_batch[:, 0, 0]          # (B,)       - RUL at start of window
+
+            # Physics-informed Health Index targets derived from RUL
+            MAX_VISIBLE_RUL = float(max_rul if max_rul is not None else 125.0)
+
+            # HI sequence target for each horizon step (B, H)
+            rul_future = target_traj_rul.squeeze(-1)          # (B, H)
+            hi_linear_seq = (rul_future / MAX_VISIBLE_RUL).clamp(0.0, 1.0)
+            target_hi_seq = torch.where(
+                rul_future > MAX_VISIBLE_RUL,
+                torch.ones_like(hi_linear_seq),               # healthy plateau
+                hi_linear_seq,                                # linear decay region
+            )  # (B, H)
+
+            # HI target at current step (use first horizon step)
+            hi_linear = (target_eol / MAX_VISIBLE_RUL).clamp(0.0, 1.0)
+            target_hi_last = torch.where(
+                target_eol > MAX_VISIBLE_RUL,
+                torch.ones_like(hi_linear),
+                hi_linear,
+            )  # (B,)
+
+            # ------------------------------------------------------------------
+            # Losses per head
+            # ------------------------------------------------------------------
+            # 1) EOL head: RUL at current step (optionally tail-weighted)
+            if (world_model_config.eol_tail_rul_threshold is not None and
+                world_model_config.eol_tail_weight is not None and
+                world_model_config.eol_tail_weight != 1.0):
+                thr = float(world_model_config.eol_tail_rul_threshold)
+                tail_w = float(world_model_config.eol_tail_weight)
+                weights_eol = torch.where(
+                    target_eol < thr,
+                    torch.full_like(target_eol, tail_w),
+                    torch.ones_like(target_eol),
+                )
+                loss_eol = ((eol_pred - target_eol) ** 2 * weights_eol).mean()
+            else:
+                loss_eol = mse_loss(eol_pred, target_eol)
+
+            # 2) HI head (scalar): MSE to current-step HI target
+            loss_hi_last = mse_loss(hi_pred, target_hi_last)
+
+            # 3) Trajectory head: full HI trajectory with monotonic + smoothness regularization
+            hi_seq_pred = traj_pred.squeeze(-1)  # (B, H)
+            loss_traj, base_hi_mse, mono_raw, smooth_raw = monotonic_health_loss(
+                pred_hi=hi_seq_pred,
+                target_hi=target_hi_seq,
+                alpha=world_model_config.mono_late_weight,
+                beta=world_model_config.mono_global_weight,
+                return_components=True,
+            )
+
+            # Weighted total loss
+            weighted_traj = world_model_config.traj_loss_weight * loss_traj
+            weighted_eol = world_model_config.eol_loss_weight * loss_eol
+            weighted_hi = world_model_config.hi_loss_weight * loss_hi_last
+
+            loss = weighted_traj + weighted_eol + weighted_hi
+            
+            loss.backward()
+            optimizer.step()
+            
+            running_train_loss += loss.item() * X_batch.size(0)
+            n_train_samples += X_batch.size(0)
+        
+        epoch_train_loss = running_train_loss / n_train_samples
+        
+        # Validation
+        model.eval()
+        running_val_loss = 0.0
+        running_val_traj_loss = 0.0
+        running_val_eol_loss = 0.0
+        running_val_hi_loss = 0.0
+        running_val_mono_late_loss = 0.0
+        running_val_mono_global_loss = 0.0
+        running_val_traj_weighted = 0.0
+        running_val_eol_weighted = 0.0
+        running_val_hi_weighted = 0.0
+        running_val_mono_weighted = 0.0
+        n_val_samples = 0
+        
+        with torch.no_grad():
+            for X_batch, Y_batch, cond_batch in val_loader:
+                X_batch = X_batch.to(device)
+                Y_batch = Y_batch.to(device)
+                cond_batch = cond_batch.to(device)
+                
+                # Forward pass
+                outputs = model(
+                    encoder_inputs=X_batch,
+                    decoder_targets=Y_batch,
+                    teacher_forcing_ratio=0.0,
+                    horizon=horizon,
+                    cond_ids=cond_batch if num_conditions > 1 else None,
+                )
+                
+                traj_pred = outputs["traj"]  # (B, H, 1) - predicted HI trajectory
+                eol_pred = outputs["eol"].squeeze(-1)  # (B,)
+                hi_pred = outputs["hi"].squeeze(-1)    # (B,)
+                
+                # Targets
+                target_traj_rul = Y_batch              # (B, H, 1)
+                target_eol = Y_batch[:, 0, 0]          # (B,)
+
+                # Physics-informed HI targets (same as training loop)
+                MAX_VISIBLE_RUL = float(max_rul if max_rul is not None else 125.0)
+                rul_future = target_traj_rul.squeeze(-1)          # (B, H)
+                hi_linear_seq = (rul_future / MAX_VISIBLE_RUL).clamp(0.0, 1.0)
+                target_hi_seq = torch.where(
+                    rul_future > MAX_VISIBLE_RUL,
+                    torch.ones_like(hi_linear_seq),
+                    hi_linear_seq,
+                )  # (B, H)
+
+                hi_linear = (target_eol / MAX_VISIBLE_RUL).clamp(0.0, 1.0)
+                target_hi_last = torch.where(
+                    target_eol > MAX_VISIBLE_RUL,
+                    torch.ones_like(hi_linear),
+                    hi_linear,
+                )  # (B,)
+                
+                # Losses
+                if (world_model_config.eol_tail_rul_threshold is not None and
+                    world_model_config.eol_tail_weight is not None and
+                    world_model_config.eol_tail_weight != 1.0):
+                    thr = float(world_model_config.eol_tail_rul_threshold)
+                    tail_w = float(world_model_config.eol_tail_weight)
+                    weights_eol = torch.where(
+                        target_eol < thr,
+                        torch.full_like(target_eol, tail_w),
+                        torch.ones_like(target_eol),
+                    )
+                    loss_eol = ((eol_pred - target_eol) ** 2 * weights_eol).mean()
+                else:
+                    loss_eol = mse_loss(eol_pred, target_eol)
+                loss_hi_last = mse_loss(hi_pred, target_hi_last)
+
+                hi_seq_pred = traj_pred.squeeze(-1)  # (B, H)
+                loss_traj, base_hi_mse, mono_raw, smooth_raw = monotonic_health_loss(
+                    pred_hi=hi_seq_pred,
+                    target_hi=target_hi_seq,
+                    alpha=world_model_config.mono_late_weight,
+                    beta=world_model_config.mono_global_weight,
+                    return_components=True,
+                )
+                
+                # Weighted losses
+                weighted_traj = world_model_config.traj_loss_weight * loss_traj
+                weighted_eol = world_model_config.eol_loss_weight * loss_eol
+                weighted_hi = world_model_config.hi_loss_weight * loss_hi_last
+                weighted_mono = world_model_config.traj_loss_weight * (
+                    world_model_config.mono_late_weight * mono_raw
+                    + world_model_config.mono_global_weight * smooth_raw
+                )
+                
+                loss = weighted_traj + weighted_eol + weighted_hi
+                
+                running_val_loss += loss.item() * X_batch.size(0)
+                running_val_traj_loss += base_hi_mse.item() * X_batch.size(0)
+                running_val_eol_loss += loss_eol.item() * X_batch.size(0)
+                running_val_hi_loss += loss_hi_last.item() * X_batch.size(0)
+                running_val_mono_late_loss += mono_raw.item() * X_batch.size(0)
+                running_val_mono_global_loss += smooth_raw.item() * X_batch.size(0)
+                running_val_traj_weighted += weighted_traj.item() * X_batch.size(0)
+                running_val_eol_weighted += weighted_eol.item() * X_batch.size(0)
+                running_val_hi_weighted += weighted_hi.item() * X_batch.size(0)
+                running_val_mono_weighted += weighted_mono.item() * X_batch.size(0)
+                n_val_samples += X_batch.size(0)
+        
+        epoch_val_loss = running_val_loss / n_val_samples
+        epoch_val_traj_loss = running_val_traj_loss / n_val_samples
+        epoch_val_eol_loss = running_val_eol_loss / n_val_samples
+        epoch_val_hi_loss = running_val_hi_loss / n_val_samples
+        epoch_val_mono_late_loss = running_val_mono_late_loss / n_val_samples
+        epoch_val_mono_global_loss = running_val_mono_global_loss / n_val_samples
+        epoch_val_traj_weighted = running_val_traj_weighted / n_val_samples
+        epoch_val_eol_weighted = running_val_eol_weighted / n_val_samples
+        epoch_val_hi_weighted = running_val_hi_weighted / n_val_samples
+        epoch_val_mono_weighted = running_val_mono_weighted / n_val_samples
+        
+        history["train_loss"].append(epoch_train_loss)
+        history["val_loss"].append(epoch_val_loss)
+        history["val_traj_loss"].append(epoch_val_traj_loss)
+        history["val_eol_loss"].append(epoch_val_eol_loss)
+        history["val_hi_loss"].append(epoch_val_hi_loss)
+        history["val_mono_late_loss"].append(epoch_val_mono_late_loss)
+        history["val_mono_global_loss"].append(epoch_val_mono_global_loss)
+        history["val_traj_weighted"].append(epoch_val_traj_weighted)
+        history["val_eol_weighted"].append(epoch_val_eol_weighted)
+        history["val_hi_weighted"].append(epoch_val_hi_weighted)
+        history["val_mono_weighted"].append(epoch_val_mono_weighted)
+        
+        print(
+            f"Epoch {epoch+1}/{num_epochs} - "
+            f"train: {epoch_train_loss:.4f}, val: {epoch_val_loss:.4f}, "
+            f"val_traj: {epoch_val_traj_loss:.4f} (w: {epoch_val_traj_weighted:.4f}), "
+            f"val_eol: {epoch_val_eol_loss:.4f} (w: {epoch_val_eol_weighted:.4f}), "
+            f"val_hi: {epoch_val_hi_loss:.4f} (w: {epoch_val_hi_weighted:.4f}), "
+            f"val_mono: {epoch_val_mono_late_loss:.4f}+{epoch_val_mono_global_loss:.4f} (w: {epoch_val_mono_weighted:.4f})"
+        )
+        
+        # Early stopping
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            epochs_no_improve = 0
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "epoch": epoch,
+                "val_loss": epoch_val_loss,
+                "input_dim": len(feature_cols),
+                "d_model": d_model,
+                "num_conditions": num_conditions,
+                "encoder_type": "world_model_universal_v3",
+            }, best_model_path)
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
+    
+    # Load best model
+    checkpoint = torch.load(best_model_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    
+    print(f"\n[7] Best model loaded from epoch {checkpoint['epoch']+1} (val_loss={checkpoint['val_loss']:.4f})")
+    
+    # ===================================================================
+    # 7. Evaluate on test set
+    # ===================================================================
+    print("\n[8] Evaluating on test set...")
+    test_metrics = evaluate_world_model_v3_eol(
+        model=model,
+        df_test=df_test,
+        y_test_true=y_test_true,
+        feature_cols=feature_cols,
+        scaler_dict=scaler_dict,
+        past_len=past_len,
+        max_rul=max_rul,
+        num_conditions=num_conditions,
+        device=device,
+    )
+    
+    print(f"  Test RMSE: {test_metrics['RMSE']:.2f} cycles")
+    print(f"  Test MAE:  {test_metrics['MAE']:.2f} cycles")
+    print(f"  Test Bias: {test_metrics['Bias']:.2f} cycles")
+    print(f"  Test R²:   {test_metrics.get('R2', 0.0):.4f}")
+    print(f"  NASA Score (mean): {test_metrics['nasa_score_mean']:.2f}")
+    
+    # ===================================================================
+    # 8. Compute per-condition metrics
+    # ===================================================================
+    print("\n[9] Computing per-condition metrics...")
+    condition_metrics = {}
+    
+    df_test_cond = df_test.groupby("UnitNumber")["ConditionID"].first()
+    unit_ids_test = sorted(df_test["UnitNumber"].unique())
+    
+    y_pred_eol = np.array(test_metrics.get("y_pred_eol", []))
+    y_true_eol = np.array(test_metrics.get("y_true_eol", y_test_true))
+    
+    if len(y_pred_eol) > 0 and len(y_pred_eol) == len(unit_ids_test):
+        for cond_id in unique_conditions:
+            cond_id = int(cond_id)
+            cond_engines = df_test_cond[df_test_cond == cond_id].index.values
+            if len(cond_engines) == 0:
+                continue
+            
+            cond_indices = [i for i, uid in enumerate(unit_ids_test) if uid in cond_engines]
+            if len(cond_indices) == 0:
+                continue
+            
+            cond_y_true = y_true_eol[cond_indices]
+            cond_y_pred = y_pred_eol[cond_indices]
+            
+            errors = cond_y_pred - cond_y_true
+            rmse = np.sqrt(np.mean(errors ** 2))
+            mae = np.mean(np.abs(errors))
+            bias = np.mean(errors)
+            r2 = 1 - np.sum(errors ** 2) / np.sum((cond_y_true - np.mean(cond_y_true)) ** 2) if np.var(cond_y_true) > 0 else 0.0
+            
+            condition_metrics[cond_id] = {
+                "num_engines": len(cond_indices),
+                "rmse": float(rmse),
+                "mae": float(mae),
+                "bias": float(bias),
+                "r2": float(r2),
+            }
+        
+        condition_metrics_path = results_dir / "condition_metrics.json"
+        with open(condition_metrics_path, "w") as f:
+            json.dump(condition_metrics, f, indent=2)
+        print(f"  Saved per-condition metrics to {condition_metrics_path}")
+        print(f"  Conditions analyzed: {list(condition_metrics.keys())}")
+    else:
+        print("  Warning: Could not compute per-condition metrics (missing predictions)")
+    
+    # ===================================================================
+    # 9. Save results
+    # ===================================================================
+    print("\n[10] Saving results...")
+    summary = {
+        "experiment_name": experiment_name,
+        "dataset": dataset_name,
+        "model_version": "v3",
+        "model_type": "world_model_universal_v3",
+        "encoder_type": "universal_v3",
+        "d_model": d_model,
+        "num_layers": num_layers,
+        "nhead": nhead,
+        "dim_feedforward": dim_feedforward,
+        "dropout": dropout,
+        "kernel_sizes": kernel_sizes,
+        "seq_encoder_type": seq_encoder_type,
+        "decoder_num_layers": decoder_num_layers,
+        "num_features": len(feature_cols),
+        "num_conditions": num_conditions,
+        "past_len": past_len,
+        "horizon": horizon,
+        "max_rul": max_rul,
+        "world_model_config": {
+            "forecast_horizon": horizon,
+            "traj_loss_weight": world_model_config.traj_loss_weight,
+            "eol_loss_weight": world_model_config.eol_loss_weight,
+            "hi_loss_weight": world_model_config.hi_loss_weight,
+            "mono_late_weight": world_model_config.mono_late_weight,
+            "mono_global_weight": world_model_config.mono_global_weight,
+            "traj_step_weighting": world_model_config.traj_step_weighting,
+            "use_condition_wise_scaling": use_condition_wise_scaling,
+            "use_hi_in_eol": world_model_config.use_hi_in_eol,
+            "use_hi_slope_in_eol": world_model_config.use_hi_slope_in_eol,
+            "eol_tail_rul_threshold": world_model_config.eol_tail_rul_threshold,
+            "eol_tail_weight": world_model_config.eol_tail_weight,
+        },
+        "test_metrics": {
+            "rmse": test_metrics["RMSE"],
+            "mae": test_metrics["MAE"],
+            "bias": test_metrics["Bias"],
+            "r2": test_metrics.get("R2", 0.0),
+            "nasa_mean": test_metrics["nasa_score_mean"],
+            "nasa_sum": test_metrics["nasa_score_sum"],
+            "num_engines": test_metrics["num_engines"],
+        },
+        "condition_metrics": condition_metrics,
+        "training_history": {
+            "best_epoch": checkpoint["epoch"] + 1,
+            "best_val_loss": float(checkpoint["val_loss"]),
+            "final_train_loss": float(history["train_loss"][-1]),
+            "final_val_loss": float(history["val_loss"][-1]),
+        },
+    }
+    
+    summary_path = results_dir / "summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"  Saved summary to {summary_path}")
+    
+    # Save full training history
+    training_history_path = results_dir / "training_history.json"
+    with open(training_history_path, "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"  Saved training history to {training_history_path}")
+    
+    # Plot training curves
+    try:
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        
+        epochs = range(1, len(history["train_loss"]) + 1)
+        
+        # Loss curves
+        axes[0, 0].plot(epochs, history["train_loss"], label="Train Loss", color="blue")
+        axes[0, 0].plot(epochs, history["val_loss"], label="Val Loss", color="red")
+        axes[0, 0].set_xlabel("Epoch")
+        axes[0, 0].set_ylabel("Loss")
+        axes[0, 0].set_title("Training and Validation Loss")
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Component losses (raw)
+        axes[0, 1].plot(epochs, history["val_traj_loss"], label="Traj", color="green")
+        axes[0, 1].plot(epochs, history["val_eol_loss"], label="EOL", color="orange")
+        axes[0, 1].plot(epochs, history["val_hi_loss"], label="HI", color="purple")
+        axes[0, 1].set_xlabel("Epoch")
+        axes[0, 1].set_ylabel("Loss")
+        axes[0, 1].set_title("Validation Component Losses (Raw)")
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Weighted losses
+        axes[0, 2].plot(epochs, history["val_traj_weighted"], label=f"Traj (×{world_model_config.traj_loss_weight:.1f})", color="green", linestyle="--")
+        axes[0, 2].plot(epochs, history["val_eol_weighted"], label=f"EOL (×{world_model_config.eol_loss_weight:.1f})", color="orange", linestyle="--")
+        axes[0, 2].plot(epochs, history["val_hi_weighted"], label=f"HI (×{world_model_config.hi_loss_weight:.1f})", color="purple", linestyle="--")
+        axes[0, 2].set_xlabel("Epoch")
+        axes[0, 2].set_ylabel("Weighted Loss")
+        axes[0, 2].set_title("Validation Weighted Losses")
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, alpha=0.3)
+        
+        # Monotonicity losses
+        axes[1, 0].plot(epochs, history["val_mono_late_loss"], label="Late Mono", color="red")
+        axes[1, 0].plot(epochs, history["val_mono_global_loss"], label="Global Mono", color="blue")
+        axes[1, 0].set_xlabel("Epoch")
+        axes[1, 0].set_ylabel("Loss")
+        axes[1, 0].set_title("Validation Monotonicity Losses")
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Combined weighted view
+        axes[1, 1].plot(epochs, history["val_traj_weighted"], label="Traj", color="green", alpha=0.7)
+        axes[1, 1].plot(epochs, history["val_eol_weighted"], label="EOL", color="orange", alpha=0.7)
+        axes[1, 1].plot(epochs, history["val_hi_weighted"], label="HI", color="purple", alpha=0.7)
+        axes[1, 1].plot(epochs, history["val_mono_weighted"], label="Mono", color="red", alpha=0.7)
+        axes[1, 1].set_xlabel("Epoch")
+        axes[1, 1].set_ylabel("Weighted Loss")
+        axes[1, 1].set_title("All Weighted Losses")
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        # Total loss breakdown
+        axes[1, 2].plot(epochs, history["val_loss"], label="Total Val Loss", color="black", linewidth=2)
+        axes[1, 2].set_xlabel("Epoch")
+        axes[1, 2].set_ylabel("Loss")
+        axes[1, 2].set_title("Total Validation Loss")
+        axes[1, 2].legend()
+        axes[1, 2].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        training_curves_path = results_dir / "training_curves.png"
+        plt.savefig(training_curves_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"  Saved training curves to {training_curves_path}")
+    except Exception as e:
+        print(f"  Warning: Could not generate training curves: {e}")
+    
+    # ===================================================================
+    # 10. Generate diagnostics
+    # ===================================================================
+    print("\n[11] Generating diagnostics...")
+    try:
+        from src.analysis.diagnostics import run_diagnostics_for_run
+        
+        print(f"Using diagnostics (sliding-window HI, degraded engines) for {dataset_name}...")
+        run_diagnostics_for_run(
+            exp_dir=results_dir.parent.parent,  # results/ (go up from results/<dataset>/<name> to results/)
+            dataset_name=dataset_name,
+            run_name=experiment_name,
+            device=device,
+        )
+        
+        # Reload summary to get updated info
+        with open(summary_path, "r") as f:
+            summary = json.load(f)
+    except Exception as e:
+        print(f"Warning: Could not generate diagnostics: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return summary
+
+
+def train_transformer_world_model_v1(
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    feature_cols: List[str],
+    dataset_name: str,
+    experiment_name: str,
+    world_model_config: WorldModelTrainingConfig,
+    encoder_d_model: int = 64,
+    encoder_num_layers: int = 3,
+    encoder_nhead: int = 4,
+    encoder_dim_feedforward: int = 256,
+    encoder_dropout: float = 0.1,
+    num_sensors_out: int = 21,
+    cond_dim: int = 9,
+    batch_size: int = 128,
+    num_epochs: int = 60,
+    lr: float = 1e-4,
+    weight_decay: float = 1e-4,
+    patience: int = 10,
+    results_dir: Optional[Path] = None,
+    device: Optional[torch.device] = None,
+) -> Dict[str, Any]:
+    """
+    Train Transformer World Model V1 on FD004 (or compatible datasets).
+
+    - Encoder: EOLFullTransformerEncoder with ms+DT feature vectors (e.g. 349D).
+    - Decoder: GRU-based world model (TransformerWorldModelV1) predicting
+      future sensor trajectories (and optionally future HI/RUL).
+
+    This is an initial V1 implementation focused primarily on future sensor
+    forecasting; HI/RUL future heads are optional and can be refined later.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if results_dir is None:
+        results_dir = Path("results") / dataset_name.lower() / experiment_name
+    else:
+        results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    past_len = world_model_config.past_len
+    horizon = world_model_config.forecast_horizon
+
+    print(f"\n{'='*80}")
+    print(f"Training Transformer World Model V1: {experiment_name}")
+    print(f"Dataset: {dataset_name}, Features: {len(feature_cols)}")
+    print(f"  Horizon: {horizon}, Past len: {past_len}")
+    print(f"{'='*80}\n")
+
+    # ------------------------------------------------------------------
+    # Build seq2seq dataset for future sensor, RUL and HI prediction
+    # ------------------------------------------------------------------
+    sensor_cols = [c for c in feature_cols if c.startswith("Sensor")]
+    if len(sensor_cols) < num_sensors_out:
+        # Fallback: use whatever sensor columns are available
+        num_sensors_out = len(sensor_cols)
+    target_sensor_cols = sensor_cols[:num_sensors_out]
+
+    # ------------------------------------------------------------------
+    # Optional sensor scaling: put sensor trajectories into a normalized
+    # space (same scaler used for inputs X_past and targets Y_future_sens).
+    # ------------------------------------------------------------------
+    from sklearn.preprocessing import StandardScaler
+
+    sensor_scaler = StandardScaler()
+    sensor_values = df_train[target_sensor_cols].to_numpy(dtype=np.float32, copy=True)
+    sensor_scaler.fit(sensor_values)
+
+    # Apply scaling to the training DataFrame for sensor columns only.
+    df_train_scaled = df_train.copy()
+    df_train_scaled[target_sensor_cols] = sensor_scaler.transform(sensor_values)
+
+    # We build samples per engine (UnitNumber) with sliding windows, similar to
+    # build_seq2seq_samples_from_df in src/world_model_training.py, but we
+    # additionally construct future RUL and HI trajectories.
+    X_list: list[np.ndarray] = []
+    Y_sens_list: list[np.ndarray] = []
+    Y_rul_list: list[np.ndarray] = []
+    Y_hi_list: list[np.ndarray] = []
+    future_cond_list: list[np.ndarray] = []
+    cond_id_list: list[int] = []
+
+    max_rul = world_model_config.max_rul
+    max_visible_rul = float(max_rul if max_rul is not None else 125.0)
+
+    # Continuous condition-feature columns (Cond_*) used for optional future_conds.
+    cond_cols = [c for c in feature_cols if c.startswith("Cond_")]
+    cond_dim_actual = len(cond_cols)
+    if cond_dim_actual > 0 and cond_dim_actual != cond_dim:
+        print(
+            f"[WorldModelV1] Warning: cond_dim={cond_dim} but found {cond_dim_actual} Cond_* columns "
+            f"in feature_cols. Using {cond_dim_actual} for future_conds."
+        )
+
+    for unit_id, df_unit in df_train_scaled.groupby("UnitNumber"):
+        cond_id = int(df_unit["ConditionID"].iloc[0])
+
+        values_in = df_unit[feature_cols].to_numpy(dtype=np.float32, copy=True)
+        # Sensors are already scaled in df_train_scaled for target_sensor_cols.
+        values_sens = df_unit[target_sensor_cols].to_numpy(dtype=np.float32, copy=True)
+        # We assume a precomputed RUL column (capped) exists in the training df.
+        if "RUL" not in df_unit.columns:
+            raise KeyError("Expected 'RUL' column in df_train for world model targets.")
+        values_rul = df_unit["RUL"].to_numpy(dtype=np.float32, copy=True)
+        # Continuous condition vectors for each time step (if available)
+        values_cond = None
+        if cond_dim_actual > 0:
+            values_cond = df_unit[cond_cols].to_numpy(dtype=np.float32, copy=True)
+        # Clip RUL to [0, max_rul] for safety
+        values_rul = np.clip(values_rul, 0.0, float(max_rul))
+
+        T = len(df_unit)
+        if T < past_len + horizon:
+            continue
+
+        for t_past_end in range(past_len - 1, T - horizon):
+            t_past_start = t_past_end + 1 - past_len
+            t_future_start = t_past_end + 1
+            t_future_end = t_future_start + horizon
+
+            X_past = values_in[t_past_start : t_past_end + 1]  # (past_len, F)
+            Y_future_sens = values_sens[t_future_start:t_future_end]  # (H, num_sensors_out)
+
+            future_rul = values_rul[t_future_start:t_future_end]  # (H,)
+
+            # Physics-informed HI mapping (same piecewise linear mapping as v3):
+            # HI = 1 for RUL > MAX_VISIBLE_RUL, else HI = RUL / MAX_VISIBLE_RUL,
+            # clipped to [0, 1].
+            hi_linear = np.clip(future_rul / max_visible_rul, 0.0, 1.0)
+            future_hi = np.where(future_rul > max_visible_rul, 1.0, hi_linear).astype(
+                np.float32
+            )  # (H,)
+
+            # Normalize RUL future trajectory to [0, 1] for the model.
+            future_rul_norm = future_rul / float(max_rul if max_rul is not None else 1.0)
+
+            # Future continuous condition vectors [H, cond_dim_actual] (or zeros if not available)
+            if cond_dim_actual > 0 and values_cond is not None:
+                future_conds = values_cond[t_future_start:t_future_end]  # (H, cond_dim_actual)
+            else:
+                future_conds = np.zeros((horizon, cond_dim), dtype=np.float32)
+
+            X_list.append(X_past.astype(np.float32))
+            Y_sens_list.append(Y_future_sens.astype(np.float32))
+            Y_rul_list.append(future_rul_norm.astype(np.float32))
+            Y_hi_list.append(future_hi)
+            future_cond_list.append(future_conds.astype(np.float32))
+            cond_id_list.append(cond_id)
+
+    if not X_list:
+        raise ValueError("No seq2seq samples could be built for TransformerWorldModelV1.")
+
+    X_train_np = np.stack(X_list, axis=0)  # (N, past_len, F)
+    Y_sens_np = np.stack(Y_sens_list, axis=0)  # (N, horizon, num_sensors_out)
+    Y_rul_np = np.stack(Y_rul_list, axis=0)  # (N, horizon)
+    Y_hi_np = np.stack(Y_hi_list, axis=0)  # (N, horizon)
+    future_cond_np = np.stack(future_cond_list, axis=0)  # (N, horizon, cond_dim_actual or cond_dim)
+
+    # ------------------------------------------------------------------
+    # Debug: dataset-level normalization statistics
+    # ------------------------------------------------------------------
+    print("=== WorldModelV1 Debug: Dataset stats ===")
+    print(
+        "X_train_np:  mean {:.3f}, std {:.3f}, min {:.3f}, max {:.3f}".format(
+            float(X_train_np.mean()),
+            float(X_train_np.std()),
+            float(X_train_np.min()),
+            float(X_train_np.max()),
+        )
+    )
+    print(
+        "Y_sens_np:   mean {:.3f}, std {:.3f}, min {:.3f}, max {:.3f}".format(
+            float(Y_sens_np.mean()),
+            float(Y_sens_np.std()),
+            float(Y_sens_np.min()),
+            float(Y_sens_np.max()),
+        )
+    )
+    print(
+        "Y_rul_np:    mean {:.3f}, min {:.3f}, max {:.3f}".format(
+            float(Y_rul_np.mean()),
+            float(Y_rul_np.min()),
+            float(Y_rul_np.max()),
+        )
+    )
+    print(
+        "Y_hi_np:     mean {:.3f}, min {:.3f}, max {:.3f}".format(
+            float(Y_hi_np.mean()),
+            float(Y_hi_np.min()),
+            float(Y_hi_np.max()),
+        )
+    )
+    if future_cond_np.size > 0:
+        print(
+            "future_cond_np: mean {:.3f}, std {:.3f}".format(
+                float(future_cond_np.mean()), float(future_cond_np.std())
+            )
+        )
+    print("=========================================")
+
+    X_train = torch.from_numpy(X_train_np).float()
+    Y_sens_train = torch.from_numpy(Y_sens_np).float()
+    Y_rul_train = torch.from_numpy(Y_rul_np).float()
+    Y_hi_train = torch.from_numpy(Y_hi_np).float()
+    future_cond_train = torch.from_numpy(future_cond_np).float()
+    cond_ids = torch.tensor(cond_id_list, dtype=torch.long)
+
+    # Simple train/val split on sample-level (could be improved to engine-level)
+    N = X_train.shape[0]
+    n_train = int(0.8 * N)
+    train_indices = np.arange(0, n_train)
+    val_indices = np.arange(n_train, N)
+
+    X_tr = X_train[train_indices]
+    Y_sens_tr = Y_sens_train[train_indices]
+    Y_rul_tr = Y_rul_train[train_indices]
+    Y_hi_tr = Y_hi_train[train_indices]
+    future_cond_tr = future_cond_train[train_indices]
+    cond_tr = cond_ids[train_indices]
+
+    X_val = X_train[val_indices]
+    Y_sens_val = Y_sens_train[val_indices]
+    Y_rul_val = Y_rul_train[val_indices]
+    Y_hi_val = Y_hi_train[val_indices]
+    future_cond_val = future_cond_train[val_indices]
+    cond_val = cond_ids[val_indices]
+
+    train_ds = torch.utils.data.TensorDataset(
+        X_tr, Y_sens_tr, Y_rul_tr, Y_hi_tr, cond_tr, future_cond_tr
+    )
+    val_ds = torch.utils.data.TensorDataset(
+        X_val, Y_sens_val, Y_rul_val, Y_hi_val, cond_val, future_cond_val
+    )
+
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, drop_last=False
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, drop_last=False
+    )
+
+    # ------------------------------------------------------------------
+    # Build encoder and world model
+    # ------------------------------------------------------------------
+    input_dim = len(feature_cols)
+    print(f"[WorldModelV1] Using input_dim={input_dim}, num_sensors_out={num_sensors_out}, cond_dim={cond_dim}")
+
+    encoder = EOLFullTransformerEncoder(
+        input_dim=input_dim,
+        d_model=encoder_d_model,
+        num_layers=encoder_num_layers,
+        n_heads=encoder_nhead,
+        dim_feedforward=encoder_dim_feedforward,
+        dropout=encoder_dropout,
+        use_condition_embedding=True,
+        num_conditions=7,
+        cond_emb_dim=4,
+        max_seq_len=300,
+    ).to(device)
+
+    # Optional: load pretrained encoder weights (e.g. from ms+DT encoder run)
+    encoder_ckpt_path = getattr(world_model_config, "encoder_checkpoint", None)
+    if encoder_ckpt_path:
+        try:
+            print(f"[WorldModelV1] Loading encoder weights from: {encoder_ckpt_path}")
+            state = torch.load(encoder_ckpt_path, map_location=device)
+            # Accept either a full checkpoint or a plain state_dict
+            if isinstance(state, dict) and "model_state_dict" in state:
+                encoder.load_state_dict(state["model_state_dict"], strict=False)
+            else:
+                encoder.load_state_dict(state, strict=False)
+            print("[WorldModelV1] Encoder weights loaded successfully.")
+        except Exception as e:
+            print(f"[WorldModelV1] Warning: failed to load encoder checkpoint '{encoder_ckpt_path}': {e}")
+    else:
+        print("[WorldModelV1] No encoder_checkpoint provided – training encoder from scratch.")
+
+    # World-model specific flags/params
+    target_mode = getattr(world_model_config, "target_mode", "sensors")
+    init_from_rul_hi = getattr(world_model_config, "init_from_rul_hi", False)
+    decoder_hidden_dim = int(getattr(world_model_config, "decoder_hidden_dim", 256))
+    num_layers_decoder = int(getattr(world_model_config, "num_layers_decoder", 1))
+    freeze_encoder = bool(getattr(world_model_config, "freeze_encoder", False))
+
+    # Dynamic latent flags for Branch A+ (default False for backwards compatibility)
+    use_latent_history = bool(getattr(world_model_config, "use_latent_history", False))
+    use_hi_anchor = bool(getattr(world_model_config, "use_hi_anchor", False))
+    use_future_conds = bool(getattr(world_model_config, "use_future_conds", False))
+
+    world_model = TransformerWorldModelV1(
+        encoder=encoder,
+        input_dim=input_dim,
+        num_sensors_out=num_sensors_out,
+        cond_dim=cond_dim,
+        future_horizon=horizon,
+        decoder_hidden_dim=decoder_hidden_dim,
+        num_layers_decoder=num_layers_decoder,
+        dropout=encoder_dropout,
+        predict_hi=True,
+        predict_rul=True,
+        target_mode=target_mode,
+        init_from_rul_hi=init_from_rul_hi,
+        use_latent_history=use_latent_history,
+        use_hi_anchor=use_hi_anchor,
+        use_future_conds=use_future_conds,
+    ).to(device)
+
+    # Optionally freeze encoder (latent dynamics world model)
+    if freeze_encoder:
+        print("[WorldModelV1] Freezing encoder parameters (no gradient updates).")
+        for p in world_model.encoder.parameters():
+            p.requires_grad = False
+        world_model.encoder.eval()
+    print(
+        f"[WorldModelV1] Encoder configuration -> "
+        f"checkpoint: {encoder_ckpt_path if encoder_ckpt_path else 'None'}, "
+        f"freeze_encoder: {freeze_encoder}"
+    )
+
+    # Optimizer: only train parameters that require gradients
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, world_model.parameters()),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+
+    best_val_loss = float("inf")
+    best_state = None
+    epochs_no_improve = 0
+
+    sensor_w = world_model_config.__dict__.get("sensor_loss_weight", 1.0)
+    hi_w = world_model_config.__dict__.get("hi_future_loss_weight", 0.0)
+    rul_w = world_model_config.__dict__.get("rul_future_loss_weight", 0.0)
+
+    for epoch in range(num_epochs):
+        world_model.train()
+        running_train = 0.0
+        n_train_samples = 0
+
+        for batch_idx, (X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b) in enumerate(train_loader):
+            X_b = X_b.to(device)
+            Y_sens_b = Y_sens_b.to(device)
+            Y_rul_b = Y_rul_b.to(device)
+            Y_hi_b = Y_hi_b.to(device)
+            cond_b = cond_b.to(device)
+            future_cond_b = future_cond_b.to(device)
+
+            if epoch == 0 and batch_idx == 0:
+                print("=== WorldModelV1 Debug: First batch stats ===")
+                print(
+                    "X_b:       mean {:.3f}, std {:.3f}, min {:.3f}, max {:.3f}".format(
+                        float(X_b.mean()), float(X_b.std()),
+                        float(X_b.min()), float(X_b.max())
+                    )
+                )
+                print(
+                    "Y_sens_b:  mean {:.3f}, std {:.3f}, min {:.3f}, max {:.3f}".format(
+                        float(Y_sens_b.mean()), float(Y_sens_b.std()),
+                        float(Y_sens_b.min()), float(Y_sens_b.max())
+                    )
+                )
+                print(
+                    "Y_rul_b:   mean {:.3f}, min {:.3f}, max {:.3f}".format(
+                        float(Y_rul_b.mean()), float(Y_rul_b.min()), float(Y_rul_b.max())
+                    )
+                )
+                print(
+                    "Y_hi_b:    mean {:.3f}, min {:.3f}, max {:.3f}".format(
+                        float(Y_hi_b.mean()), float(Y_hi_b.min()), float(Y_hi_b.max())
+                    )
+                )
+                print("============================================")
+
+            optimizer.zero_grad()
+
+            # For now we don't pass a continuous condition vector – caller should
+            # precompute Cond_* and pass here; as a first version we use zeros.
+            cond_vec = torch.zeros(X_b.size(0), cond_dim, device=device)
+
+            # Use the first future step as "current" RUL/HI for decoder init
+            current_rul_b = Y_rul_b[:, 0]  # (B,)
+            current_hi_b = Y_hi_b[:, 0]    # (B,)
+
+            if target_mode in ["latent_hi_rul", "latent_hi_rul_dynamic_delta_v2"]:
+                # Dynamic latent world model: no sensor teacher forcing, optional future_conds + HI anchor.
+                pred_sensors, pred_hi, pred_rul = world_model(
+                    past_seq=X_b,
+                    cond_vec=cond_vec,
+                    cond_ids=cond_b,
+                    future_horizon=horizon,
+                    teacher_forcing_targets=None,
+                    current_rul=current_rul_b if use_hi_anchor else None,
+                    current_hi=current_hi_b if use_hi_anchor else None,
+                    future_conds=future_cond_b if use_future_conds else None,
+                )
+            else:
+                # Original sensor-autoregressive world model path.
+                pred_sensors, pred_hi, pred_rul = world_model(
+                    past_seq=X_b,
+                    cond_vec=cond_vec,
+                    cond_ids=cond_b,
+                    future_horizon=horizon,
+                    teacher_forcing_targets=Y_sens_b,
+                    current_rul=current_rul_b,
+                    current_hi=current_hi_b,
+                )
+
+            # Sensor trajectory loss
+            loss_sensors = F.mse_loss(pred_sensors, Y_sens_b)
+            loss = sensor_w * loss_sensors
+
+            # HI future loss (piecewise HI targets already built into Y_hi_b)
+            if hi_w > 0.0 and pred_hi is not None:
+                # pred_hi: (B, H, 1), Y_hi_b: (B, H)
+                hi_loss = F.mse_loss(pred_hi.squeeze(-1), Y_hi_b)
+                loss = loss + hi_w * hi_loss
+
+            # RUL future loss (L1 on cycles)
+            if rul_w > 0.0 and pred_rul is not None:
+                # pred_rul: (B, H, 1), Y_rul_b: (B, H)
+                rul_loss = F.l1_loss(pred_rul.squeeze(-1), Y_rul_b)
+                loss = loss + rul_w * rul_loss
+
+            loss.backward()
+            optimizer.step()
+
+            running_train += loss.item() * X_b.size(0)
+            n_train_samples += X_b.size(0)
+
+        train_loss = running_train / max(1, n_train_samples)
+
+        # Validation
+        world_model.eval()
+        running_val = 0.0
+        n_val_samples = 0
+        with torch.no_grad():
+            for X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b in val_loader:
+                X_b = X_b.to(device)
+                Y_sens_b = Y_sens_b.to(device)
+                Y_rul_b = Y_rul_b.to(device)
+                Y_hi_b = Y_hi_b.to(device)
+                cond_b = cond_b.to(device)
+                future_cond_b = future_cond_b.to(device)
+                cond_vec = torch.zeros(X_b.size(0), cond_dim, device=device)
+
+                current_rul_b = Y_rul_b[:, 0]
+                current_hi_b = Y_hi_b[:, 0]
+
+                if target_mode in ["latent_hi_rul", "latent_hi_rul_dynamic_delta_v2"]:
+                    pred_sensors, pred_hi, pred_rul = world_model(
+                        past_seq=X_b,
+                        cond_vec=cond_vec,
+                        cond_ids=cond_b,
+                        future_horizon=horizon,
+                        teacher_forcing_targets=None,
+                        current_rul=current_rul_b if use_hi_anchor else None,
+                        current_hi=current_hi_b if use_hi_anchor else None,
+                        future_conds=future_cond_b if use_future_conds else None,
+                    )
+                else:
+                    pred_sensors, pred_hi, pred_rul = world_model(
+                        past_seq=X_b,
+                        cond_vec=cond_vec,
+                        cond_ids=cond_b,
+                        future_horizon=horizon,
+                        teacher_forcing_targets=Y_sens_b,
+                        current_rul=current_rul_b,
+                        current_hi=current_hi_b,
+                    )
+
+                loss_sensors = F.mse_loss(pred_sensors, Y_sens_b)
+                loss = sensor_w * loss_sensors
+
+                if hi_w > 0.0 and pred_hi is not None:
+                    hi_loss = F.mse_loss(pred_hi.squeeze(-1), Y_hi_b)
+                    loss = loss + hi_w * hi_loss
+
+                if rul_w > 0.0 and pred_rul is not None:
+                    rul_loss = F.l1_loss(pred_rul.squeeze(-1), Y_rul_b)
+                    loss = loss + rul_w * rul_loss
+
+                running_val += loss.item() * X_b.size(0)
+                n_val_samples += X_b.size(0)
+
+        val_loss = running_val / max(1, n_val_samples)
+
+        print(
+            f"[WorldModelV1] Epoch {epoch+1}/{num_epochs} - "
+            f"train_loss: {train_loss:.4f}, val_loss: {val_loss:.4f}"
+        )
+
+        if val_loss < best_val_loss - 1e-6:
+            best_val_loss = val_loss
+            best_state = {k: v.cpu().clone() for k, v in world_model.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"[WorldModelV1] Early stopping at epoch {epoch+1}")
+                break
+
+    if best_state is not None:
+        world_model.load_state_dict(best_state)
+
+    # Save checkpoint
+    checkpoint_path = results_dir / f"transformer_world_model_v1_best_{experiment_name}.pt"
+    torch.save(
+        {
+            "model_state_dict": world_model.state_dict(),
+            "val_loss": best_val_loss,
+            "input_dim": input_dim,
+            "num_sensors_out": num_sensors_out,
+            "cond_dim": cond_dim,
+            "horizon": horizon,
+        },
+        checkpoint_path,
+    )
+    print(f"[WorldModelV1] Saved best model to {checkpoint_path}")
+
+    # Save sensor scaler used for normalizing sensor trajectories so that
+    # diagnostics / rollouts can de-normalize back to physical units.
+    try:
+        import pickle
+
+        scaler_path = results_dir / "world_model_v1_sensor_scaler.pkl"
+        with open(scaler_path, "wb") as f:
+            pickle.dump(
+                {
+                    "sensor_cols": target_sensor_cols,
+                    "scaler_state": {
+                        "mean_": sensor_scaler.mean_,
+                        "scale_": sensor_scaler.scale_,
+                    },
+                },
+                f,
+            )
+        print(f"[WorldModelV1] Saved sensor scaler to {scaler_path}")
+    except Exception as e:
+        print(f"[WorldModelV1] Warning: could not save sensor scaler: {e}")
+
+    # ------------------------------------------------------------------
+    # EOL-style test evaluation on FD004 test set (literature-style RUL metrics)
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 80)
+    print(f"World Model Experiment Complete: {experiment_name}")
+    print("=" * 80)
+    print("Test Metrics: (literature-style EOL metrics for RUL)")
+
+    from typing import Dict
+
+    # Ensure df_test has an RUL column for evaluation (per-unit, per-cycle),
+    # using the same convention as training: RUL_raw = MaxTime - TimeInCycles,
+    # clipped to [0, max_rul]. This yields a monotonically decreasing RUL
+    # towards 0 at the last observed cycle.
+    df_test_for_eval = df_test.copy()
+    if "RUL" not in df_test_for_eval.columns:
+        df_max_time = (
+            df_test_for_eval.groupby("UnitNumber")["TimeInCycles"]
+            .max()
+            .reset_index()
+            .rename(columns={"TimeInCycles": "MaxTime"})
+        )
+        df_test_for_eval = df_test_for_eval.merge(df_max_time, on="UnitNumber", how="left")
+        df_test_for_eval["RUL_raw"] = df_test_for_eval["MaxTime"] - df_test_for_eval["TimeInCycles"]
+        df_test_for_eval["RUL"] = np.minimum(
+            df_test_for_eval["RUL_raw"],
+            float(getattr(world_model_config, "max_rul", 125.0)),
+        )
+
+    try:
+        test_metrics = evaluate_transformer_world_model_v1_on_test(
+            model=world_model,
+            df_test=df_test_for_eval,
+            feature_cols=feature_cols,
+            world_model_config=world_model_config,
+            device=device,
+        )
+    except Exception as exc:
+        print(f"  Error while computing test metrics: {exc}")
+        test_metrics: Dict[str, Any] = {}
+
+    if test_metrics:
+        print(f"  RMSE: {test_metrics['rmse']:.2f} cycles")
+        print(f"  MAE:  {test_metrics['mae']:.2f} cycles")
+        print(f"  Bias: {test_metrics['bias']:.2f} cycles")
+        print(f"  R²:   {test_metrics['r2']:.4f}")
+        print(f"  NASA Mean: {test_metrics['nasa_mean']:.2f}")
+    else:
+        print("  (no test metrics computed)")
+    print("=" * 80)
+
+    # Summary with validation loss and optional test metrics
+    summary = {
+        "experiment_name": experiment_name,
+        "dataset": dataset_name,
+        "model_type": "transformer_world_model_v1",
+        "num_features": input_dim,
+        "past_len": past_len,
+        "horizon": horizon,
+        "target_mode": target_mode,
+        "val_loss": float(best_val_loss),
+        # Encoder configuration is important for latent world-model runs
+        "encoder_checkpoint": encoder_ckpt_path if encoder_ckpt_path else None,
+        "freeze_encoder": freeze_encoder,
+    }
+    if test_metrics:
+        summary["test_metrics"] = test_metrics
+
+    summary_path = results_dir / "summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[WorldModelV1] Saved summary to {summary_path}")
+
+    return summary
+
+
+def evaluate_transformer_world_model_v1_on_test(
+    model: nn.Module,
+    df_test: pd.DataFrame,
+    feature_cols: List[str],
+    world_model_config: WorldModelTrainingConfig,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """
+    Evaluate TransformerWorldModelV1 on FD004 test set and compute
+    literature-style EOL metrics (RMSE, MAE, Bias, R², NASA score).
+
+    Strategy:
+    - Build seq2seq samples (past_len, future_horizon) from test data.
+    - Run model in eval mode without teacher forcing (free rollouts).
+    - Use the RUL forecast at the last horizon step as EOL-like prediction.
+    - Compute metrics using compute_eol_errors_and_nasa.
+    """
+    model.eval()
+
+    past_len = int(getattr(world_model_config, "past_len", 30))
+    horizon = int(getattr(world_model_config, "future_horizon", world_model_config.forecast_horizon))
+    max_rul = float(getattr(world_model_config, "max_rul", 125.0))
+
+    X_list: List[np.ndarray] = []
+    hi_seq_list: List[np.ndarray] = []
+    true_rul_last_list: List[float] = []
+    cond_id_list: List[int] = []
+
+    # Ensure we have a RUL column clipped to [0, max_rul]
+    if "RUL" not in df_test.columns:
+        raise KeyError("evaluate_transformer_world_model_v1_on_test expects 'RUL' column in df_test.")
+
+    for unit_id, df_unit in df_test.groupby("UnitNumber"):
+        df_unit = df_unit.sort_values("TimeInCycles").reset_index(drop=True)
+        num_rows = len(df_unit)
+        if num_rows < past_len + horizon:
+            continue
+
+        cond_id_unit = int(df_unit["ConditionID"].iloc[0])
+
+        for start in range(0, num_rows - past_len - horizon + 1):
+            past = df_unit.iloc[start : start + past_len]
+            future = df_unit.iloc[start + past_len : start + past_len + horizon]
+
+            X_list.append(past[feature_cols].to_numpy(dtype=np.float32, copy=True))
+
+            # RUL future in cycles for metrics (clipped)
+            rul_future = future["RUL"].clip(lower=0.0, upper=max_rul).to_numpy(dtype=np.float32)
+            true_rul_last_list.append(float(rul_future[-1]))
+
+            # HI future (normalized) as in training: HI = clip(RUL / max_rul, 0, 1)
+            hi_future = np.clip(rul_future / max_rul, 0.0, 1.0)
+            hi_seq_list.append(hi_future.astype(np.float32))
+
+            cond_id_list.append(cond_id_unit)
+
+    if not X_list:
+        print("[WorldModelV1-Test] No valid test samples could be built.")
+        return {}
+
+    X_np = np.stack(X_list, axis=0)  # (N, past_len, F)
+    Y_hi_np = np.stack(hi_seq_list, axis=0)  # (N, horizon)
+    cond_ids_np = np.array(cond_id_list, dtype=np.int64)  # (N,)
+
+    X = torch.from_numpy(X_np).float().to(device)
+    Y_hi = torch.from_numpy(Y_hi_np).float().to(device)
+    cond_ids = torch.from_numpy(cond_ids_np).long().to(device)
+
+    batch_size = int(getattr(world_model_config, "batch_size", 256))
+    ds = TensorDataset(X, Y_hi, cond_ids)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+
+    all_true_rul_last: List[float] = []
+    all_pred_rul_last: List[float] = []
+    idx_offset = 0
+
+    cond_dim = getattr(world_model_config, "cond_dim", 9)
+
+    with torch.no_grad():
+        for X_b, Y_hi_b, cond_b in loader:
+            B, _, _ = X_b.shape
+            cond_vec = torch.zeros(B, cond_dim, device=device)
+
+            # Approximate current RUL from HI (since HI ≈ RUL/max_rul in our mapping)
+            current_hi_b = Y_hi_b[:, 0]  # (B,)
+            current_rul_b = current_hi_b  # normalized RUL in [0,1]
+
+            pred_sensors, pred_hi, pred_rul = model(
+                past_seq=X_b,
+                cond_vec=cond_vec,
+                cond_ids=cond_b,
+                future_horizon=horizon,
+                teacher_forcing_targets=None,
+                current_rul=current_rul_b,
+                current_hi=current_hi_b,
+            )
+
+            if pred_rul is None:
+                continue
+
+            # Model predicts normalized RUL; take last horizon step and denormalize
+            pred_rul_last_norm = pred_rul[:, -1, 0]  # (B,)
+            pred_rul_last = (pred_rul_last_norm * max_rul).cpu().numpy()
+
+            true_rul_last_batch = np.array(true_rul_last_list[idx_offset : idx_offset + B], dtype=np.float32)
+            idx_offset += B
+
+            all_true_rul_last.append(true_rul_last_batch)
+            all_pred_rul_last.append(pred_rul_last)
+
+    if not all_true_rul_last:
+        print("[WorldModelV1-Test] No RUL predictions were produced.")
+        return {}
+
+    y_true = np.concatenate(all_true_rul_last, axis=0)
+    y_pred = np.concatenate(all_pred_rul_last, axis=0)
+
+    # Compute classic EOL metrics
+    errors = y_pred - y_true
+    mse = float(np.mean(errors**2))
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(errors)))
+    bias = float(np.mean(errors))
+
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    r2 = float(1 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
+
+    # NASA PHM08-style score via existing helper
+    nasa_stats = compute_eol_errors_and_nasa(y_true, y_pred, max_rul=max_rul)
+
+    metrics = {
+        "rmse": rmse,
+        "mae": mae,
+        "bias": bias,
+        "r2": r2,
+        "nasa_mean": float(nasa_stats["nasa_mean"]),
+        "nasa_sum": float(nasa_stats["nasa_sum"]),
+        "num_samples": int(len(y_true)),
+    }
+
+    return metrics
+
+
+def evaluate_world_model_v3_eol(
+    model: nn.Module,
+    df_test: pd.DataFrame,
+    y_test_true: np.ndarray,
+    feature_cols: List[str],
+    scaler_dict: Dict[int, StandardScaler],
+    past_len: int = 30,
+    max_rul: int = 125,
+    num_conditions: int = 1,
+    device: torch.device = None,
+) -> Dict[str, Any]:
+    """
+    Evaluate World Model v3 on test set (EOL metrics).
+    
+    Args:
+        model: Trained WorldModelUniversalV3
+        df_test: Test DataFrame
+        y_test_true: True RUL at EOL (capped)
+        feature_cols: Feature column names
+        scaler_dict: Dictionary of condition-wise scalers
+        past_len: Past window length
+        max_rul: Maximum RUL value
+        num_conditions: Number of conditions
+        device: PyTorch device
+    
+    Returns:
+        Dictionary with EOL metrics
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = model.to(device)
+    model.eval()
+    
+    y_pred_all = []
+    y_true_all = []
+    unit_ids_list = []
+    
+    # Helper function to build EOL input
+    def _build_eol_input_for_unit(df_unit: pd.DataFrame, feature_cols: List[str], past_len: int) -> np.ndarray:
+        """Build past_len window for EOL evaluation."""
+        df_unit = df_unit.sort_values("TimeInCycles")
+        feats = df_unit[feature_cols].values.astype(np.float32)
+        
+        if len(feats) < past_len:
+            # Pad with first row
+            padding = np.tile(feats[0:1], (past_len - len(feats), 1))
+            feats = np.vstack([padding, feats])
+        else:
+            # Take last past_len rows
+            feats = feats[-past_len:]
+        
+        return feats
+    
+    # Create mapping from unit_id to index in y_test_true
+    unit_id_to_idx = {i + 1: i for i in range(len(y_test_true))}
+    
+    with torch.no_grad():
+        for unit_id, df_unit in df_test.groupby("UnitNumber"):
+            unit_id = int(unit_id)
+            
+            # Build input
+            X_past_np = _build_eol_input_for_unit(df_unit, feature_cols, past_len)
+            
+            # Get condition ID
+            cond_id = int(df_unit["ConditionID"].iloc[0])
+            
+            # Scale
+            scaler = scaler_dict.get(cond_id, scaler_dict.get(0))
+            X_past_scaled = scaler.transform(X_past_np.reshape(-1, len(feature_cols))).reshape(past_len, len(feature_cols))
+            
+            X_past = torch.tensor(X_past_scaled, dtype=torch.float32).unsqueeze(0).to(device)  # (1, past_len, F)
+            cond_ids = torch.tensor([cond_id], dtype=torch.long).to(device) if num_conditions > 1 else None
+            
+            # Predict
+            outputs = model(
+                encoder_inputs=X_past,
+                decoder_targets=None,
+                teacher_forcing_ratio=0.0,
+                horizon=1,
+                cond_ids=cond_ids,
+            )
+
+            # Robustly extract EOL/RUL prediction from different output formats
+            if isinstance(outputs, dict):
+                # World Model v3 or dict-like wrapper
+                eol_pred = outputs.get("eol", outputs.get("rul"))
+                if eol_pred is None:
+                    raise ValueError("evaluate_world_model_v3_eol: could not find 'eol' or 'rul' in model outputs dict")
+            else:
+                # Tuple/list outputs: e.g. (traj, eol)
+                if isinstance(outputs, (tuple, list)):
+                    if len(outputs) == 2:
+                        _, eol_pred = outputs
+                    else:
+                        # Fallback: assume second element is EOL
+                        eol_pred = outputs[1]
+                else:
+                    # Unexpected type, treat whole output as eol_pred
+                    eol_pred = outputs
+
+            # Normalize shapes: expect either (B, 1), (B,) or (B, H, 1)
+            eol_tensor = eol_pred
+            if isinstance(eol_tensor, np.ndarray):
+                eol_val = float(eol_tensor.reshape(-1)[0])
+            else:
+                if eol_tensor.dim() == 3:
+                    # (B, H, 1) -> first horizon step
+                    eol_val = float(eol_tensor[0, 0, 0].cpu().item())
+                elif eol_tensor.dim() == 2:
+                    # (B, 1)
+                    eol_val = float(eol_tensor[0, 0].cpu().item())
+                else:
+                    # (B,)
+                    eol_val = float(eol_tensor[0].cpu().item())
+
+            pred_rul = np.clip(eol_val, 0.0, max_rul)
+            
+            y_pred_all.append(pred_rul)
+            unit_ids_list.append(unit_id)
+            # Map unit_id to index in y_test_true
+            idx = unit_id_to_idx.get(unit_id, unit_id - 1)
+            if idx < len(y_test_true):
+                y_true_all.append(y_test_true[idx])
+            else:
+                # Fallback: use last value if index out of range
+                y_true_all.append(y_test_true[-1])
+    
+    y_true = np.array(y_true_all)
+    y_pred = np.array(y_pred_all)
+    
+    # Compute metrics
+    errors = y_pred - y_true
+    mse = float(np.mean(errors**2))
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(errors)))
+    bias = float(np.mean(errors))
+    
+    # R²
+    ss_res = np.sum((y_true - y_pred)**2)
+    ss_tot = np.sum((y_true - np.mean(y_true))**2)
+    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+    
+    # NASA score using compute_eol_errors_and_nasa
+    nasa_stats = compute_eol_errors_and_nasa(y_true, y_pred, max_rul=max_rul)
+    
+    return {
+        "MSE": mse,
+        "RMSE": rmse,
+        "MAE": mae,
+        "Bias": bias,
+        "R2": r2,
+        "nasa_score_sum": nasa_stats["nasa_sum"],
+        "nasa_score_mean": nasa_stats["nasa_mean"],
+        "num_engines": len(y_true),
+        "y_pred_eol": y_pred.tolist(),
+        "y_true_eol": y_true.tolist(),
+    }
+

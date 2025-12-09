@@ -86,7 +86,7 @@ print("\n" + "=" * 60)
 print("[3] Building Full-Trajectory Sequences")
 print("=" * 60)
 
-X_full, y_full, unit_ids_full = build_full_eol_sequences_from_df(
+X_full, y_full, unit_ids_full, cond_ids_full = build_full_eol_sequences_from_df(
     df=df_train_global,
     feature_cols=feature_cols,
     past_len=30,
@@ -107,6 +107,7 @@ train_loader, val_loader, scaler, train_unit_ids, val_unit_ids = create_full_dat
     X=X_full,
     y=y_full,
     unit_ids=unit_ids_full,
+    cond_ids=cond_ids_full,
     batch_size=256,
     engine_train_ratio=0.8,
     shuffle_engines=True,
@@ -137,6 +138,11 @@ print("\n" + "=" * 60)
 print("[6] Training EOLFullLSTM")
 print("=" * 60)
 
+from src.config import (
+    HI_CONDITION_CALIB_WEIGHT,
+    HI_CONDITION_CALIB_PLATEAU_THRESH,
+)
+
 model, history = train_eol_full_lstm(
     model=model,
     train_loader=train_loader,
@@ -148,6 +154,9 @@ model, history = train_eol_full_lstm(
     device=device,
     results_dir="../results/eol_full_lstm",
     run_name="fd001_fd004",
+    use_health_head=True,  # Enable multi-task mode for condition calibration
+    hi_condition_calib_weight=HI_CONDITION_CALIB_WEIGHT,
+    hi_plateau_threshold=HI_CONDITION_CALIB_PLATEAU_THRESH,
 )
 
 # ===================================================================

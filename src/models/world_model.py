@@ -1,5 +1,5 @@
 # src/models/world_model.py
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 try:
     import torch  # type: ignore[import]
@@ -525,3 +525,397 @@ class WorldModelEncoderDecoderMultiTaskV11(nn.Module):
         eol_pred = self.eol_head(h_last_eol)  # (B, 1)
 
         return traj_outputs, eol_pred
+
+
+class WorldModelEncoderDecoderUniversalV2(nn.Module):
+    """
+    World Model using UniversalEncoderV2 as encoder.
+    
+    Phase 4: Uses UniversalEncoderV2 (multi-scale CNN + Transformer) as encoder
+    for seq2seq RUL trajectory prediction with EOL head.
+    
+    Architecture:
+    - encoder: UniversalEncoderV2 (multi-scale CNN + Transformer/LSTM)
+    - decoder: LSTM decoder for RUL trajectory
+    - eol_head: MLP on encoder output for EOL prediction
+    
+    This is designed for Phase 4 residual feature experiments (464 features).
+    """
+    
+    def __init__(
+        self,
+        input_size: int,
+        d_model: int = 96,
+        num_layers: int = 3,
+        nhead: int = 4,
+        dim_feedforward: int = 384,
+        dropout: float = 0.1,
+        output_size: int = 1,
+        num_conditions: Optional[int] = None,
+        cond_emb_dim: int = 4,
+        kernel_sizes: List[int] = None,
+        seq_encoder_type: str = "transformer",
+        use_layer_norm: bool = True,
+        max_seq_len: int = 300,
+        decoder_hidden_size: Optional[int] = None,
+        decoder_num_layers: int = 2,
+    ):
+        super().__init__()
+        
+        if kernel_sizes is None:
+            kernel_sizes = [3, 5, 9]
+        
+        if decoder_hidden_size is None:
+            decoder_hidden_size = d_model
+        
+        self.input_size = input_size
+        self.d_model = d_model
+        self.output_size = output_size
+        self.num_conditions = num_conditions
+        self.decoder_num_layers = decoder_num_layers
+        
+        # Import UniversalEncoderV2
+        from .universal_encoder_v1 import UniversalEncoderV2
+        
+        # Encoder: UniversalEncoderV2
+        self.encoder = UniversalEncoderV2(
+            input_dim=input_size,
+            d_model=d_model,
+            num_layers=num_layers,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            num_conditions=num_conditions,
+            cond_emb_dim=cond_emb_dim,
+            kernel_sizes=kernel_sizes,
+            seq_encoder_type=seq_encoder_type,
+            use_layer_norm=use_layer_norm,
+            max_seq_len=max_seq_len,
+        )
+        
+        # Decoder: LSTM for trajectory prediction
+        self.decoder = nn.LSTM(
+            input_size=output_size,  # Autoregressive: feed previous RUL prediction
+            hidden_size=decoder_hidden_size,
+            num_layers=decoder_num_layers,
+            batch_first=True,
+            dropout=dropout if decoder_num_layers > 1 else 0.0,
+        )
+        
+        # Project encoder output to decoder initial hidden state
+        self.encoder_to_decoder_h = nn.Linear(d_model, decoder_hidden_size * decoder_num_layers)
+        self.encoder_to_decoder_c = nn.Linear(d_model, decoder_hidden_size * decoder_num_layers)
+        
+        # Decoder output projection
+        self.fc_out = nn.Linear(decoder_hidden_size, output_size)
+        
+        # EOL Head: MLP on encoder output
+        self.eol_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, 1),
+        )
+    
+    def forward(
+        self,
+        encoder_inputs: torch.Tensor,  # (B, L_past, F)
+        decoder_targets: Optional[torch.Tensor] = None,  # (B, H, 1) or None
+        teacher_forcing_ratio: float = 0.5,
+        horizon: Optional[int] = None,
+        cond_ids: Optional[torch.Tensor] = None,  # (B,) - condition IDs for encoder
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass.
+        
+        Args:
+            encoder_inputs: (B, L_past, F) - Past sequence
+            decoder_targets: (B, H, 1) or None - Future RUL trajectory (for teacher forcing)
+            teacher_forcing_ratio: Probability of using ground truth in decoder
+            horizon: Number of future steps (if decoder_targets is None)
+            cond_ids: (B,) - Condition IDs for encoder (required if num_conditions > 1)
+        
+        Returns:
+            traj_outputs: (B, H, 1) - Predicted RUL trajectory
+            eol_pred: (B, 1) - Predicted EOL RUL
+        """
+        B = encoder_inputs.size(0)
+        
+        # --- Encoder ---
+        # UniversalEncoderV2 returns (B, d_model) - sequence embedding
+        enc_emb = self.encoder(encoder_inputs, cond_ids=cond_ids)  # (B, d_model)
+        
+        # EOL prediction from encoder embedding
+        eol_pred = self.eol_head(enc_emb)  # (B, 1)
+        
+        # --- Decoder Setup ---
+        if decoder_targets is not None and horizon is None:
+            horizon = decoder_targets.size(1)
+        if horizon is None:
+            raise ValueError("Either decoder_targets or horizon must be provided.")
+        
+        # Initialize decoder hidden state from encoder embedding
+        h_0 = self.encoder_to_decoder_h(enc_emb)  # (B, decoder_hidden_size * decoder_num_layers)
+        c_0 = self.encoder_to_decoder_c(enc_emb)  # (B, decoder_hidden_size * decoder_num_layers)
+        
+        # Reshape for LSTM: (num_layers, B, hidden_size)
+        h_0 = h_0.view(B, self.decoder_num_layers, -1).transpose(0, 1).contiguous()
+        c_0 = c_0.view(B, self.decoder_num_layers, -1).transpose(0, 1).contiguous()
+        
+        dec_hidden = (h_0, c_0)
+        
+        # Initial decoder input
+        if decoder_targets is not None:
+            dec_input = decoder_targets[:, 0:1, :]  # (B, 1, 1)
+        else:
+            dec_input = eol_pred.unsqueeze(1)  # (B, 1, 1)
+        
+        # --- Decoder Loop ---
+        traj_outputs = []
+        for t in range(horizon):
+            dec_out, dec_hidden = self.decoder(dec_input, dec_hidden)
+            step_pred = self.fc_out(dec_out)  # (B, 1, 1)
+            traj_outputs.append(step_pred)
+            
+            # Teacher forcing or autoregressive
+            if decoder_targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                if t + 1 < decoder_targets.size(1):
+                    dec_input = decoder_targets[:, t + 1 : t + 2, :]
+                else:
+                    dec_input = step_pred
+            else:
+                dec_input = step_pred
+        
+        traj_outputs = torch.cat(traj_outputs, dim=1)  # (B, H, 1)
+        
+        return traj_outputs, eol_pred
+
+
+class WorldModelUniversalV3(nn.Module):
+    """
+    Universal World Model v3 with Health Index Head.
+    
+    Phase 5: Enhanced World Model with:
+    - UniversalEncoderV2 (multi-scale CNN + Transformer) as encoder
+    - LSTM Decoder for trajectory prediction (horizon=40)
+    - Three heads:
+        * Trajectory-Head: Predicts HI-proxy trajectory over horizon
+        * EOL-Head: Predicts EOL RUL (strongly weighted)
+        * HI-Head: Predicts Health Index in [0, 1] (with monotonicity)
+    
+    This is designed for Phase 5 residual feature experiments (464 features).
+    Uses same architecture pattern as RULHIUniversalModelV2 for compatibility.
+    """
+    
+    def __init__(
+        self,
+        input_size: int,
+        d_model: int = 96,
+        num_layers: int = 3,
+        nhead: int = 4,
+        dim_feedforward: int = 384,
+        dropout: float = 0.1,
+        num_conditions: Optional[int] = None,
+        cond_emb_dim: int = 4,
+        kernel_sizes: List[int] = None,
+        seq_encoder_type: str = "transformer",
+        use_layer_norm: bool = True,
+        max_seq_len: int = 300,
+        decoder_hidden_size: Optional[int] = None,
+        decoder_num_layers: int = 2,
+        horizon: int = 40,
+        # v3 extensions: HI fusion into EOL head
+        use_hi_in_eol: bool = False,
+        use_hi_slope_in_eol: bool = False,
+    ):
+        super().__init__()
+        
+        if kernel_sizes is None:
+            kernel_sizes = [3, 5, 9]
+        
+        if decoder_hidden_size is None:
+            decoder_hidden_size = d_model
+        
+        self.input_size = input_size
+        self.d_model = d_model
+        self.num_conditions = num_conditions
+        self.decoder_num_layers = decoder_num_layers
+        self.horizon = horizon
+        self.use_hi_in_eol = use_hi_in_eol
+        self.use_hi_slope_in_eol = use_hi_slope_in_eol
+        
+        # Import UniversalEncoderV2
+        from .universal_encoder_v1 import UniversalEncoderV2
+        
+        # Encoder: UniversalEncoderV2 (same as v2)
+        self.encoder = UniversalEncoderV2(
+            input_dim=input_size,
+            d_model=d_model,
+            num_layers=num_layers,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            num_conditions=num_conditions,
+            cond_emb_dim=cond_emb_dim,
+            kernel_sizes=kernel_sizes,
+            seq_encoder_type=seq_encoder_type,
+            use_layer_norm=use_layer_norm,
+            max_seq_len=max_seq_len,
+        )
+        
+        # Decoder: LSTM for trajectory prediction (same as v2)
+        self.decoder = nn.LSTM(
+            input_size=1,  # Autoregressive: feed previous prediction
+            hidden_size=decoder_hidden_size,
+            num_layers=decoder_num_layers,
+            batch_first=True,
+            dropout=dropout if decoder_num_layers > 1 else 0.0,
+        )
+        
+        # Project encoder output to decoder initial hidden state
+        self.encoder_to_decoder_h = nn.Linear(d_model, decoder_hidden_size * decoder_num_layers)
+        self.encoder_to_decoder_c = nn.Linear(d_model, decoder_hidden_size * decoder_num_layers)
+        
+        # Shared head (like RULHIUniversalModelV2) for HI and (base) EOL features
+        self.shared_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        
+        # Trajectory-Head: Predicts HI-proxy trajectory from decoder output
+        self.traj_head = nn.Linear(decoder_hidden_size, 1)
+        
+        # Determine number of additional HI features for EOL fusion
+        hi_feat_dim = 0
+        if self.use_hi_in_eol:
+            hi_feat_dim += 1  # hi_current
+            if self.use_hi_slope_in_eol:
+                hi_feat_dim += 1  # hi_slope
+        
+        # EOL-Head: MLP/Linear on shared encoder features (+ optional HI fusion)
+        eol_in_dim = d_model + hi_feat_dim if self.use_hi_in_eol else d_model
+        self.fc_rul = nn.Linear(eol_in_dim, 1)
+        
+        # HI-Head: Predicts Health Index in [0, 1] (with monotonicity)
+        self.fc_health = nn.Linear(d_model, 1)
+        
+        # Initialize weights
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def forward(
+        self,
+        encoder_inputs: torch.Tensor,  # (B, L_past, F)
+        decoder_targets: Optional[torch.Tensor] = None,  # (B, H, 1) or None
+        teacher_forcing_ratio: float = 0.5,
+        horizon: Optional[int] = None,
+        cond_ids: Optional[torch.Tensor] = None,  # (B,) - condition IDs for encoder
+    ) -> dict:
+        """
+        Forward pass.
+        
+        Args:
+            encoder_inputs: (B, L_past, F) - Past sequence
+            decoder_targets: (B, H, 1) or None - Future trajectory (for teacher forcing)
+            teacher_forcing_ratio: Probability of using ground truth in decoder
+            horizon: Number of future steps (if decoder_targets is None, uses self.horizon)
+            cond_ids: (B,) - Condition IDs for encoder (required if num_conditions > 1)
+        
+        Returns:
+            Dictionary with:
+                "traj": (B, H, 1) - Predicted HI-proxy trajectory
+                "eol": (B, 1) - Predicted EOL RUL
+                "hi": (B, 1) - Predicted Health Index in [0, 1]
+        """
+        B = encoder_inputs.size(0)
+        
+        # --- Encoder ---
+        # UniversalEncoderV2 returns (B, d_model) - sequence embedding
+        enc_emb = self.encoder(encoder_inputs, cond_ids=cond_ids)  # (B, d_model)
+        
+        # Shared features for EOL and HI heads
+        h_shared = self.shared_head(enc_emb)  # (B, d_model)
+        
+        # HI prediction from shared features (sigmoid to [0, 1])
+        hi_logit = self.fc_health(h_shared)  # (B, 1)
+        hi_pred = torch.sigmoid(hi_logit)  # (B, 1)
+        
+        # --- Decoder Setup ---
+        if decoder_targets is not None and horizon is None:
+            horizon = decoder_targets.size(1)
+        elif horizon is None:
+            horizon = self.horizon
+        
+        # Initialize decoder hidden state from encoder embedding
+        h_0 = self.encoder_to_decoder_h(enc_emb)  # (B, decoder_hidden_size * decoder_num_layers)
+        c_0 = self.encoder_to_decoder_c(enc_emb)  # (B, decoder_hidden_size * decoder_num_layers)
+        
+        # Reshape for LSTM: (num_layers, B, hidden_size)
+        h_0 = h_0.view(B, self.decoder_num_layers, -1).transpose(0, 1).contiguous()
+        c_0 = c_0.view(B, self.decoder_num_layers, -1).transpose(0, 1).contiguous()
+        
+        dec_hidden = (h_0, c_0)
+        
+        # Initial decoder input:
+        # - If we have decoder_targets (training/teacher forcing), start from first target step.
+        # - Otherwise:
+        #     * In HI-fusion mode: start from HI prediction (consistent with HI trajectory)
+        #     * In base mode: we will start from a simple EOL estimate later if needed.
+        if decoder_targets is not None:
+            dec_input = decoder_targets[:, 0:1, :]  # (B, 1, 1)
+        else:
+            if self.use_hi_in_eol:
+                dec_input = hi_pred.unsqueeze(1)  # (B, 1, 1)
+            else:
+                # Base mode without HI fusion: start from zeros (decoder learns its own dynamics)
+                dec_input = torch.zeros(B, 1, 1, device=encoder_inputs.device)
+        
+        # --- Decoder Loop ---
+        traj_outputs = []
+        for t in range(horizon):
+            dec_out, dec_hidden = self.decoder(dec_input, dec_hidden)
+            step_pred = self.traj_head(dec_out)  # (B, 1, 1) - HI-proxy prediction
+            traj_outputs.append(step_pred)
+            
+            # Teacher forcing or autoregressive
+            if decoder_targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                if t + 1 < decoder_targets.size(1):
+                    dec_input = decoder_targets[:, t + 1 : t + 2, :]
+                else:
+                    dec_input = step_pred
+            else:
+                dec_input = step_pred
+        
+        traj_outputs = torch.cat(traj_outputs, dim=1)  # (B, H, 1)
+        hi_seq = traj_outputs.squeeze(-1)  # (B, H)
+
+        # --- EOL Head with optional HI fusion ---
+        if self.use_hi_in_eol:
+            # Use HI sequence to build EOL features: current HI + optional local slope
+            hi_current = hi_seq[:, 0].unsqueeze(-1)  # (B, 1)
+            if hi_seq.size(1) > 1:
+                k = min(3, hi_seq.size(1) - 1)
+                hi_slope = (hi_seq[:, 0] - hi_seq[:, k]).unsqueeze(-1)  # (B, 1)
+            else:
+                hi_slope = torch.zeros_like(hi_current)
+
+            eol_features = [h_shared, hi_current]
+            if self.use_hi_slope_in_eol:
+                eol_features.append(hi_slope)
+
+            eol_input = torch.cat(eol_features, dim=-1)  # (B, d_model + n_hi_features)
+            eol_pred = self.fc_rul(eol_input)  # (B, 1)
+        else:
+            # Base mode: EOL depends only on shared encoder features (backwards-compatible)
+            eol_pred = self.fc_rul(h_shared)  # (B, 1)
+        
+        return {
+            "traj": traj_outputs,  # (B, H, 1)
+            "eol": eol_pred,       # (B, 1)
+            "hi": hi_pred,         # (B, 1)
+        }

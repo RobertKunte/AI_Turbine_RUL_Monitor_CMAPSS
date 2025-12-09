@@ -1,0 +1,58 @@
+experiment_id: fd003_phase4_universal_v1_residual
+fd_id: FD003
+
+# Phase-4 residual / digital-twin baseline for FD003.
+# Same architecture as FD001 (UniversalEncoderV1 + HI head), but different engine set.
+
+model_class: RULHIUniversalModelV1
+encoder_type: universal_v1
+
+model:
+  past_len: 30
+  max_rul: 125
+
+  d_model: 48
+  num_layers: 3
+  nhead: 4
+  dim_feedforward: 256
+  dropout: 0.1
+  max_seq_len: 300
+
+  use_condition_embedding: false
+  num_conditions: 1
+  cond_emb_dim: 0
+
+loss:
+  rul_beta: 45.0
+
+  health_loss_weight: 0.35
+  mono_late_weight: 0.03
+  mono_global_weight: 0.003
+  hi_condition_calib_weight: 0.0
+
+  hi_plateau_threshold: 80.0
+  hi_eol_threshold: 25.0
+  hi_eol_weight: 4.0
+
+data:
+  use_physical_features: true
+  use_multi_scale_features: true
+  use_residual_features: true
+  condition_wise_scaling: true
+  condition_embeddings: false
+
+  unit_col: UnitNumber
+  cycle_col: TimeInCycles
+  rul_col: RUL
+
+training:
+  batch_size: 256
+  lr: 0.0001
+  num_epochs: 80
+  weight_decay: 0.0001
+  optimizer: adam
+  scheduler: null
+  patience: 8
+  seed: 42
+
+
