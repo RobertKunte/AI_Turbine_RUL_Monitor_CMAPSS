@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.universal_encoder_v1 import PositionalEncoding
+from src.models.damage_head import CumulativeDamageHead
 
 
 
@@ -241,6 +242,13 @@ class EOLFullTransformerEncoder(nn.Module):
         cond_in_dim: int = 0,
         cond_encoder_dim: Optional[int] = None,
         use_cond_recon_head: bool = False,
+        # ------------------------------------------------------------------
+        # Optional cumulative damage head (separate from legacy damage HI)
+        # ------------------------------------------------------------------
+        use_damage_head: bool = False,
+        damage_L_ref: float = 300.0,
+        damage_alpha_base: float = 0.1,
+        damage_hidden_dim: int = 64,
     ) -> None:
         super().__init__()
 
@@ -377,6 +385,22 @@ class EOLFullTransformerEncoder(nn.Module):
             )
         else:
             self.fc_cond_recon = None
+
+        # ------------------------------------------------------------------
+        # Optional: cumulative damage head for explicit damage-based HI
+        # ------------------------------------------------------------------
+        self.use_cum_damage_head: bool = bool(use_damage_head)
+        if self.use_cum_damage_head:
+            cond_dim_for_damage = self.cond_in_dim if self.use_cond_encoder and self.cond_in_dim > 0 else None
+            self.damage_head = CumulativeDamageHead(
+                d_model=d_model,
+                cond_dim=cond_dim_for_damage,
+                L_ref=damage_L_ref,
+                alpha_base=damage_alpha_base,
+                hidden_dim=damage_hidden_dim,
+            )
+        else:
+            self.damage_head = None
 
         self._init_weights()
 

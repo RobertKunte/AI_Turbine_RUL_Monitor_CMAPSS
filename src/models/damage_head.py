@@ -50,6 +50,10 @@ class CumulativeDamageHead(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
+        # Global scaling parameters for damage → [0, 1]
+        self.gamma = nn.Parameter(torch.tensor(1.0))
+        self.beta = nn.Parameter(torch.tensor(0.0))
+
     def forward(
         self,
         z_seq: torch.Tensor,
@@ -99,14 +103,13 @@ class CumulativeDamageHead(nn.Module):
         # Cumulative damage over time (monotone increasing by construction)
         damage = torch.cumsum(delta_damage, dim=1)  # [B, T]
 
-        # Soft clamp and normalisation into [0,1]
-        damage_clamped = torch.clamp(damage, 0.0, 1.5)
-        max_damage = damage_clamped.amax(dim=1, keepdim=True).clamp(min=1.0)
-        damage_norm = torch.clamp(damage_clamped / max_damage, 0.0, 1.0)
+        # Global scaling into [0, 1] via learnable affine + sigmoid.
+        damage_scaled = torch.sigmoid(self.gamma * damage + self.beta)
+        damage_seq = torch.clamp(damage_scaled, 0.0, 1.0)
 
-        hi_seq = 1.0 - damage_norm
+        hi_seq = 1.0 - damage_seq
         hi_last = hi_seq[:, -1]
 
-        return hi_seq, hi_last, damage_norm, delta_damage
+        return hi_seq, hi_last, damage_seq, delta_damage
 
 

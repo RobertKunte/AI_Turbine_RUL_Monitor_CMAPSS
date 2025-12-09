@@ -296,6 +296,28 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         train_cfg = config.get("training", config.get("training_params", {}))
         loss_cfg = config.get("loss", {})
 
+        # Model configuration: start from sensible defaults and override with
+        # any explicit settings provided in config["model"]. This allows
+        # experiments such as the damage-head variant to customise the state
+        # encoder architecture while keeping backwards compatibility.
+        model_cfg_raw = config.get("model", {})
+        model_ns = SimpleNamespace(
+            input_dim=len(feature_cols),
+            d_model=model_cfg_raw.get("d_model", 96),
+            num_layers=model_cfg_raw.get("num_layers", 3),
+            num_heads=model_cfg_raw.get("num_heads", 4),
+            dim_feedforward=model_cfg_raw.get("dim_feedforward", 256),
+            dropout=model_cfg_raw.get("dropout", 0.1),
+            # Continuous condition encoder is used for all current state encoders;
+            # cond_in_dim is inferred later from Cond_* indices if available.
+            use_cond_encoder=model_cfg_raw.get("use_cond_encoder", True),
+            cond_in_dim=model_cfg_raw.get("cond_in_dim", None),
+            # Optional cumulative damage head parameters (used by damage-head runs)
+            use_damage_head=model_cfg_raw.get("use_damage_head", False),
+            L_ref=model_cfg_raw.get("L_ref", 300.0),
+            alpha_base=model_cfg_raw.get("alpha_base", 0.1),
+        )
+
         # Common base config namespace
         cfg_ns = SimpleNamespace(
             experiment_name=experiment_name,
@@ -308,16 +330,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 train_frac=config.get("data", {}).get("train_frac", 0.8),
                 df_train_fe=df_train,  # feature-engineered train DF (may include HI_phys_final)
             ),
-            model=SimpleNamespace(
-                input_dim=len(feature_cols),
-                d_model=96,
-                num_layers=3,
-                num_heads=4,
-                dim_feedforward=256,
-                dropout=0.1,
-                use_cond_encoder=True,
-                cond_in_dim=None,
-            ),
+            model=model_ns,
             hi=SimpleNamespace(
                 plateau_threshold=80.0,
                 eol_threshold=25.0,
@@ -335,6 +348,11 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 # Optional RUL–HI alignment loss (disabled by default unless set)
                 align_weight=loss_cfg.get("align_weight", 0.0),
                 use_rul_hi_alignment_loss=loss_cfg.get("use_rul_hi_alignment_loss", False),
+                # Optional damage-head specific weights (only used by damage runs)
+                hi_phys_weight=loss_cfg.get("hi_phys_weight", 1.0),
+                hi_aux_weight=loss_cfg.get("hi_aux_weight", 0.3),
+                mono_weight=loss_cfg.get("mono_weight", 0.01),
+                smooth_weight=loss_cfg.get("smooth_weight", 0.01),
             ),
             paths=SimpleNamespace(
                 result_dir=str(results_dir),
@@ -886,6 +904,8 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         use_condition_embedding=phase_2_params['use_condition_embedding'],
         # NEW: auxiliary condition reconstruction loss (Transformer encoder V2)
         cond_recon_weight=config['loss_params'].get('cond_recon_weight', 0.0),
+        # NEW: cumulative damage-based HI loss (enabled only for damage-head configs)
+        damage_hi_weight=config['loss_params'].get('damage_hi_weight', 0.0),
     )
     
     # ===================================================================

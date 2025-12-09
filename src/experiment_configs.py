@@ -1022,6 +1022,33 @@ def get_fd004_transformer_encoder_ms_dt_v2_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v1_config() -> ExperimentConfig:
+    """
+    FD004 – Transformer-Encoder ms+DT V2 with cumulative damage head.
+
+    - Uses the same ms+DT+residual+Cond_*+Twin_* feature pipeline as ms_dt_v2
+    - Keeps the original EOL/RUL/HI/monotonic losses
+    - Adds a small extra loss on a cumulative damage-based HI trajectory.
+    """
+    base = get_fd004_transformer_encoder_ms_dt_v2_config()
+    cfg: ExperimentConfig = copy.deepcopy(base)
+
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v1"
+
+    # Enable cumulative damage head in the encoder kwargs
+    enc = cfg["encoder_kwargs"]
+    enc["use_damage_head"] = True
+    enc.setdefault("damage_L_ref", 300.0)
+    enc.setdefault("damage_alpha_base", 0.1)
+    enc.setdefault("damage_hidden_dim", 64)
+
+    # Loss params: reuse base settings and add a small damage-HI weight
+    loss = cfg["loss_params"]
+    loss.setdefault("damage_hi_weight", 0.2)
+
+    return cfg
+
+
 def get_fd004_state_encoder_v3_physics_C1_msdt_config() -> ExperimentConfig:
     """
     FD004 – Physics State Encoder V3 (C1):
@@ -2634,6 +2661,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_state_encoder_v3_physics_C2_msdt_align_config()
     if experiment_name == "fd004_state_encoder_v3_physics_C3_msdt_rulonly":
         return get_fd004_state_encoder_v3_physics_C3_msdt_rulonly_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v1":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v1_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":

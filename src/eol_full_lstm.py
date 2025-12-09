@@ -1257,6 +1257,8 @@ def train_eol_full_lstm(
     use_condition_embedding: bool = False,  # Phase 2: Whether model uses condition embeddings
     # NEW: auxiliary condition reconstruction loss weight (for Transformer encoder V2)
     cond_recon_weight: float = 0.0,
+    # NEW: damage-based HI loss weight (for Transformer encoder with cumulative damage head)
+    damage_hi_weight: float = 0.0,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Training-Loop für Full-Trajectory LSTM.
@@ -1404,6 +1406,9 @@ def train_eol_full_lstm(
         # NEW: condition reconstruction loss history (encoder V2)
         history["train_cond_loss"] = []
         history["val_cond_loss"] = []
+        # NEW: cumulative damage-based HI loss history (Transformer damage head)
+        history["train_damage_hi_loss"] = []
+        history["val_damage_hi_loss"] = []
 
     print("============================================================")
     print("[train_eol_full_lstm] Training Configuration")
@@ -1431,6 +1436,7 @@ def train_eol_full_lstm(
             "smooth_hi_raw": [],  # Phase 2
             "smooth_hi": [],  # Phase 2
             "cond_loss": [],  # NEW: condition reconstruction loss
+            "damage_hi_loss": [],  # NEW: cumulative damage-based HI loss
         } if use_health_head else None
 
         for batch in train_loader:
@@ -1540,6 +1546,54 @@ def train_eol_full_lstm(
                         )
                         smooth_hi = smooth_hi_weight * smooth_hi_raw
                         loss = loss + smooth_hi
+
+                        # Optional cumulative damage-based HI loss (Transformer encoder with damage head)
+                        damage_hi_loss = torch.tensor(0.0, device=health_seq_flat.device)
+                        if (
+                            damage_hi_weight > 0.0
+                            and hasattr(model, "damage_head")
+                            and getattr(model, "damage_head", None) is not None
+                        ):
+                            # Analytic HI target sequence from RUL sequence
+                            rul_seq_clamped = torch.clamp(rul_seq_batch, 0.0, float(max_rul))
+                            hi_target_seq = torch.ones_like(rul_seq_clamped)
+                            mask_eol = rul_seq_clamped <= float(HI_EOL_THRESH)
+                            mask_plateau = rul_seq_clamped >= float(hi_plateau_threshold)
+                            mask_mid = (~mask_eol) & (~mask_plateau)
+                            denom = max(hi_plateau_threshold - float(HI_EOL_THRESH), 1e-6)
+                            hi_target_seq[mask_eol] = 0.0
+                            hi_target_seq[mask_mid] = (
+                                (rul_seq_clamped[mask_mid] - float(HI_EOL_THRESH)) / denom
+                            ).clamp(0.0, 1.0)
+
+                            # Encoder latents for damage head
+                            try:
+                                enc_seq_dmg, _ = model.encode(
+                                    X_batch, cond_ids=cond_ids_batch, return_seq=True
+                                )
+                            except TypeError:
+                                enc_seq_dmg = None
+
+                            if enc_seq_dmg is not None:
+                                cond_seq_dmg = None
+                                if getattr(model, "use_cond_encoder", False) and getattr(
+                                    model, "cond_in_dim", 0
+                                ) > 0:
+                                    if (
+                                        hasattr(model, "cond_feature_indices")
+                                        and model.cond_feature_indices is not None
+                                        and len(model.cond_feature_indices)
+                                        == getattr(model, "cond_in_dim", 0)
+                                    ):
+                                        cond_seq_dmg = X_batch[
+                                            :, :, model.cond_feature_indices
+                                        ]
+
+                                hi_seq_damage, _, _, _ = model.damage_head(
+                                    enc_seq_dmg, cond_seq=cond_seq_dmg
+                                )
+                                damage_hi_loss = F.mse_loss(hi_seq_damage, hi_target_seq)
+                                loss = loss + damage_hi_weight * damage_hi_loss
                         
                         # Condition calibration loss (sequence-based)
                         if hi_condition_calib_weight > 0.0:
@@ -1576,6 +1630,7 @@ def train_eol_full_lstm(
                             train_component_losses["mono_global"].append(mono_global.item())
                             train_component_losses["smooth_hi_raw"].append(smooth_hi_raw.item())
                             train_component_losses["smooth_hi"].append(smooth_hi.item())
+                            train_component_losses["damage_hi_loss"].append(damage_hi_loss.item())
                     else:
                         preds = model(X_batch)
                         loss = criterion(preds, y_batch)
@@ -1673,6 +1728,50 @@ def train_eol_full_lstm(
                     )
                     smooth_hi = smooth_hi_weight * smooth_hi_raw
                     loss = loss + smooth_hi
+
+                    # Optional cumulative damage-based HI loss (validation)
+                    damage_hi_loss = torch.tensor(0.0, device=health_seq_flat.device)
+                    if (
+                        damage_hi_weight > 0.0
+                        and hasattr(model, "damage_head")
+                        and getattr(model, "damage_head", None) is not None
+                    ):
+                        rul_seq_clamped = torch.clamp(rul_seq_batch, 0.0, float(max_rul))
+                        hi_target_seq = torch.ones_like(rul_seq_clamped)
+                        mask_eol = rul_seq_clamped <= float(HI_EOL_THRESH)
+                        mask_plateau = rul_seq_clamped >= float(hi_plateau_threshold)
+                        mask_mid = (~mask_eol) & (~mask_plateau)
+                        denom = max(hi_plateau_threshold - float(HI_EOL_THRESH), 1e-6)
+                        hi_target_seq[mask_eol] = 0.0
+                        hi_target_seq[mask_mid] = (
+                            (rul_seq_clamped[mask_mid] - float(HI_EOL_THRESH)) / denom
+                        ).clamp(0.0, 1.0)
+
+                        try:
+                            enc_seq_dmg, _ = model.encode(
+                                X_batch, cond_ids=cond_ids_batch, return_seq=True
+                            )
+                        except TypeError:
+                            enc_seq_dmg = None
+
+                        if enc_seq_dmg is not None:
+                            cond_seq_dmg = None
+                            if getattr(model, "use_cond_encoder", False) and getattr(
+                                model, "cond_in_dim", 0
+                            ) > 0:
+                                if (
+                                    hasattr(model, "cond_feature_indices")
+                                    and model.cond_feature_indices is not None
+                                    and len(model.cond_feature_indices)
+                                    == getattr(model, "cond_in_dim", 0)
+                                ):
+                                    cond_seq_dmg = X_batch[:, :, model.cond_feature_indices]
+
+                            hi_seq_damage, _, _, _ = model.damage_head(
+                                enc_seq_dmg, cond_seq=cond_seq_dmg
+                            )
+                            damage_hi_loss = F.mse_loss(hi_seq_damage, hi_target_seq)
+                            loss = loss + damage_hi_weight * damage_hi_loss
                     
                     # Condition calibration loss (sequence-based)
                     if hi_condition_calib_weight > 0.0:
@@ -1745,6 +1844,8 @@ def train_eol_full_lstm(
             train_smooth_hi = float(np.mean(train_component_losses["smooth_hi"])) if train_component_losses["smooth_hi"] else 0.0
             # NEW: condition reconstruction loss (may be all zeros if disabled)
             train_cond_loss = float(np.mean(train_component_losses["cond_loss"])) if train_component_losses["cond_loss"] else 0.0
+            # NEW: cumulative damage-based HI loss (may be all zeros if disabled)
+            train_damage_hi_loss = float(np.mean(train_component_losses["damage_hi_loss"])) if train_component_losses["damage_hi_loss"] else 0.0
 
         # Validation
         model.eval()
@@ -1765,6 +1866,7 @@ def train_eol_full_lstm(
         val_calib_losses = []
         val_calib_losses_raw = []  # Unweighted calibration loss
         val_cond_losses = []  # NEW: condition reconstruction loss
+        val_damage_hi_losses = []  # NEW: cumulative damage-based HI loss
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_loader):
@@ -1913,6 +2015,9 @@ def train_eol_full_lstm(
                     val_mono_global.append(mono_global.item())
                     val_smooth_hi_raw.append(smooth_hi_raw.item())
                     val_smooth_hi.append(smooth_hi.item())
+                    val_cond_losses.append(val_cond_losses[-1] if val_cond_losses else 0.0)
+                    # For damage HI we only track loss value (already appended via damage_hi_loss)
+                    # Aggregate below when computing history entries.
                     
                     val_preds.append(rul_pred.cpu())
                     val_health_preds.append(health_last.cpu())
@@ -1979,6 +2084,10 @@ def train_eol_full_lstm(
             history["train_smooth_hi"].append(train_smooth_hi)
             history["val_smooth_hi_raw"].append(val_smooth_hi_raw)
             history["val_smooth_hi"].append(val_smooth_hi)
+            history["train_damage_hi_loss"].append(train_damage_hi_loss)
+            history["val_damage_hi_loss"].append(
+                float(np.mean(val_damage_hi_losses)) if val_damage_hi_losses else 0.0
+            )
             if hi_condition_calib_weight > 0.0:
                 history["train_calib_loss"].append(train_calib_loss)
                 history["val_calib_loss"].append(val_calib_loss)
