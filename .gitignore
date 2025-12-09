@@ -183,7 +183,7 @@ cython_debug/
 # --- Project Specific Additions ---
 # Data files (often too large for Git)
 *.csv
-*.txt
+#*.txt
 
 # PyTorch Model Weights
 *.pt
