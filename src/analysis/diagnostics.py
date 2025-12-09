@@ -1108,10 +1108,6 @@ def plot_hi_rul_trajectories(
         
         ax1.plot(traj.cycles, traj.hi, 'g-', linewidth=2, label='Health Index', alpha=0.7)
         
-        # Plot damage HI if available
-        if traj.hi_damage is not None and len(traj.hi_damage) > 0:
-            ax1.plot(traj.cycles, traj.hi_damage, 'm--', linewidth=2, label='HI Damage', alpha=0.7)
-        
         ax1.set_xlabel('Time in Cycles')
         ax1.set_ylabel('Health Index', color='g')
         ax1.tick_params(axis='y', labelcolor='g')
@@ -1141,6 +1137,86 @@ def plot_hi_rul_trajectories(
     plt.close()
     
     print(f"Saved HI + RUL trajectories to {out_path}")
+
+
+def plot_hi_damage_trajectories(
+    trajectories: List[EngineTrajectory],
+    out_path: Path,
+    title: str = "Health Index Damage Trajectories",
+    max_engines: int = 10,
+) -> None:
+    """
+    Plot HI Damage trajectories (similar to HI trajectories, but for damage-based HI).
+    
+    This function creates a separate plot specifically for the damage-based HI trajectory,
+    using the same layout and style as the standard HI trajectory plots.
+    
+    Args:
+        trajectories: List of EngineTrajectory objects (must have hi_damage field populated)
+        out_path: Output file path
+        title: Plot title
+        max_engines: Maximum number of engines to plot
+    """
+    # Filter trajectories that have damage HI
+    traj_with_damage = [t for t in trajectories if t.hi_damage is not None and len(t.hi_damage) > 0]
+    
+    if len(traj_with_damage) == 0:
+        print(f"  Warning: No damage HI trajectories available, skipping damage plot")
+        return
+    
+    num_engines = min(len(traj_with_damage), max_engines)
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+    axes = axes.flatten()
+    
+    for idx, traj in enumerate(traj_with_damage[:max_engines]):
+        ax1 = axes[idx]
+        
+        # Primary axis: HI Damage (with dynamic scaling based on actual HI damage range)
+        if len(traj.hi_damage) > 0:
+            hi_damage_min, hi_damage_max = traj.hi_damage.min(), traj.hi_damage.max()
+            hi_damage_range = hi_damage_max - hi_damage_min
+            # Add 10% padding, but ensure reasonable bounds
+            hi_damage_padding = max(0.05, hi_damage_range * 0.1) if hi_damage_range > 0 else 0.1
+            ax1.set_ylim([max(0, hi_damage_min - hi_damage_padding), min(1.1, hi_damage_max + hi_damage_padding)])
+        else:
+            ax1.set_ylim([0, 1.1])
+        
+        # Plot HI Damage trajectory
+        ax1.plot(traj.cycles, traj.hi_damage, 'm-', linewidth=2, label='HI Damage', alpha=0.7)
+        
+        # Also plot regular HI for comparison (lighter color)
+        if len(traj.hi) > 0:
+            ax1.plot(traj.cycles, traj.hi, 'g--', linewidth=1.5, label='HI (standard)', alpha=0.5)
+        
+        ax1.set_xlabel('Time in Cycles')
+        ax1.set_ylabel('Health Index', color='m')
+        ax1.tick_params(axis='y', labelcolor='m')
+        ax1.grid(True, alpha=0.3)
+        
+        # Secondary axis: RUL (for reference)
+        ax2 = ax1.twinx()
+        ax2.plot(traj.cycles, traj.true_rul, 'b-', linewidth=2, label='True RUL', alpha=0.7)
+        ax2.plot(traj.cycles, traj.pred_rul, 'r--', linewidth=2, label='Pred RUL', alpha=0.7)
+        ax2.set_ylabel('RUL [cycles]', color='b')
+        ax2.tick_params(axis='y', labelcolor='b')
+        
+        # Combine legends
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
+        
+        ax1.set_title(f'Engine #{traj.unit_id} – HI Damage (degraded)')
+    
+    # Hide unused subplots
+    for idx in range(num_engines, len(axes)):
+        axes[idx].axis('off')
+    
+    plt.suptitle(title, fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Saved HI Damage trajectories to {out_path}")
 
 
 def run_diagnostics_for_run(
@@ -1476,69 +1552,48 @@ def run_diagnostics_for_run(
         )
 
         # evaluate_on_test_data arbeitet bereits auf EOL-Samples (ein Fenster pro Engine)
+        # WICHTIG: Verwende die Metriken direkt von evaluate_on_test_data - keine Neuberechnung!
         rul_pred_full_np = np.array(test_metrics_diag["y_pred"], dtype=float)
         y_true_eol = np.array(test_metrics_diag["y_true"], dtype=float)
         unit_ids_test = np.array(test_metrics_diag.get("unit_ids"), dtype=int)
 
-        # Sanity log (gleiche Struktur wie world_model_v3 helper)
+        # Verwende die Metriken direkt von evaluate_on_test_data (100% konsistent mit Training)
         pt = test_metrics_diag["pointwise"]
         nasa_pt = test_metrics_diag["nasa_pointwise"]
-        print(f"  Test RMSE (diagnostics): {pt['rmse']:.2f} cycles")
-        print(f"  Test MAE  (diagnostics): {pt['mae']:.2f} cycles")
-        print(f"  Test Bias (diagnostics): {pt['bias']:.2f} cycles")
-        print(f"  Test R²   (diagnostics): {pt['r2']:.4f}")
-        print(f"  NASA Score (mean, diagnostics): {nasa_pt['score_mean']:.4f}")
+        
+        # Extrahiere errors für Plots
+        errors = rul_pred_full_np - y_true_eol
+        
+        # Verwende Metriken direkt von evaluate_on_test_data (keine Neuberechnung!)
+        eol_metrics_dict = {
+            "errors": errors,
+            "mean_error": pt["bias"],
+            "std_error": float(np.std(errors)),
+            "mean_abs_error": pt["mae"],
+            "median_error": float(np.median(errors)),
+            "mse": pt.get("mse", float(np.mean(errors ** 2))),
+            "rmse": pt["rmse"],
+            "mae": pt["mae"],
+            "bias": pt["bias"],
+            "r2": pt["r2"],
+            "nasa_scores": nasa_pt.get("nasa_scores", compute_eol_errors_and_nasa(y_true_eol, rul_pred_full_np, max_rul=max_rul)["nasa_scores"]),
+            "nasa_mean": nasa_pt["score_mean"],
+            "nasa_sum": nasa_pt.get("score_sum", nasa_pt.get("score_mean", 0.0) * len(y_true_eol)),
+            "nasa_median": float(np.median(nasa_pt.get("nasa_scores", []))) if nasa_pt.get("nasa_scores") is not None else 0.0,
+            "num_engines": len(y_true_eol),
+        }
 
-    # Validation: Check shapes and values (for debugging)
-    print(f"  EOL predictions shape (flattened): {rul_pred_full_np.shape}")
-    print(f"  True EOL shape: {y_true_eol.shape}")
-    print(f"  EOL predictions range: [{rul_pred_full_np.min():.2f}, {rul_pred_full_np.max():.2f}]")
-    print(f"  True EOL range: [{y_true_eol.min():.2f}, {y_true_eol.max():.2f}]")
-
-    # Compute EOL metrics in a way that ist 100 % konsistent mit dem Training
-    # (evaluate_world_model_v3_eol): RMSE/MAE/Bias/R² direkt aus y_true/y_pred,
-    # NASA mit dem zentralen Helper, der intern RUL-Capping durchführt.
-    print("[4] Computing EOL metrics (training-consistent)...")
-
-    # Fehler wie in evaluate_world_model_v3_eol
-    errors = rul_pred_full_np - y_true_eol
-    mse = float(np.mean(errors ** 2))
-    rmse = float(np.sqrt(mse))
-    mae = float(np.mean(np.abs(errors)))
-    bias = float(np.mean(errors))
-
-    # R² (gleiche Formel wie in evaluate_world_model_v3_eol)
-    ss_res = np.sum((y_true_eol - rul_pred_full_np) ** 2)
-    ss_tot = np.sum((y_true_eol - np.mean(y_true_eol)) ** 2)
-    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-    r2 = float(r2)
-
-    # NASA-Statistiken (selber Helper wie im Training)
-    nasa_stats = compute_eol_errors_and_nasa(y_true_eol, rul_pred_full_np, max_rul=max_rul)
-
-    eol_metrics_dict = {
-        "errors": errors,
-        "mean_error": bias,
-        "std_error": float(np.std(errors)),
-        "mean_abs_error": mae,
-        "median_error": float(np.median(errors)),
-        "mse": mse,
-        "rmse": rmse,
-        "mae": mae,
-        "bias": bias,
-        "r2": r2,
-        "nasa_scores": nasa_stats["nasa_scores"],
-        "nasa_mean": float(nasa_stats["nasa_mean"]),
-        "nasa_sum": float(nasa_stats["nasa_sum"]),
-        "nasa_median": float(nasa_stats["nasa_median"]),
-        "num_engines": len(y_true_eol),
-    }
-
-    print(f"  RMSE: {rmse:.2f} cycles")
-    print(f"  MAE:  {mae:.2f} cycles")
-    print(f"  Bias: {bias:.2f} cycles")
-    print(f"  R²:   {r2:.4f}")
-    print(f"  NASA Score (mean): {eol_metrics_dict['nasa_mean']:.4f}")
+        print(f"  Test RMSE (from evaluate_on_test_data): {pt['rmse']:.2f} cycles")
+        print(f"  Test MAE  (from evaluate_on_test_data): {pt['mae']:.2f} cycles")
+        print(f"  Test Bias (from evaluate_on_test_data): {pt['bias']:.2f} cycles")
+        print(f"  Test R²   (from evaluate_on_test_data): {pt['r2']:.4f}")
+        print(f"  NASA Score (mean, from evaluate_on_test_data): {nasa_pt['score_mean']:.4f}")
+        
+        # Validation: Check shapes and values (for debugging)
+        print(f"  EOL predictions shape: {rul_pred_full_np.shape}")
+        print(f"  True EOL shape: {y_true_eol.shape}")
+        print(f"  EOL predictions range: [{rul_pred_full_np.min():.2f}, {rul_pred_full_np.max():.2f}]")
+        print(f"  True EOL range: [{y_true_eol.min():.2f}, {y_true_eol.max():.2f}]")
 
     # ------------------------------------------------------------------
     # Optional: \"Floor Correction\"–Analyse (Soft Landing bei ~45 Zyklen)
@@ -1575,6 +1630,11 @@ def run_diagnostics_for_run(
     
     print(f"  Built trajectories for {len(trajectories)} engines")
     
+    # Check if any trajectories have damage HI
+    has_damage_hi = any(traj.hi_damage is not None and len(traj.hi_damage) > 0 for traj in trajectories)
+    if has_damage_hi:
+        print(f"  ✓ Damage HI trajectories detected - will create separate damage plot")
+    
     # Select degraded engines
     print("[6] Selecting degraded engines...")
     selected_trajectories = select_degraded_engines(
@@ -1607,42 +1667,9 @@ def run_diagnostics_for_run(
         title=f"{dataset_name} True vs Predicted RUL",
     )
     
-    # 3. HI + RUL trajectories (only if trajectory head exists)
-    # Check if model has trajectory head by inspecting outputs
-    has_traj_head = False
-    has_hi_head = False
-    has_eol_head = False
-    
-    if is_world_model:
-        # For world models, check outputs
-        try:
-            with torch.no_grad():
-                test_input = X_test_t[:1]  # Single sample
-                test_cond = cond_test_t[:1] if config.get("num_conditions", 1) > 1 else None
-                test_outputs = model(
-                    encoder_inputs=test_input,
-                    decoder_targets=None,
-                    teacher_forcing_ratio=0.0,
-                    horizon=1,
-                    cond_ids=test_cond,
-                )
-                if isinstance(test_outputs, dict):
-                    has_traj_head = test_outputs.get("traj") is not None and test_outputs["traj"].numel() > 0
-                    has_hi_head = test_outputs.get("hi") is not None and test_outputs["hi"].numel() > 0
-                    has_eol_head = test_outputs.get("eol") is not None and test_outputs["eol"].numel() > 0
-                else:
-                    # v2 returns tuple
-                    has_traj_head = True
-                    has_eol_head = True
-        except Exception:
-            # Fallback: assume all heads exist
-            has_traj_head = True
-            has_hi_head = True
-            has_eol_head = True
-    else:
-        # EOL models always have EOL and HI
-        has_eol_head = True
-        has_hi_head = True
+    # 3. HI + RUL trajectories (always create if we have trajectories)
+    # Note: We don't need to check for trajectory heads here since we build trajectories
+    # using sliding window approach which works for all model types
     
     # For EOL RUL/HI experiments we always have HI trajectories via build_trajectories,
     # even if there is no dedicated "trajectory head" in the model.
@@ -1655,6 +1682,16 @@ def run_diagnostics_for_run(
             max_engines=10,
         )
         print(f"  Saved HI+RUL trajectory plots for {len(selected_trajectories)} engines")
+        
+        # 4. Separate HI Damage trajectory plot (if damage HI is available)
+        if has_damage_hi:
+            plot_hi_damage_trajectories(
+                trajectories=selected_trajectories,
+                out_path=experiment_dir / "hi_damage_10_degraded.png",
+                title=f"{dataset_name} Health Index Damage Trajectories – 10 degraded engines",
+                max_engines=10,
+            )
+            print(f"  Saved HI Damage trajectory plots for {len(selected_trajectories)} engines")
     else:
         print(f"  Skipping HI+RUL trajectory plot (no trajectories available)")
     
