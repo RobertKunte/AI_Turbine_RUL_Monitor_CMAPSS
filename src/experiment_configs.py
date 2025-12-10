@@ -1261,6 +1261,31 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v3_config() -> ExperimentConfi
 
     return cfg
 
+
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v3b_config() -> ExperimentConfig:
+    """
+    FD004 ms+DT Transformer-Encoder with cumulative DamageHead,
+    trained against HI_phys_v3 with a stronger damage loss weight.
+
+    This variant is identical to _damage_v3 except for:
+      - experiment_name suffix `_v3b`
+      - increased damage_hi_weight to emphasize the damage head.
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v3_config()
+
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v3b"
+
+    # Stronger emphasis on damage head while keeping RUL/HI weights unchanged.
+    loss_params = cfg.setdefault("loss_params", {})
+    loss_params["rul_weight"] = loss_params.get("rul_weight", 1.0)
+    loss_params["health_loss_weight"] = loss_params.get("health_loss_weight", 0.1)
+    loss_params["damage_hi_weight"] = 5.0
+
+    # Document that this experiment is meant to use HI_phys_v3 as target
+    cfg["hi_target_type"] = "phys_v3"
+
+    return cfg
+
 def get_fd004_state_encoder_v3_damage_msdt_v1_config() -> ExperimentConfig:
     """
     FD004 – State Encoder V3 with cumulative damage head (ms+DT v2 features).
@@ -2733,6 +2758,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v2_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v3":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v3b":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v3b_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":
