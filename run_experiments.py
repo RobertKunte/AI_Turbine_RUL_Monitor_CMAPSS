@@ -268,8 +268,9 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             alpha_hybrid=0.7,
         )
     
-    # For damage_v2 experiments: add HI_phys_v2 using the simpler per-row computation
-    # This creates a time-resolved HI_phys_seq target for training the damage head
+    # For damage_v2/v3 experiments: add HI_phys_v2 or HI_phys_v3 using the appropriate
+    # per-row computation. This creates a time-resolved HI_phys_seq target for
+    # training the damage head.
     experiment_name = config.get("experiment_name", "")
     if "damage_v2" in experiment_name.lower():
         print("  Computing HI_phys_v2 for damage_v2 experiment (time-resolved target)")
@@ -282,6 +283,19 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             egt_drift_col="EGT_Drift",
             residual_prefix="Resid_",
             baseline_len=30,
+        )
+    elif "damage_v3" in experiment_name.lower():
+        print("  Computing HI_phys_v3 for damage_v3 experiment (time-resolved target)")
+        from src.features.hi_phys_v3 import compute_hi_phys_v3_from_residuals
+        hi_v3_series = compute_hi_phys_v3_from_residuals(
+            df_train,
+            unit_col="UnitNumber",
+            cycle_col="TimeInCycles",
+        )
+        df_train["HI_phys_v3"] = hi_v3_series
+        print(
+            f"  HI_phys_v3 stats: min={hi_v3_series.min():.4f}, "
+            f"max={hi_v3_series.max():.4f}, mean={hi_v3_series.mean():.4f}"
         )
 
     feature_cols = [

@@ -74,8 +74,12 @@ def build_full_eol_sequences_from_df(
 
     unit_ids = df[unit_col].unique()
     
-    # Check if HI_phys_v2 column exists
-    has_hi_phys_v2 = "HI_phys_v2" in df.columns
+    # Check which HI_phys column is available (prefer v3 over v2)
+    hi_phys_col: Optional[str] = None
+    if "HI_phys_v3" in df.columns:
+        hi_phys_col = "HI_phys_v3"
+    elif "HI_phys_v2" in df.columns:
+        hi_phys_col = "HI_phys_v2"
 
     print("============================================================")
     print("[build_full_eol_sequences_from_df] Summary")
@@ -115,9 +119,9 @@ def build_full_eol_sequences_from_df(
         values = df_u[feature_cols].to_numpy(dtype=np.float32)
         rul_values = df_u[rul_col].to_numpy(dtype=np.float32)
         
-        # Extract HI_phys_v2 if available
-        if has_hi_phys_v2:
-            hi_phys_values = df_u["HI_phys_v2"].to_numpy(dtype=np.float32)
+        # Extract HI_phys (v3 preferred, else v2) if available
+        if hi_phys_col is not None and hi_phys_col in df_u.columns:
+            hi_phys_values = df_u[hi_phys_col].to_numpy(dtype=np.float32)
         else:
             hi_phys_values = None
 
@@ -132,8 +136,8 @@ def build_full_eol_sequences_from_df(
             unit_id_list.append(uid)
             cond_id_list.append(cond_id)
             
-            # Extract HI_phys_v2 sequence for this window
-            if has_hi_phys_v2 and hi_phys_values is not None:
+            # Extract HI_phys sequence for this window (v3 preferred, else v2)
+            if hi_phys_values is not None:
                 hi_phys_window = hi_phys_values[i - past_len + 1 : i + 1]  # [past_len]
                 health_phys_seq_list.append(hi_phys_window)
 
