@@ -29,6 +29,55 @@ from src.additional_features import group_feature_columns
 from src.feature_safety import check_feature_dimensions
 
 
+def log_damage_head_params(model: nn.Module, logger=print) -> int:
+    """
+    Log all parameters that belong to the damage head:
+    - name
+    - shape
+    - requires_grad flag
+    - total number of parameters in damage head
+
+    Matching is done via 'damage' in the parameter name (case-insensitive).
+    """
+    total = 0
+    logger("[DEBUG DamageHead] Listing damage-head parameters:")
+    for name, p in model.named_parameters():
+        if "damage" in name.lower():
+            num = p.numel()
+            total += num
+            logger(
+                f"  {name}: shape={tuple(p.shape)}, "
+                f"requires_grad={p.requires_grad}, numel={num}"
+            )
+    logger(f"[DEBUG DamageHead] Total damage-head parameters: {total}")
+    return total
+
+
+def log_damage_head_gradients(model: nn.Module, logger=print, prefix: str = "[DEBUG DamageHeadGrad]"):
+    """
+    Log simple gradient statistics for damage-head parameters:
+    - mean absolute gradient
+    Only logs parameters that have non-None .grad.
+    """
+    grads = []
+    num_params_with_grad = 0
+    for name, p in model.named_parameters():
+        if "damage" in name.lower() and p.grad is not None:
+            g = p.grad.detach()
+            num_params_with_grad += 1
+            grads.append(g.abs().mean().item())
+
+    if not grads:
+        logger(f"{prefix} No gradients found for damage-head parameters!")
+    else:
+        mean_grad = float(sum(grads) / len(grads))
+        logger(
+            f"{prefix} num_params_with_grad={num_params_with_grad}, "
+            f"mean_abs_grad={mean_grad:.4e}"
+        )
+    return grads
+
+
 def build_full_eol_sequences_from_df(
     df: pd.DataFrame,
     feature_cols: list[str],
@@ -1372,6 +1421,9 @@ def train_eol_full_lstm(
     results_dir.mkdir(parents=True, exist_ok=True)
 
     model = model.to(device)
+
+    # Debug: log all damage-head parameters (if any)
+    log_damage_head_params(model)
     
     # Choose loss function based on mode
     if use_health_head:
@@ -1680,7 +1732,7 @@ def train_eol_full_lstm(
                                 damage_hi_loss = F.mse_loss(hi_seq_damage_, hi_target_seq_)
                                 loss = loss + damage_hi_weight * damage_hi_loss
 
-                                # DEBUG: Inspect targets and predictions for damage head once
+                                # DEBUG: Inspect damage-head input/targets/preds once on first batch
                                 if (
                                     epoch == 1
                                     and batch_idx == 0
@@ -1689,13 +1741,37 @@ def train_eol_full_lstm(
                                 ):
                                     first_damage_debug_done = True
                                     with torch.no_grad():
-                                        print("\n[DEBUG damage_head] health_phys_seq_batch[0, :10]:",
-                                              health_phys_seq_batch[0, :10].detach().cpu().numpy())
-                                        print("[DEBUG damage_head] hi_target_seq_[0, :10]:",
-                                              hi_target_seq_[0, :10].detach().cpu().numpy())
-                                        print("[DEBUG damage_head] hi_seq_damage_[0, :10]:",
-                                              hi_seq_damage_[0, :10].detach().cpu().numpy())
-                                        print(f"[DEBUG damage_head] damage_hi_loss: {damage_hi_loss.item():.6e}")
+                                        std_time = enc_seq_dmg[0].std(dim=0).mean().item()
+                                        mean_time = enc_seq_dmg[0].mean().item()
+                                        print(
+                                            f"[DEBUG DamageHeadInput] enc_seq_dmg[0] "
+                                            f"mean={mean_time:.4f}, mean_std_over_time={std_time:.4f}"
+                                        )
+                                        print(
+                                            "[DEBUG damage_head] health_phys_seq_batch[0, :10]:",
+                                            health_phys_seq_batch[0, :10]
+                                            .detach()
+                                            .cpu()
+                                            .numpy(),
+                                        )
+                                        print(
+                                            "[DEBUG damage_head] hi_target_seq_[0, :10]:",
+                                            hi_target_seq_[0, :10]
+                                            .detach()
+                                            .cpu()
+                                            .numpy(),
+                                        )
+                                        print(
+                                            "[DEBUG damage_head] hi_seq_damage_[0, :10]:",
+                                            hi_seq_damage_[0, :10]
+                                            .detach()
+                                            .cpu()
+                                            .numpy(),
+                                        )
+                                        print(
+                                            f"[DEBUG damage_head] damage_hi_loss: "
+                                            f"{damage_hi_loss.item():.6e}"
+                                        )
                                 
                                 # ====================================================================
                                 # DEBUG: Sanity-Check des Damage-Heads (einmal pro 5 Epochen)
@@ -1744,6 +1820,15 @@ def train_eol_full_lstm(
                         loss = criterion(preds, y_batch)
                         loss_components = None
                 scaler.scale(loss).backward()
+
+                # Debug: log damage-head gradients for first few batches of epoch 1
+                if epoch == 1 and batch_idx < 3:
+                    # Gradients are scaled; unscale before inspection
+                    scaler.unscale_(optimizer)
+                    log_damage_head_gradients(
+                        model,
+                        prefix=f"[DEBUG DamageHeadGrad] epoch={epoch} batch={batch_idx} (AMP)",
+                    )
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
@@ -1921,6 +2006,13 @@ def train_eol_full_lstm(
                     loss = criterion(preds, y_batch)
                     loss_components = None
                 loss.backward()
+
+                # Debug: log damage-head gradients for first few batches of epoch 1
+                if epoch == 1 and batch_idx < 3:
+                    log_damage_head_gradients(
+                        model,
+                        prefix=f"[DEBUG DamageHeadGrad] epoch={epoch} batch={batch_idx}",
+                    )
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
