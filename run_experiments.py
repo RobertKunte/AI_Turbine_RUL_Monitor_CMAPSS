@@ -308,7 +308,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     feature_cols = [
         c
         for c in feature_cols
-        if c not in ["HI_phys_final", "HI_target_hybrid", "HI_phys_v2"]
+        if c not in ["HI_phys_final", "HI_target_hybrid", "HI_phys_v2", "HI_phys_v3"]
     ]
 
     print(f"Using {len(feature_cols)} features for model input.")

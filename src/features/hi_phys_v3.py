@@ -186,11 +186,11 @@ def compute_hi_phys_v3_from_residuals(
     unit_col: str = "UnitNumber",
     cycle_col: str = "TimeInCycles",
     window: int = 5,
-    alpha_base: float = 0.001,
-    alpha_res: float = 0.003,
-    u_max: float = 4.0,
+    alpha_base: float = 0.00,
+    alpha_res: float = 0.01,
+    u_max: float = 5.0,
     p: float = 1.6,
-    q_eol_ref: float = 0.98,
+    q_eol_ref: float = 0.99,
     eps: float = 1e-8,
 ) -> pd.Series:
     """
