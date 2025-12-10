@@ -1,5 +1,6 @@
 try:
     import torch  # type: ignore[import]
+    import torch.nn.functional as F  # type: ignore[import]
     from typing import Optional, Tuple, Union  # type: ignore[import]
     import numpy as np  # type: ignore[import]
 except ImportError as exc:
@@ -285,7 +286,14 @@ def multitask_rul_health_loss(
     hi_mono_weight: float = 0.0,
     hi_mono_rul_beta: float = 30.0,
     return_components: bool = False,
-    rul_traj_weight: float = 1.0,  # NEW: Weight for RUL MSE part
+    rul_traj_weight: float = 1.0,  # Weight for RUL MSE part
+    # NEW (v3d/v3e): damage increment smoothness + HI alignment terms
+    damage_delta_seq: Optional[torch.Tensor] = None,
+    damage_delta_smooth_weight: float = 0.0,
+    damage_hi_seq: Optional[torch.Tensor] = None,
+    hi_phys_seq: Optional[torch.Tensor] = None,
+    damage_hi_align_start_weight: float = 0.0,
+    damage_hi_align_end_weight: float = 0.0,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
     """
     Multi-task loss that combines:
@@ -407,8 +415,62 @@ def multitask_rul_health_loss(
             # Apply weight outside (function returns raw values)
             mono_loss = mono_loss_raw * hi_mono_weight
     
-    # 5) Total loss composition
-    loss = rul_loss + lambda_health * (health_loss + eol_health_loss) + mono_loss
+    # 5) Optional damage-delta smoothness loss (v3d / v3e)
+    damage_delta_smooth_loss = torch.tensor(0.0, device=rul_pred.device)
+    if (
+        damage_delta_seq is not None
+        and damage_delta_smooth_weight > 0.0
+    ):
+        # Ensure shape: [B, T]
+        if damage_delta_seq.dim() == 3:
+            d = damage_delta_seq.squeeze(-1)
+        else:
+            d = damage_delta_seq
+        if d.size(1) > 1:
+            diff = d[:, 1:] - d[:, :-1]
+            damage_delta_smooth_loss = damage_delta_smooth_weight * (diff ** 2).mean()
+
+    # 6) Optional HI alignment loss between damage HI and physical HI_phys_v3 (v3e)
+    damage_hi_align_loss = torch.tensor(0.0, device=rul_pred.device)
+    if (
+        damage_hi_seq is not None
+        and hi_phys_seq is not None
+        and (damage_hi_align_start_weight > 0.0 or damage_hi_align_end_weight > 0.0)
+    ):
+        # Ensure shapes: [B, T]
+        if damage_hi_seq.dim() == 3:
+            hi_d = damage_hi_seq.squeeze(-1)
+        else:
+            hi_d = damage_hi_seq
+        if hi_phys_seq.dim() == 3:
+            hi_p = hi_phys_seq.squeeze(-1)
+        else:
+            hi_p = hi_phys_seq
+
+        # Align time dimension if needed (crop to min length)
+        T = min(hi_d.size(1), hi_p.size(1))
+        hi_d = hi_d[:, :T]
+        hi_p = hi_p[:, :T]
+
+        if T > 0:
+            k_align = max(1, T // 6)
+
+            if damage_hi_align_start_weight > 0.0:
+                loss_start = F.mse_loss(hi_d[:, :k_align], hi_p[:, :k_align])
+                damage_hi_align_loss = damage_hi_align_loss + damage_hi_align_start_weight * loss_start
+
+            if damage_hi_align_end_weight > 0.0:
+                loss_end = F.mse_loss(hi_d[:, -k_align:], hi_p[:, -k_align:])
+                damage_hi_align_loss = damage_hi_align_loss + damage_hi_align_end_weight * loss_end
+
+    # 7) Total loss composition
+    loss = (
+        rul_loss
+        + lambda_health * (health_loss + eol_health_loss)
+        + mono_loss
+        + damage_delta_smooth_loss
+        + damage_hi_align_loss
+    )
     
     if return_components:
         components = {
@@ -418,6 +480,12 @@ def multitask_rul_health_loss(
             "eol_health_loss": eol_health_loss.item(),
             "mono_loss_raw": mono_loss_raw.item() if isinstance(mono_loss_raw, torch.Tensor) else mono_loss_raw,
             "mono_loss": mono_loss.item() if isinstance(mono_loss, torch.Tensor) else mono_loss,
+            "damage_delta_smooth_loss": damage_delta_smooth_loss.item()
+            if isinstance(damage_delta_smooth_loss, torch.Tensor)
+            else float(damage_delta_smooth_loss),
+            "damage_hi_align_loss": damage_hi_align_loss.item()
+            if isinstance(damage_hi_align_loss, torch.Tensor)
+            else float(damage_hi_align_loss),
             "total_loss": loss.item(),
         }
         return loss, components

@@ -660,46 +660,53 @@ class EOLFullTransformerEncoder(nn.Module):
             return enc_out, pooled
         return pooled
 
-    def encode_with_hi(self, x, cond_ids=None, cond_vec=None):
+    # ------------------------------------------------------------------
+    # Encoder + HI helper for downstream decoders (e.g. RUL trajectory)
+    # ------------------------------------------------------------------
+    def encode_with_hi(
+        self,
+        x: torch.Tensor,
+        cond_ids: Optional[torch.Tensor] = None,
+        cond_vec: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Runs the encoder (frozen or trainable) and returns:
-          - z_seq: latent sequence [B, T, D]
-          - hi_phys_seq: physics HI_phys_v3_seq [B, T] if available, else None
-          - hi_damage_seq: learned damage HI_seq [B, T] from damage_head if available, else None
+        Run the encoder and (optionally) the cumulative damage head to obtain:
+
+          - z_seq:        [B, T, d_model] latent encoder sequence
+          - hi_phys_seq:  None for now (physics HI is passed separately if available)
+          - hi_damage_seq:[B, T] learned damage HI sequence from damage_head, if present
+
+        This helper is intentionally lightweight and does not alter gradients
+        or training behaviour. It is primarily used by external decoders
+        (e.g. RUL trajectory decoders) on a frozen encoder.
         """
-        # existing encode logic should already allow return_seq=True
+        # Reuse encoder stack; treat cond_vec as explicit cond_seq if provided.
         enc_outputs = self.encode(
             x,
             cond_ids=cond_ids,
-            cond_vec=cond_vec,
             return_seq=True,
-            return_pooled=False,
+            cond_seq=cond_vec,
         )
-        # enc_outputs is typically (z_seq, pooled) or just z_seq
+
         if isinstance(enc_outputs, tuple):
-            z_seq = enc_outputs[0]
+            z_seq, _ = enc_outputs
         else:
+            # encode(return_seq=True) always returns a tuple, but keep this
+            # for defensive programming.
             z_seq = enc_outputs
 
-        hi_phys_seq = None
-        hi_damage_seq = None
+        hi_phys_seq: Optional[torch.Tensor] = None
+        hi_damage_seq: Optional[torch.Tensor] = None
 
-        # If health_phys_seq is available in the batch, it is passed separately in training.
-        # For inference/decoder training we only use the learned damage_head.
-        if hasattr(self, "damage_head") and self.damage_head is not None:
-            # we can run the damage head with the encoder sequence only, cond_seq=None
-            
-            # Determine cond_seq if model uses it
-            cond_seq_dmg = None
-            if self.use_cond_encoder and self.cond_in_dim > 0 and self.cond_feature_indices is not None:
-                # We need x to be [B, T, F] to extract cond features
-                if x.dim() == 3:
-                    cond_seq_dmg = x[:, :, self.cond_feature_indices]
-            
+        # If a cumulative damage head is available, run it to obtain the
+        # damage-based HI sequence. We do not pass an explicit cond_seq here;
+        # the head itself does not require it (cond-sequence effects are
+        # already embedded via the encoder if use_cond_encoder=True).
+        if hasattr(self, "damage_head") and getattr(self, "damage_head", None) is not None:
             hi_damage_seq, _, _, _ = self.damage_head(
                 z_seq,
-                cond_seq=cond_seq_dmg,
-            )  # hi_damage_seq shape: [B, T]
+                cond_seq=None,
+            )
 
         return z_seq, hi_phys_seq, hi_damage_seq
 

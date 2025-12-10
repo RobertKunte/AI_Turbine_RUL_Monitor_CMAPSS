@@ -114,6 +114,42 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     
     dataset_name = config['dataset']
     experiment_name = config['experiment_name']
+
+    # ===================================================================
+    # Special case: RUL Trajectory Decoder v1 on top of frozen encoder v3d
+    # ===================================================================
+    if config.get("encoder_type") == "decoder_v1_from_encoder_v3d":
+        from src.rul_decoder_training_v1 import train_rul_decoder_v1
+
+        train_cfg = config.get("training_params", {})
+        epochs = int(train_cfg.get("num_epochs", 50))
+        batch_size = int(train_cfg.get("batch_size", 256))
+
+        # Map torch.device to simple string for the decoder script
+        device_str = "cuda" if str(device).startswith("cuda") else "cpu"
+
+        print("\n[decoder_v1] Launching RUL Trajectory Decoder v1 training "
+              f"for experiment '{experiment_name}' on {device_str}")
+        train_rul_decoder_v1(
+            device=device_str,
+            epochs=epochs,
+            batch_size=batch_size,
+        )
+
+        # After training finishes, attempt to load its summary JSON to return
+        # a consistent summary dict to the caller.
+        decoder_results_dir = Path("results") / "fd004" / "decoder_v1_from_encoder_v3d"
+        summary_path = decoder_results_dir / "summary_decoder_v1.json"
+        if summary_path.exists():
+            with open(summary_path, "r") as f:
+                summary = json.load(f)
+        else:
+            summary = {
+                "experiment_name": experiment_name,
+                "dataset": dataset_name,
+                "note": "Decoder v1 training finished, but summary_decoder_v1.json was not found.",
+            }
+        return summary
     
     # ===================================================================
     # Load Data
@@ -399,15 +435,6 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             summary = train_state_encoder_v3_physics(cfg_ns)
         return summary
     
-    # ===================================================================
-    # Decoder V1 Training
-    # ===================================================================
-    if config["encoder_type"] == "decoder_v1":
-        from src.rul_decoder_training_v1 import train_rul_decoder_v1
-        print("\n[2] Training RUL Trajectory Decoder V1 (on frozen encoder)...")
-        summary = train_rul_decoder_v1(config, device=device)
-        return summary
-
     # ===================================================================
     # World Model Training (Phase 4/5 Residual)
     # ===================================================================

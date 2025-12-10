@@ -1,16 +1,32 @@
+from __future__ import annotations
+
+"""
+RUL Trajectory Decoder v1 on top of a frozen EOLFullTransformerEncoder.
+
+This module is intentionally minimal and dataset-agnostic: it operates only
+on tensors (latent encoder sequence + HI sequences) and does not know about
+NASA CMAPSS specifics. The training script is responsible for providing
+properly prepared inputs.
+"""
+
+from typing import Optional
+
 import torch
 import torch.nn as nn
+
 
 class RULTrajectoryDecoderV1(nn.Module):
     """
     Simple RUL trajectory decoder on top of frozen encoder + HI sequences.
 
     Inputs:
-      - z_seq:        [B, T, D]  latent encoder sequence from EOLFullTransformerEncoder
-      - hi_phys_seq:  [B, T]     physics HI_phys_v3 (continuous, monotone decreasing)
-      - hi_damage_seq:[B, T]     learned damage HI (v3d) from CumulativeDamageHead
+      - z_seq:         [B, T, D]  latent encoder sequence from EOLFullTransformerEncoder
+      - hi_phys_seq:   [B, T]     physics HI_phys_v3 (continuous, monotone decreasing)
+                                  If not available, pass a zero/one tensor of same shape.
+      - hi_damage_seq: [B, T]     learned damage HI (v3d) from CumulativeDamageHead
+
     Output:
-      - rul_seq_pred: [B, T]     predicted RUL trajectory over the same T timesteps
+      - rul_seq_pred:  [B, T]     predicted RUL trajectory over the same T timesteps
     """
 
     def __init__(
@@ -19,13 +35,14 @@ class RULTrajectoryDecoderV1(nn.Module):
         hidden_dim: int = 128,
         num_layers: int = 2,
         dropout: float = 0.1,
-    ):
+    ) -> None:
         super().__init__()
 
         # project HIs to small embedding
         hi_input_dim = 2  # [hi_phys, hi_damage]
         self.hi_proj = nn.Linear(hi_input_dim, latent_dim)
 
+        # combine latent encoder sequence + HI embedding
         self.input_proj = nn.Linear(latent_dim * 2, hidden_dim)
 
         self.gru = nn.GRU(
@@ -38,74 +55,57 @@ class RULTrajectoryDecoderV1(nn.Module):
 
         self.out = nn.Linear(hidden_dim, 1)
 
-    def forward(self, z_seq, hi_phys_seq, hi_damage_seq):
-        # z_seq: [B, T, D]
-        # hi_*:  [B, T]
-        
-        # Handle missing hi_phys_seq by using zeros if None
+    def forward(
+        self,
+        z_seq: torch.Tensor,
+        hi_phys_seq: torch.Tensor,
+        hi_damage_seq: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            z_seq:        [B, T, D] latent encoder sequence
+            hi_phys_seq:  [B, T]    physics HI (or zeros/ones if unavailable)
+            hi_damage_seq:[B, T]    learned damage HI
+
+        Returns:
+            rul_seq_pred: [B, T] predicted RUL trajectory
+        """
         if hi_phys_seq is None:
-            hi_phys_seq = torch.zeros_like(hi_damage_seq)
-            
+            raise ValueError("hi_phys_seq must be a tensor; pass zeros/ones if unavailable.")
+        if hi_damage_seq is None:
+            raise ValueError("hi_damage_seq must be provided.")
+
+        if z_seq.dim() != 3:
+            raise ValueError(f"z_seq must be [B,T,D], got shape {tuple(z_seq.shape)}")
+
+        B, T, D = z_seq.shape
+
+        # Ensure HI sequences are [B, T]
+        if hi_phys_seq.dim() == 3:
+            hi_phys_seq = hi_phys_seq.squeeze(-1)
+        if hi_damage_seq.dim() == 3:
+            hi_damage_seq = hi_damage_seq.squeeze(-1)
+
+        if hi_phys_seq.shape[:2] != (B, T):
+            raise ValueError(
+                f"hi_phys_seq must be [B,T], got {tuple(hi_phys_seq.shape)} vs expected {(B, T)}"
+            )
+        if hi_damage_seq.shape[:2] != (B, T):
+            raise ValueError(
+                f"hi_damage_seq must be [B,T], got {tuple(hi_damage_seq.shape)} vs expected {(B, T)}"
+            )
+
+        # Stack and project HI channels
         hi = torch.stack([hi_phys_seq, hi_damage_seq], dim=-1)  # [B, T, 2]
         hi_emb = torch.relu(self.hi_proj(hi))                   # [B, T, D]
+
+        # Concatenate latent sequence and HI embedding
         x = torch.cat([z_seq, hi_emb], dim=-1)                  # [B, T, 2D]
         x = torch.relu(self.input_proj(x))                      # [B, T, H]
+
         out_seq, _ = self.gru(x)                                # [B, T, H]
         rul_seq = self.out(out_seq).squeeze(-1)                 # [B, T]
+
         return rul_seq
-
-
-class DecoderV1Wrapper(nn.Module):
-    """
-    Wrapper that combines a frozen EOLFullTransformerEncoder and a RULTrajectoryDecoderV1.
-    Provides a standard forward(x, cond_ids=...) interface for evaluation/diagnostics.
-    """
-    def __init__(self, encoder: nn.Module, decoder: RULTrajectoryDecoderV1):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        
-        # Expose attributes expected by diagnostics/evaluation tools
-        self.d_model = getattr(encoder, "d_model", 64)
-        
-    def forward(self, x, cond_ids=None, cond_vec=None):
-        """
-        Forward pass for inference/evaluation.
-        Returns:
-            rul_pred: [B, 1] predicted RUL at the last timestep (EOL prediction)
-            hi_last:  Dummy (or last HI if available) [B, 1]
-            hi_seq:   Dummy (or predicted HI seq) [B, T]
-        
-        Note: The standard evaluation interface expects (rul_pred, hi_last, hi_seq).
-        """
-        # Encoder forward (frozen)
-        # We assume self.encoder has encode_with_hi (added in previous step)
-        if hasattr(self.encoder, "encode_with_hi"):
-            z_seq, hi_phys_seq, hi_damage_seq = self.encoder.encode_with_hi(x, cond_ids=cond_ids, cond_vec=cond_vec)
-        else:
-            # Fallback if method missing (should not happen if encoder updated)
-            z_seq = self.encoder(x, cond_ids=cond_ids)
-            hi_phys_seq = None
-            hi_damage_seq = None
-            if hasattr(self.encoder, "damage_head") and self.encoder.damage_head is not None:
-                 # Try to extract damage HI manually
-                 pass # Simplified for now
-        
-        # Decoder forward
-        rul_seq = self.decoder(z_seq, hi_phys_seq, hi_damage_seq) # [B, T]
-        
-        # For compatibility with evaluate_on_test_data which expects:
-        # rul_pred (B, 1), hi_last (B, 1), hi_seq (B, T)
-        rul_pred = rul_seq[:, -1].unsqueeze(-1)
-        
-        # We can use hi_damage_seq as the "Health Index" for plotting if available
-        if hi_damage_seq is not None:
-            hi_seq = hi_damage_seq
-            hi_last = hi_seq[:, -1].unsqueeze(-1)
-        else:
-            hi_seq = torch.zeros_like(rul_seq)
-            hi_last = torch.zeros_like(rul_pred)
-            
-        return rul_pred, hi_last, hi_seq
 
 

@@ -1287,6 +1287,28 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v3b_config() -> ExperimentConf
     return cfg
 
 
+def get_fd004_decoder_v1_from_encoder_v3d_config() -> ExperimentConfig:
+    """
+    FD004 RUL Trajectory Decoder v1 on top of a frozen encoder v3d.
+
+    This is a thin wrapper that allows launching the standalone
+    decoder training script via run_experiments.py using:
+
+        --experiments fd004_decoder_v1_from_encoder_v3d
+    """
+    cfg: ExperimentConfig = {
+        "experiment_name": "fd004_decoder_v1_from_encoder_v3d",
+        "dataset": "FD004",
+        # Custom encoder_type used as a switch in run_experiments.run_single_experiment
+        "encoder_type": "decoder_v1_from_encoder_v3d",
+        # Minimal training params for the decoder; can be overridden if needed.
+        "training_params": {
+            "num_epochs": 50,
+            "batch_size": 256,
+        },
+    }
+    return cfg
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_config() -> ExperimentConfig:
     """
     FD004 ms+DT Transformer-Encoder with MLP-based DamageHead and two-phase training.
@@ -2870,40 +2892,6 @@ def get_world_model_phase5_universal_v3_residual_config(
     )
 
 
-def get_fd004_decoder_v1_from_encoder_v3d_config() -> ExperimentConfig:
-    """
-    Config for RUL Trajectory Decoder V1 training on top of frozen v3d encoder.
-    """
-    return {
-        "experiment_name": "fd004_decoder_v1_from_encoder_v3d",
-        "dataset": "FD004",
-        "encoder_type": "decoder_v1",
-        "training_params": {
-            "num_epochs": 50,
-            "batch_size": 256,
-            "patience": 10,
-            "lr": 1e-3,
-            "weight_decay": 1e-4,
-        },
-        # These features mimic the v3d setup for consistency
-        "features": {
-            "use_multiscale_features": True,
-            "multiscale": {
-                "windows_short": [5, 10],
-                "windows_medium": [],
-                "windows_long": [30]
-            }
-        },
-        "phys_features": {
-            "use_condition_vector": True,
-            "use_twin_features": True,
-            "twin_baseline_len": 30,
-            "condition_vector_version": 3,
-        },
-        "encoder_checkpoint": "results/fd004/fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase/eol_full_lstm_best_fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase.pt",
-    }
-
-
 def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
     """
     Get a single experiment config by name.
@@ -2958,6 +2946,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v3e_smooth":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3e_smooth_config()
+    if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
+        return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":
@@ -2970,8 +2960,6 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_latent_worldmodel_dynamic_freeze_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_dynamic_delta_v2":
         return get_fd004_transformer_latent_worldmodel_dynamic_delta_v2_config()
-    if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
-        return get_fd004_decoder_v1_from_encoder_v3d_config()
     # Check for world model phase 5 v3 experiments first
     if "world" in experiment_name and "phase5" in experiment_name and "v3" in experiment_name:
         for dataset in ["FD001", "FD002", "FD003", "FD004"]:

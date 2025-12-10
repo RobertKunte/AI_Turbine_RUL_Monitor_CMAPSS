@@ -1,419 +1,903 @@
+from __future__ import annotations
+
+"""
+RUL Trajectory Decoder v1 training script.
+
+This script trains a lightweight GRU-based decoder (RULTrajectoryDecoderV1)
+on top of a **frozen** EOLFullTransformerEncoder that was trained in the
+FD004 ms_dt_v2 damage_v3d_delta_two_phase experiment.
+
+The decoder consumes:
+  - latent encoder sequence z_seq      [B, T, D]
+  - physics HI_phys_v3 sequence       [B, T]  (from the data pipeline)
+  - learned damage HI sequence (v3d)  [B, T]  (from CumulativeDamageHead)
+
+and predicts a full RUL trajectory over the same T steps.
+
+Results are stored under:
+  results/fd004/decoder_v1_from_encoder_v3d/
+"""
+
 import argparse
 import json
 import math
-import os
+import pickle
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-# Use absolute imports
-from src.analysis.inference import reconstruct_model_from_checkpoint
-from src.eol_full_lstm import build_full_eol_sequences_from_df
+from src.analysis.inference import load_model_from_experiment
 from src.data_loading import load_cmapps_subset
-from src.models.rul_decoder import RULTrajectoryDecoderV1
 from src.additional_features import (
+    create_physical_features,
+    create_all_features,
     FeatureConfig,
     TemporalFeatureConfig,
     PhysicsFeatureConfig,
-    create_physical_features,
-    create_all_features,
     build_condition_features,
     create_twin_features,
 )
-from src.feature_safety import remove_rul_leakage
+from src.config import ResidualFeatureConfig
+from src.eol_full_lstm import (
+    build_full_eol_sequences_from_df,
+    build_test_sequences_from_df,
+    SequenceDatasetWithUnits,
+)
+from src.metrics import compute_eol_errors_and_nasa
+from src.models.rul_decoder import RULTrajectoryDecoderV1
+
+
+EXPERIMENT_NAME_V3D = "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase"
+DATASET_NAME = "FD004"
+ENCODER_EXPERIMENT_DIR = (
+    Path("results") / "fd004" / EXPERIMENT_NAME_V3D
+)
+ENCODER_CHECKPOINT = (
+    ENCODER_EXPERIMENT_DIR
+    / f"eol_full_lstm_best_{EXPERIMENT_NAME_V3D}.pt"
+)
+SCALER_PATH = ENCODER_EXPERIMENT_DIR / "scaler.pkl"
+
+DECODER_RESULTS_DIR = Path("results") / "fd004" / "decoder_v1_from_encoder_v3d"
 
 
 def build_rul_seq_from_last(rul_last: torch.Tensor, T: int) -> torch.Tensor:
     """
-    Reconstructs RUL(t) backwards from the last step RUL.
-    rul_seq[i, j] = rul_last[i] + (T - 1 - j)
+    Reconstruct a simple RUL trajectory by counting backwards from the
+    last-step RUL (which is already capped if needed).
+
+    Args:
+        rul_last: [B] tensor of RUL at the last timestep of each window.
+        T:        sequence length (past_len, e.g. 30).
+
+    Returns:
+        rul_seq: [B, T] tensor where
+            rul_seq[:, -1] == rul_last
+            rul_seq[:, j] = rul_last + (T - 1 - j)
     """
+    if rul_last.dim() != 1:
+        rul_last = rul_last.view(-1)
+    B = rul_last.shape[0]
     device = rul_last.device
-    steps = torch.arange(T - 1, -1, -1, device=device).unsqueeze(0)  # [1, T]
+    # Offsets: [T-1, ..., 1, 0]
+    steps = torch.arange(T - 1, -1, -1, device=device, dtype=rul_last.dtype).unsqueeze(0)  # [1, T]
     rul_seq = rul_last.unsqueeze(1) + steps  # [B, T]
     return rul_seq
 
 
-def train_rul_decoder_v1(config: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+def apply_loaded_scaler(
+    X: torch.Tensor,
+    cond_ids: torch.Tensor,
+    scaler,
+) -> torch.Tensor:
     """
-    Train RUL Trajectory Decoder V1.
-    Called by run_experiments.py.
+    Apply a pre-fitted scaler (global or condition-wise) to a 3D tensor X.
+
+    Args:
+        X:        [N, T, F] unscaled features
+        cond_ids: [N] condition IDs per sample
+        scaler:   StandardScaler or Dict[int, StandardScaler]
+
+    Returns:
+        X_scaled: [N, T, F]
     """
-    experiment_name = config["experiment_name"]
-    dataset_name = config["dataset"]
-    encoder_checkpoint = config.get("encoder_checkpoint")
-    
-    if not encoder_checkpoint:
-        raise ValueError("encoder_checkpoint must be provided in config for decoder_v1 experiment")
-        
-    results_dir = Path("results") / dataset_name.lower() / experiment_name
-    results_dir.mkdir(parents=True, exist_ok=True)
-    
-    training_params = config.get("training_params", {})
-    epochs = training_params.get("num_epochs", 50)
-    batch_size = training_params.get("batch_size", 256)
-    lr = training_params.get("lr", 1e-3)
-    weight_decay = training_params.get("weight_decay", 1e-4)
+    N, T, F = X.shape
 
-    print(f"\n[DecoderV1] Loading encoder from {encoder_checkpoint}...")
-    if not os.path.exists(encoder_checkpoint):
-        raise FileNotFoundError(f"Checkpoint not found: {encoder_checkpoint}")
+    # Condition-wise scaling (dict[int, StandardScaler])
+    if isinstance(scaler, dict):
+        X_scaled_list = []
+        cond_ids_np = cond_ids.cpu().numpy()
+        if not scaler:
+            # Degenerate case: no scalers stored – fall back to identity.
+            return X.clone()
 
-    # Load frozen encoder
-    # Note: reconstruct_model_from_checkpoint returns (model, config, scaler)
-    # We pass strict=False if keys mismatch (e.g. if we modified EOLFullTransformerEncoder)
-    try:
-        encoder_model, model_config, scaler = reconstruct_model_from_checkpoint(
-            encoder_checkpoint, device=device
-        )
-    except Exception as e:
-        print(f"Error loading checkpoint: {e}")
-        print("Trying to load with strict=False...")
-        # Fallback if needed, but reconstruct doesn't have strict param easily accessible
-        raise e
-        
-    encoder_model.eval()
-    for p in encoder_model.parameters():
-        p.requires_grad = False
-    
-    print("[DecoderV1] Encoder loaded and frozen.")
+        # Fallback scaler in case a condition ID is missing
+        fallback_scaler = next(iter(scaler.values()))
 
-    # 2. Build Datasets
-    print("[DecoderV1] Building datasets...")
-    # Load raw FD data (same helper as run_experiments)
-    train_df, test_df, _ = load_cmapps_subset(dataset_name, max_rul=None, clip_train=False, clip_test=True)
-    
-    # Feature Config from current experiment config (to match ms_dt_v2 style)
-    features_cfg = config.get("features", {})
-    ms_cfg = features_cfg.get("multiscale", {})
-    phys_features_cfg = config.get("phys_features", {})
-    
-    feature_cfg = FeatureConfig(
-        add_physical_core=True,
-        add_temporal_features=features_cfg.get("use_multiscale_features", True),
-        temporal=TemporalFeatureConfig(
-            short_windows=tuple(ms_cfg.get("windows_short", (5, 10))),
-            long_windows=tuple(ms_cfg.get("windows_long", (30,))),
-            add_rolling_mean=True,
-            add_rolling_std=False,
-            add_trend=True,
-            add_delta=True,
-            delta_lags=(5, 10),
-        ),
+        for i in range(N):
+            cid = int(cond_ids_np[i])
+            sc = scaler.get(cid, fallback_scaler)
+            x_i = X[i].cpu().numpy()  # [T, F]
+            x_scaled = sc.transform(x_i)  # [T, F]
+            X_scaled_list.append(torch.from_numpy(x_scaled))
+
+        X_scaled = torch.stack(X_scaled_list, dim=0)
+        return X_scaled.to(X.device, dtype=X.dtype)
+
+    # Global StandardScaler
+    X_flat = X.cpu().numpy().reshape(-1, F)  # [N*T, F]
+    X_scaled_flat = scaler.transform(X_flat)
+    X_scaled = torch.from_numpy(X_scaled_flat.reshape(N, T, F)).to(X.device, dtype=X.dtype)
+    return X_scaled
+
+
+def make_engine_split_loaders(
+    X: torch.Tensor,
+    y: torch.Tensor,
+    unit_ids: torch.Tensor,
+    cond_ids: torch.Tensor,
+    health_phys_seq: torch.Tensor | None,
+    batch_size: int,
+    engine_train_ratio: float = 0.8,
+    random_seed: int = 42,
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Create train/val loaders using an engine-based split, mirroring
+    create_full_dataloaders but reusing already-scaled features.
+    """
+    unique_units = torch.unique(unit_ids)
+    n_units = len(unique_units)
+    n_train_units = int(n_units * engine_train_ratio)
+    if n_units > 1 and n_train_units == 0:
+        n_train_units = 1
+
+    # Shuffle engine IDs deterministically
+    gen = torch.Generator().manual_seed(random_seed)
+    perm = torch.randperm(n_units, generator=gen)
+    train_unit_ids = unique_units[perm[:n_train_units]]
+    val_unit_ids = unique_units[perm[n_train_units:]]
+
+    train_mask = torch.isin(unit_ids, train_unit_ids)
+    val_mask = torch.isin(unit_ids, val_unit_ids)
+
+    X_train = X[train_mask]
+    y_train = y[train_mask]
+    cond_ids_train = cond_ids[train_mask]
+    X_val = X[val_mask]
+    y_val = y[val_mask]
+    cond_ids_val = cond_ids[val_mask]
+
+    if health_phys_seq is not None:
+        health_train = health_phys_seq[train_mask]
+        health_val = health_phys_seq[val_mask]
+    else:
+        health_train = None
+        health_val = None
+
+    train_unit_ids_samples = unit_ids[train_mask]
+    val_unit_ids_samples = unit_ids[val_mask]
+
+    train_ds = SequenceDatasetWithUnits(
+        X_train, y_train, train_unit_ids_samples, cond_ids_train, health_phys_seq=health_train
     )
-    
-    # Physics Config (no explicit residual features for decoder)
-    physics_cfg = PhysicsFeatureConfig(
+    val_ds = SequenceDatasetWithUnits(
+        X_val, y_val, val_unit_ids_samples, cond_ids_val, health_phys_seq=health_val
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    print("============================================================")
+    print("[decoder_v1] Engine-based split for decoder training")
+    print("============================================================")
+    print(f"Total units: {n_units}")
+    print(f"Train units: {len(train_unit_ids)}, Val units: {len(val_unit_ids)}")
+    print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
+    print("============================================================")
+
+    return train_loader, val_loader
+
+
+def prepare_fd004_ms_dt_v3d_data(
+    device: torch.device,
+    past_len: int = 30,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    list[str],
+    Dict,
+]:
+    """
+    Rebuild the FD004 feature pipeline used in the v3d encoder experiment
+    and return:
+
+      - X_full:            [N, past_len, F] train sequences (unscaled)
+      - y_full:            [N]              last-step RUL targets
+      - unit_ids_full:     [N]
+      - cond_ids_full:     [N]
+      - health_phys_seq:   [N, past_len] or None (HI_phys_v3)
+      - X_test:            [N_test, past_len, F] test sequences (unscaled)
+      - unit_ids_test:     [N_test]
+      - cond_ids_test:     [N_test]
+      - feature_cols:      list of feature column names (encoder input)
+      - summary_cfg:       summary.json config from the encoder experiment
+    """
+    print("============================================================")
+    print("[decoder_v1] Preparing FD004 data (ms_dt_v2 + residual + twin)")
+    print("============================================================")
+
+    # Load original experiment summary to reconstruct feature/physics config
+    summary_path = ENCODER_EXPERIMENT_DIR / "summary.json"
+    if not summary_path.exists():
+        raise FileNotFoundError(f"summary.json not found at {summary_path}")
+
+    with open(summary_path, "r") as f:
+        summary_cfg = json.load(f)
+
+    # Load raw CMAPSS data (same helper as core experiments)
+    df_train, df_test, y_test_true = load_cmapps_subset(
+        DATASET_NAME,
+        max_rul=None,
+        clip_train=False,
+        clip_test=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Physics & feature configs (mirroring run_experiments.py)
+    # ------------------------------------------------------------------
+    name_lower = EXPERIMENT_NAME_V3D.lower()
+    is_phase4_residual = (
+        (("phase4" in name_lower) or ("phase5" in name_lower)) and "residual" in name_lower
+    ) or ("residual" in name_lower) or ("resid" in name_lower)
+
+    physics_config = PhysicsFeatureConfig(
         use_core=True,
         use_extended=False,
-        use_residuals=False,
+        use_residuals=is_phase4_residual,
         use_temporal_on_physics=False,
+        residual=ResidualFeatureConfig(
+            enabled=is_phase4_residual,
+            mode="per_engine",
+            baseline_len=30,
+            include_original=True,
+        )
+        if is_phase4_residual
+        else ResidualFeatureConfig(enabled=False),
     )
-    
+
+    phys_opts = summary_cfg.get("phys_features", {})
+    use_phys_condition_vec = phys_opts.get("use_condition_vector", False)
+    use_twin_features = phys_opts.get(
+        "use_twin_features",
+        phys_opts.get("use_digital_twin_residuals", False),
+    )
+    twin_baseline_len = phys_opts.get("twin_baseline_len", 30)
+    condition_vector_version = phys_opts.get("condition_vector_version", 2)
+
+    features_cfg = summary_cfg.get("features", {})
+    ms_cfg = features_cfg.get("multiscale", {})
+    use_temporal_features = features_cfg.get("use_multiscale_features", True)
+
+    windows_short = tuple(ms_cfg.get("windows_short", (5, 10)))
+    windows_medium = tuple(ms_cfg.get("windows_medium", ()))
+    windows_long = tuple(ms_cfg.get("windows_long", (30,)))
+    combined_long = windows_medium + windows_long
+
+    temporal_cfg = TemporalFeatureConfig(
+        base_cols=None,
+        short_windows=windows_short,
+        long_windows=combined_long if combined_long else (30,),
+        add_rolling_mean=True,
+        add_rolling_std=False,
+        add_trend=True,
+        add_delta=True,
+        delta_lags=(5, 10),
+    )
+    feature_config = FeatureConfig(
+        add_physical_core=True,
+        add_temporal_features=use_temporal_features,
+        temporal=temporal_cfg,
+    )
+
     # 1) Physics features
-    train_df_fe = create_physical_features(train_df, physics_cfg, "UnitNumber", "TimeInCycles")
-    test_df_fe = create_physical_features(test_df, physics_cfg, "UnitNumber", "TimeInCycles")
-    
+    df_train = create_physical_features(df_train, physics_config, "UnitNumber", "TimeInCycles")
+    df_test = create_physical_features(df_test, physics_config, "UnitNumber", "TimeInCycles")
+
     # 2) Continuous condition vector
-    if phys_features_cfg.get("use_condition_vector", False):
-        train_df_fe = build_condition_features(
-            train_df_fe,
+    if use_phys_condition_vec:
+        print("  Using continuous condition vector features (Cond_*)")
+        df_train = build_condition_features(
+            df_train,
             unit_col="UnitNumber",
             cycle_col="TimeInCycles",
-            version=phys_features_cfg.get("condition_vector_version", 2),
+            version=condition_vector_version,
         )
-        test_df_fe = build_condition_features(
-            test_df_fe,
+        df_test = build_condition_features(
+            df_test,
             unit_col="UnitNumber",
             cycle_col="TimeInCycles",
-            version=phys_features_cfg.get("condition_vector_version", 2),
+            version=condition_vector_version,
         )
-    
-    # 3) Digital twin residuals
-    use_twin = phys_features_cfg.get("use_twin_features", False)
-    twin_baseline = phys_features_cfg.get("twin_baseline_len", 30)
-    if use_twin:
-        train_df_fe, twin_model = create_twin_features(
-            train_df_fe,
+
+    # 3) Digital twin + residuals
+    if use_twin_features:
+        print(f"  Using HealthyTwinRegressor (baseline_len={twin_baseline_len})")
+        df_train, twin_model = create_twin_features(
+            df_train,
             unit_col="UnitNumber",
             cycle_col="TimeInCycles",
-            baseline_len=twin_baseline,
-            condition_vector_version=phys_features_cfg.get("condition_vector_version", 2),
+            baseline_len=twin_baseline_len,
+            condition_vector_version=condition_vector_version,
         )
-        test_df_fe = twin_model.add_twin_and_residuals(test_df_fe)
-    
+        df_test = twin_model.add_twin_and_residuals(df_test)
+
     # 4) Temporal / multi-scale features
-    train_df_fe = create_all_features(
-        train_df_fe,
+    df_train = create_all_features(
+        df_train,
         "UnitNumber",
         "TimeInCycles",
-        feature_cfg,
+        feature_config,
         inplace=False,
-        physics_config=physics_cfg,
+        physics_config=physics_config,
     )
-    test_df_fe = create_all_features(
-        test_df_fe,
+    df_test = create_all_features(
+        df_test,
         "UnitNumber",
         "TimeInCycles",
-        feature_cfg,
+        feature_config,
         inplace=False,
-        physics_config=physics_cfg,
+        physics_config=physics_config,
     )
-    
-    # 5) Feature columns (match training-time encoder pipeline)
+
+    # 5) HI_phys_v3 column must already exist in df_train for v3d runs
+    if "HI_phys_v3" not in df_train.columns:
+        raise RuntimeError(
+            "[decoder_v1] Expected HI_phys_v3 in df_train. "
+            "Please ensure the v3d encoder experiment was run with HI_phys_v3 computation."
+        )
+
+    # ------------------------------------------------------------------
+    # Feature column selection (mirrors run_experiments.py)
+    # ------------------------------------------------------------------
     feature_cols = [
         c
-        for c in train_df_fe.columns
-        if c not in ["UnitNumber", "TimeInCycles", "RUL", "RUL_raw", "MaxTime", "ConditionID"]
+        for c in df_train.columns
+        if c
+        not in ["UnitNumber", "TimeInCycles", "RUL", "RUL_raw", "MaxTime", "ConditionID"]
     ]
+
+    # Remove RUL leakage (same helper as in run_experiments)
+    from src.feature_safety import remove_rul_leakage
+
     feature_cols, _ = remove_rul_leakage(feature_cols)
+    # Never feed HI_* targets as input features
+    feature_cols = [
+        c
+        for c in feature_cols
+        if c not in ["HI_phys_final", "HI_target_hybrid", "HI_phys_v2", "HI_phys_v3"]
+    ]
+
+    print(f"[decoder_v1] Using {len(feature_cols)} features for encoder/decoder input.")
 
     # ------------------------------------------------------------------
-    # Align feature_cols with encoder scaler and apply scaling
+    # Build full-trajectory sliding windows (train) and test sequences
     # ------------------------------------------------------------------
-    if isinstance(scaler, dict):
-        # Condition-wise scaler: dict[cond_id] -> StandardScaler
-        # Try to honour feature_cols from encoder summary if present
-        saved_feature_cols = model_config.get("feature_cols")
-        if saved_feature_cols:
-            feature_cols = saved_feature_cols
-            missing = [c for c in feature_cols if c not in train_df_fe.columns]
-            if missing:
-                raise ValueError(f"[DecoderV1] Missing features (condition-wise scaler): {missing}")
-        else:
-            # Use current pipeline features; just log potential mismatch
-            first_scaler = next(iter(scaler.values()))
-            expected_dim = len(getattr(first_scaler, "mean_", np.zeros(len(feature_cols))))
-            if len(feature_cols) != expected_dim:
-                print(
-                    f"[DecoderV1] Warning: condition-wise scaler feature dim mismatch – "
-                    f"pipeline={len(feature_cols)}, scaler={expected_dim}. Continuing anyway."
-                )
+    X_full, y_full, unit_ids_full, cond_ids_full, health_phys_seq_full = build_full_eol_sequences_from_df(
+        df_train,
+        feature_cols=feature_cols,
+        past_len=past_len,
+        max_rul=summary_cfg.get("max_rul", 125.0),
+        unit_col="UnitNumber",
+        cycle_col="TimeInCycles",
+        rul_col="RUL",
+        cond_col="ConditionID",
+    )
 
-        # Apply scaling per condition ID
-        cond_ids_train = train_df_fe["ConditionID"].values
-        cond_ids_test = test_df_fe["ConditionID"].values
+    X_test, unit_ids_test, cond_ids_test = build_test_sequences_from_df(
+        df_test,
+        feature_cols=feature_cols,
+        past_len=past_len,
+        unit_col="UnitNumber",
+        cycle_col="TimeInCycles",
+        cond_col="ConditionID",
+    )
 
-        for cond_id, cond_scaler in scaler.items():
-            mask_tr = cond_ids_train == cond_id
-            if np.any(mask_tr):
-                train_df_fe.loc[mask_tr, feature_cols] = cond_scaler.transform(
-                    train_df_fe.loc[mask_tr, feature_cols]
-                )
+    # y_test_true from load_cmapps_subset is EOL RUL per engine
+    y_test_true_arr = np.asarray(y_test_true, dtype=np.float32)
+    y_test_true_tensor = torch.from_numpy(y_test_true_arr)
 
-            mask_te = cond_ids_test == cond_id
-            if np.any(mask_te):
-                test_df_fe.loc[mask_te, feature_cols] = cond_scaler.transform(
-                    test_df_fe.loc[mask_te, feature_cols]
-                )
+    # Move tensors to desired device later; keep on CPU for now
+    return (
+        X_full,
+        y_full,
+        unit_ids_full,
+        cond_ids_full,
+        health_phys_seq_full,
+        X_test,
+        unit_ids_test,
+        cond_ids_test,
+        feature_cols,
+        {
+            "summary_cfg": summary_cfg,
+            "y_test_true": y_test_true_tensor,
+        },
+    )
 
-        # Optional: warn if there are conditions without a scaler entry
-        known_conds = set(scaler.keys())
-        unknown_train = sorted(set(cond_ids_train) - known_conds)
-        unknown_test = sorted(set(cond_ids_test) - known_conds)
-        if unknown_train or unknown_test:
-            print(
-                f"[DecoderV1] Warning: some ConditionIDs have no scaler entry – "
-                f"train_missing={unknown_train}, test_missing={unknown_test}"
-            )
-    else:
-        # Global StandardScaler (single object)
-        if scaler is not None and hasattr(scaler, "mean_"):
-            expected_dim = scaler.mean_.shape[0]
-            saved_feature_cols = model_config.get("feature_cols")
-            if saved_feature_cols:
-                feature_cols = saved_feature_cols
-                missing = [c for c in feature_cols if c not in train_df_fe.columns]
-                if missing:
-                    raise ValueError(f"[DecoderV1] Missing features: {missing}")
+
+def evaluate_decoder_eol(
+    encoder: nn.Module,
+    decoder: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> Dict:
+    """
+    Evaluate decoder on a loader of sliding windows by aggregating per-engine
+    EOL predictions (one value per engine: the window with minimal RUL).
+    """
+    encoder.eval()
+    decoder.eval()
+
+    y_true_eol: Dict[int, float] = {}
+    y_pred_eol: Dict[int, float] = {}
+
+    with torch.no_grad():
+        for batch in loader:
+            # Robust batch unpacking (SequenceDatasetWithUnits)
+            health_phys_seq_batch = None
+            if len(batch) == 5:
+                X_batch, y_batch, unit_ids_batch, cond_ids_batch, health_phys_seq_batch = batch
+            elif len(batch) == 4:
+                X_batch, y_batch, unit_ids_batch, cond_ids_batch = batch
+            elif len(batch) == 3:
+                X_batch, y_batch, unit_ids_batch = batch
+                cond_ids_batch = torch.zeros(len(y_batch), dtype=torch.int64)
             else:
-                if len(feature_cols) != expected_dim:
-                    print(
-                        f"[DecoderV1] Warning: global scaler feature dim mismatch – "
-                        f"pipeline={len(feature_cols)}, scaler={expected_dim}. Continuing anyway."
-                    )
+                X_batch, y_batch = batch
+                unit_ids_batch = torch.zeros(len(y_batch), dtype=torch.int64)
+                cond_ids_batch = torch.zeros(len(y_batch), dtype=torch.int64)
+
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+            unit_ids_batch = unit_ids_batch.to(device)
+            cond_ids_batch = cond_ids_batch.to(device)
+
+            if health_phys_seq_batch is not None:
+                hi_phys_batch = health_phys_seq_batch.to(device)
+            else:
+                hi_phys_batch = None
+
+            z_seq, _, hi_damage_seq = encoder.encode_with_hi(
+                X_batch,
+                cond_ids=cond_ids_batch,
+                cond_vec=None,
+            )
+
+            if hi_phys_batch is None:
+                hi_phys_batch = torch.zeros_like(hi_damage_seq, device=device)
+
+            rul_pred_seq = decoder(z_seq, hi_phys_batch, hi_damage_seq)  # [B, T]
+            eol_pred = rul_pred_seq[:, -1]
+
+            # Aggregate per engine: choose sample with minimal true RUL
+            for i in range(y_batch.shape[0]):
+                uid = int(unit_ids_batch[i].item())
+                true_rul = float(y_batch[i].item())
+                pred_rul = float(eol_pred[i].item())
+
+                if uid not in y_true_eol or true_rul < y_true_eol[uid]:
+                    y_true_eol[uid] = true_rul
+                    y_pred_eol[uid] = pred_rul
+
+    if not y_true_eol:
+        raise RuntimeError("[decoder_v1] No EOL samples collected for evaluation.")
+
+    y_true_arr = np.array([y_true_eol[k] for k in sorted(y_true_eol.keys())], dtype=np.float32)
+    y_pred_arr = np.array([y_pred_eol[k] for k in sorted(y_pred_eol.keys())], dtype=np.float32)
+
+    metrics = compute_eol_errors_and_nasa(y_true_arr, y_pred_arr, max_rul=125.0)
+    return metrics
+
+
+def evaluate_decoder_on_test(
+    encoder: nn.Module,
+    decoder: nn.Module,
+    X_test: torch.Tensor,
+    y_test_true: torch.Tensor,
+    unit_ids_test: torch.Tensor,
+    cond_ids_test: torch.Tensor,
+    device: torch.device,
+) -> Dict:
+    """
+    Evaluate decoder on FD004 test set (one sequence per engine).
+    """
+    encoder.eval()
+    decoder.eval()
+
+    with torch.no_grad():
+        X_batch = X_test.to(device)
+        cond_ids_batch = cond_ids_test.to(device)
+
+        # HI_phys_v3 is not present for test sequences; feed zeros for hi_phys_seq
+        z_seq, _, hi_damage_seq = encoder.encode_with_hi(
+            X_batch,
+            cond_ids=cond_ids_batch,
+            cond_vec=None,
+        )
+        hi_phys_batch = torch.zeros_like(hi_damage_seq, device=device)
+
+        rul_pred_seq = decoder(z_seq, hi_phys_batch, hi_damage_seq)  # [B, T]
+        eol_pred = rul_pred_seq[:, -1]  # [B]
+
+    y_true_eol = y_test_true.cpu().numpy().astype(np.float32)
+    y_pred_eol = eol_pred.cpu().numpy().astype(np.float32)
+    metrics = compute_eol_errors_and_nasa(y_true_eol, y_pred_eol, max_rul=125.0)
+    return metrics
+
+
+def train_rul_decoder_v1(
+    device: str = "cuda",
+    epochs: int = 50,
+    batch_size: int = 256,
+) -> None:
+    # Resolve device
+    if device == "auto":
+        device_t = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device_t = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+
+    print(f"[decoder_v1] Using device: {device_t}")
+
+    DECODER_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 1) Prepare data + load original scaler
+    # ------------------------------------------------------------------
+    (
+        X_full,
+        y_full,
+        unit_ids_full,
+        cond_ids_full,
+        health_phys_seq_full,
+        X_test,
+        unit_ids_test,
+        cond_ids_test,
+        feature_cols,
+        extra_info,
+    ) = prepare_fd004_ms_dt_v3d_data(device_t)
+
+    # Load scaler from original encoder experiment
+    if not SCALER_PATH.exists():
+        raise FileNotFoundError(f"Scaler not found at {SCALER_PATH}")
+
+    with open(SCALER_PATH, "rb") as f:
+        scaler = pickle.load(f)
+
+    print(f"[decoder_v1] Loaded scaler from {SCALER_PATH}")
+
+    # Scale features using the loaded scaler (condition-wise or global)
+    X_full_scaled = apply_loaded_scaler(X_full, cond_ids_full, scaler)
+    X_test_scaled = apply_loaded_scaler(X_test, cond_ids_test, scaler)
+
+    # Move tensors to desired device lazily during training/inference
+    y_test_true = extra_info["y_test_true"]
+
+    # ------------------------------------------------------------------
+    # 2) Build train/val loaders (engine-based split)
+    # ------------------------------------------------------------------
+    train_loader, val_loader = make_engine_split_loaders(
+        X_full_scaled,
+        y_full,
+        unit_ids_full,
+        cond_ids_full,
+        health_phys_seq_full,
+        batch_size=batch_size,
+        engine_train_ratio=0.8,
+        random_seed=42,
+    )
+
+    # ------------------------------------------------------------------
+    # 3) Load frozen encoder from v3d experiment
+    # ------------------------------------------------------------------
+    if not ENCODER_CHECKPOINT.exists():
+        raise FileNotFoundError(f"Encoder checkpoint not found at {ENCODER_CHECKPOINT}")
+
+    print(f"[decoder_v1] Loading encoder from {ENCODER_EXPERIMENT_DIR}")
+    encoder, encoder_cfg = load_model_from_experiment(
+        ENCODER_EXPERIMENT_DIR,
+        device=device_t,
+    )
+
+    # Ensure we have a Transformer encoder with damage head
+    encoder.to(device_t)
+    encoder.eval()
+    for p in encoder.parameters():
+        p.requires_grad = False
+
+    # Set cond_feature_indices so the encoder can reconstruct Cond_* sequences
+    cond_feature_indices = [i for i, c in enumerate(feature_cols) if c.startswith("Cond_")]
+    if getattr(encoder, "use_cond_encoder", False) and getattr(encoder, "cond_in_dim", 0) > 0:
+        if cond_feature_indices and len(cond_feature_indices) == getattr(encoder, "cond_in_dim", 0):
+            encoder.cond_feature_indices = cond_feature_indices
+            print(
+                f"[decoder_v1] Set encoder.cond_feature_indices "
+                f"({len(cond_feature_indices)} Cond_* features)"
+            )
         else:
-            # Should not happen if encoder run saved a scaler, but guard anyway
-            from sklearn.preprocessing import StandardScaler
+            print(
+                "[decoder_v1] Warning: cond_feature_indices length does not match cond_in_dim; "
+                "continuous condition encoder will not use explicit Cond_* features."
+            )
 
-            print("[DecoderV1] Warning: scaler is None or invalid; fitting new global StandardScaler.")
-            scaler = StandardScaler().fit(train_df_fe[feature_cols].values)
+    # ------------------------------------------------------------------
+    # 4) Instantiate decoder
+    # ------------------------------------------------------------------
+    latent_dim = getattr(encoder, "d_model", None)
+    if latent_dim is None:
+        raise RuntimeError("Encoder is missing attribute d_model (expected Transformer encoder).")
 
-        train_df_fe[feature_cols] = scaler.transform(train_df_fe[feature_cols])
-        test_df_fe[feature_cols] = scaler.transform(test_df_fe[feature_cols])
-    
-    # Build sequences
-    seq_len = 30
-    print(f"[DecoderV1] Building sequences (T={seq_len})...")
-    
-    train_X, train_y, train_units, train_conds, _ = build_full_eol_sequences_from_df(
-        train_df_fe, feature_cols, sequence_length=seq_len, 
-        target_col="RUL", 
-        return_tensor=True,
-        pad_sequences=True,
-        cond_col="ConditionID"
-    )
-    
-    test_X, test_y, test_units, test_conds, _ = build_full_eol_sequences_from_df(
-        test_df_fe, feature_cols, sequence_length=seq_len,
-        target_col="RUL",
-        return_tensor=True,
-        pad_sequences=True,
-        cond_col="ConditionID"
-    )
-    
-    # DataLoaders
-    class SimpleDataset(torch.utils.data.Dataset):
-        def __init__(self, X, y, conds=None):
-            self.X = X
-            self.y = y
-            self.conds = conds
-        def __len__(self):
-            return len(self.X)
-        def __getitem__(self, idx):
-            item = {"features": self.X[idx], "rul": self.y[idx]}
-            if self.conds is not None:
-                item["cond_ids"] = self.conds[idx]
-            return item
-
-    train_dataset = SimpleDataset(train_X, train_y, train_conds)
-    val_dataset = SimpleDataset(test_X, test_y, test_conds)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
-    # 3. Initialize Decoder
-    latent_dim = encoder_model.d_model
     decoder = RULTrajectoryDecoderV1(
         latent_dim=latent_dim,
         hidden_dim=128,
         num_layers=2,
-        dropout=0.1
-    ).to(device)
-    
-    optimizer = torch.optim.Adam(decoder.parameters(), lr=lr, weight_decay=weight_decay)
-    
-    # 4. Training Loop
-    print(f"[DecoderV1] Starting training for {epochs} epochs...")
+        dropout=0.1,
+    ).to(device_t)
+
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=5,
+        min_lr=1e-6,
+    )
+
+    # ------------------------------------------------------------------
+    # 5) Training loop
+    # ------------------------------------------------------------------
     best_val_rmse = float("inf")
-    
-    for epoch in range(epochs):
+    best_state = None
+
+    for epoch in range(1, epochs + 1):
         decoder.train()
-        train_loss_total = 0.0
-        
+        train_losses = []
+
         for batch in train_loader:
-            x = batch["features"].to(device)
-            rul_last = batch["rul"].to(device)
-            rul_last = torch.clamp(rul_last, 0, 125.0)
-            
-            cond_ids = batch.get("cond_ids", None)
-            if cond_ids is not None: cond_ids = cond_ids.to(device)
-            
-            with torch.no_grad():
-                z_seq, _, hi_damage_seq = encoder_model.encode_with_hi(
-                    x, cond_ids=cond_ids
+            health_phys_seq_batch = None
+            if len(batch) == 5:
+                X_batch, y_batch, unit_ids_batch, cond_ids_batch, health_phys_seq_batch = batch
+            elif len(batch) == 4:
+                X_batch, y_batch, unit_ids_batch, cond_ids_batch = batch
+            elif len(batch) == 3:
+                X_batch, y_batch, unit_ids_batch = batch
+                cond_ids_batch = torch.zeros(len(y_batch), dtype=torch.int64)
+            else:
+                X_batch, y_batch = batch
+                unit_ids_batch = torch.zeros(len(y_batch), dtype=torch.int64)
+                cond_ids_batch = torch.zeros(len(y_batch), dtype=torch.int64)
+
+            X_batch = X_batch.to(device_t)
+            y_batch = y_batch.to(device_t)
+            cond_ids_batch = cond_ids_batch.to(device_t)
+
+            if health_phys_seq_batch is not None:
+                hi_phys_batch = health_phys_seq_batch.to(device_t)
+            else:
+                # If physics HI is unavailable, use ones (healthy) as a neutral baseline
+                hi_phys_batch = torch.ones(
+                    X_batch.size(0), X_batch.size(1), device=device_t, dtype=X_batch.dtype
                 )
-            
-            T = x.size(1)
-            rul_target_seq = build_rul_seq_from_last(rul_last, T)
-            rul_target_seq = torch.clamp(rul_target_seq, 0, 125.0)
-            
-            rul_pred_seq = decoder(z_seq, hi_phys_seq=None, hi_damage_seq=hi_damage_seq)
-            
-            traj_loss = F.mse_loss(rul_pred_seq, rul_target_seq)
-            eol_loss = F.mse_loss(rul_pred_seq[:, -1], rul_last)
-            
-            # Monotonicity: RUL should decrease. diff = R(t+1) - R(t) should be negative.
-            # If diff > 0, penalize.
-            diffs = rul_pred_seq[:, 1:] - rul_pred_seq[:, :-1]
-            mono_loss = torch.relu(diffs).mean() 
-            
-            loss = traj_loss + 0.5 * eol_loss + 0.1 * mono_loss
-            
+
             optimizer.zero_grad()
+
+            with torch.no_grad():
+                z_seq, _, hi_damage_seq = encoder.encode_with_hi(
+                    X_batch,
+                    cond_ids=cond_ids_batch,
+                    cond_vec=None,
+                )
+
+            # Build RUL trajectory target
+            T = X_batch.size(1)
+            rul_target_seq = build_rul_seq_from_last(y_batch, T)  # [B, T]
+
+            # Decoder forward
+            rul_pred_seq = decoder(z_seq, hi_phys_batch, hi_damage_seq)  # [B, T]
+
+            # Loss components
+            traj_loss = torch.mean((rul_pred_seq - rul_target_seq) ** 2)
+            eol_pred = rul_pred_seq[:, -1]
+            eol_loss = torch.mean((eol_pred - y_batch) ** 2)
+
+            diffs = rul_pred_seq[:, 1:] - rul_pred_seq[:, :-1]
+            mono_violation = torch.relu(-diffs)  # penalize decreasing RUL
+            mono_loss = mono_violation.mean()
+
+            loss = traj_loss + 0.5 * eol_loss + 0.1 * mono_loss
             loss.backward()
             optimizer.step()
-            
-            train_loss_total += loss.item()
-            
-        avg_train_loss = train_loss_total / len(train_loader)
-        
-        # Validation
-        decoder.eval()
-        val_mse = 0.0
-        val_mae = 0.0
-        batches = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                x = batch["features"].to(device)
-                rul_last = batch["rul"].to(device)
-                rul_last = torch.clamp(rul_last, 0, 125.0)
-                cond_ids = batch.get("cond_ids", None)
-                if cond_ids is not None: cond_ids = cond_ids.to(device)
-                
-                z_seq, _, hi_damage_seq = encoder_model.encode_with_hi(
-                    x, cond_ids=cond_ids
-                )
-                
-                rul_pred_seq = decoder(z_seq, hi_phys_seq=None, hi_damage_seq=hi_damage_seq)
-                eol_pred = rul_pred_seq[:, -1]
-                
-                val_mse += F.mse_loss(eol_pred, rul_last, reduction='sum').item()
-                val_mae += F.l1_loss(eol_pred, rul_last, reduction='sum').item()
-                batches += x.size(0)
-        
-        val_rmse = math.sqrt(val_mse / batches)
-        val_mae_avg = val_mae / batches
-        
-        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val RMSE: {val_rmse:.4f} | Val MAE: {val_mae_avg:.4f}")
-        
+
+            train_losses.append(float(loss.item()))
+
+        mean_train_loss = float(np.mean(train_losses)) if train_losses else math.nan
+
+        # ------------------------------------------------------------------
+        # Validation (EOL metrics)
+        # ------------------------------------------------------------------
+        val_metrics = evaluate_decoder_eol(encoder, decoder, val_loader, device_t)
+        val_rmse = float(val_metrics["rmse"])
+        scheduler.step(val_rmse)
+
+        print(
+            f"[decoder_v1][Epoch {epoch:03d}] "
+            f"train_loss={mean_train_loss:.4f}, "
+            f"val_rmse={val_rmse:.3f}, "
+            f"val_mae={val_metrics['mae']:.3f}, "
+            f"val_bias={val_metrics['bias']:.3f}, "
+            f"val_r2={val_metrics['r2']:.3f}"
+        )
+
         if val_rmse < best_val_rmse:
             best_val_rmse = val_rmse
-            torch.save(decoder.state_dict(), results_dir / "decoder_v1_best.pt")
-            print("  -> Saved best model")
+            best_state = decoder.state_dict()
 
-    print("[DecoderV1] Training finished.")
-    
-    # Final Metrics
+    if best_state is None:
+        raise RuntimeError("[decoder_v1] Training finished without any valid epochs.")
+
+    # Restore best decoder state
+    decoder.load_state_dict(best_state)
+
+    # ------------------------------------------------------------------
+    # 6) Final evaluation on validation + test
+    # ------------------------------------------------------------------
+    final_val_metrics = evaluate_decoder_eol(encoder, decoder, val_loader, device_t)
+    final_test_metrics = evaluate_decoder_on_test(
+        encoder,
+        decoder,
+        X_test_scaled.to(device_t),
+        y_test_true.to(device_t),
+        unit_ids_test,
+        cond_ids_test,
+        device_t,
+    )
+
+    # ------------------------------------------------------------------
+    # 7) Save decoder + summary + simple plots
+    # ------------------------------------------------------------------
+    DECODER_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    decoder_ckpt_path = DECODER_RESULTS_DIR / "decoder_v1_best.pt"
+    torch.save(
+        {
+            "state_dict": best_state,
+            "meta": {
+                "encoder_experiment": EXPERIMENT_NAME_V3D,
+                "dataset": DATASET_NAME,
+                "latent_dim": latent_dim,
+            },
+        },
+        decoder_ckpt_path,
+    )
+    print(f"[decoder_v1] Saved best decoder checkpoint to {decoder_ckpt_path}")
+
     summary = {
-        "experiment_name": experiment_name,
-        "dataset": dataset_name,
-        "encoder_experiment": config.get("encoder_experiment", "unknown"),
-        "best_val_rmse": best_val_rmse,
+        "dataset": DATASET_NAME,
+        "encoder_experiment": EXPERIMENT_NAME_V3D,
+        "results_dir_encoder": str(ENCODER_EXPERIMENT_DIR),
+        "decoder_results_dir": str(DECODER_RESULTS_DIR),
+        "training": {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "best_val_rmse": best_val_rmse,
+        },
+        "val_metrics": {
+            "rmse": final_val_metrics["rmse"],
+            "mae": final_val_metrics["mae"],
+            "bias": final_val_metrics["bias"],
+            "r2": final_val_metrics["r2"],
+            "nasa_mean": final_val_metrics["nasa_mean"],
+            "nasa_sum": final_val_metrics["nasa_sum"],
+            "num_engines": final_val_metrics["num_engines"],
+        },
         "test_metrics": {
-            "rmse": best_val_rmse, # Approximate
-            "mae": val_mae_avg,
-            "bias": 0.0, # Not computed
-            "r2": 0.0, # Not computed
-            "nasa_mean": 0.0, # Not computed
-            "nasa_sum": 0.0,
-            "num_engines": len(test_y)
-        }
+            "rmse": final_test_metrics["rmse"],
+            "mae": final_test_metrics["mae"],
+            "bias": final_test_metrics["bias"],
+            "r2": final_test_metrics["r2"],
+            "nasa_mean": final_test_metrics["nasa_mean"],
+            "nasa_sum": final_test_metrics["nasa_sum"],
+            "num_engines": final_test_metrics["num_engines"],
+        },
     }
-    with open(results_dir / "summary.json", "w") as f:
-        json.dump(summary, f, indent=4)
-        
-    print(f"[DecoderV1] Saved summary to {results_dir / 'summary.json'}")
-    return summary
+
+    summary_path = DECODER_RESULTS_DIR / "summary_decoder_v1.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[decoder_v1] Saved summary to {summary_path}")
+
+    # Simple plots (error histogram + true-vs-pred) using matplotlib
+    try:
+        import matplotlib.pyplot as plt  # type: ignore[import]
+
+        # Error histogram (test)
+        errors = (
+            np.asarray(final_test_metrics["errors"], dtype=np.float32)
+            if "errors" in final_test_metrics
+            else None
+        )
+        if errors is not None:
+            plt.figure(figsize=(6, 4))
+            plt.hist(errors, bins=30, alpha=0.8, color="tab:blue")
+            plt.xlabel("Prediction Error (pred - true) [cycles]")
+            plt.ylabel("Count")
+            plt.title("Decoder v1: Test EOL Error Histogram")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            hist_path = DECODER_RESULTS_DIR / "error_hist_decoder_v1.png"
+            plt.savefig(hist_path)
+            plt.close()
+            print(f"[decoder_v1] Saved error histogram to {hist_path}")
+
+        # True vs predicted (test)
+        # We re-construct y_true/y_pred arrays from metrics dict
+        # if available; otherwise recompute quickly.
+        if "errors" in final_test_metrics:
+            # errors = y_pred - y_true
+            errs = np.asarray(final_test_metrics["errors"], dtype=np.float32)
+            # NASA helper returns capped predictions; we approximate y_true from rmse info
+            # but for plotting we can recompute quickly:
+            # NOTE: For simplicity, recompute using compute_eol_errors_and_nasa if needed.
+            pass
+
+        # Minimal recomputation for plotting
+        # Note: we already have y_true_eol and y_pred_eol as numpy arrays above.
+        # Recompute here for clarity.
+        encoder.eval()
+        decoder.eval()
+        with torch.no_grad():
+            Xb = X_test_scaled.to(device_t)
+            cb = cond_ids_test.to(device_t)
+            z_seq_b, _, hi_dmg_b = encoder.encode_with_hi(Xb, cond_ids=cb, cond_vec=None)
+            hi_phys_b = torch.zeros_like(hi_dmg_b, device=device_t)
+            rul_seq_b = decoder(z_seq_b, hi_phys_b, hi_dmg_b)
+            eol_pred_b = rul_seq_b[:, -1]
+
+        y_true_plot = y_test_true.cpu().numpy().astype(np.float32)
+        y_pred_plot = eol_pred_b.cpu().numpy().astype(np.float32)
+
+        plt.figure(figsize=(5, 5))
+        plt.scatter(y_true_plot, y_pred_plot, s=12, alpha=0.7, edgecolor="none")
+        max_val = float(max(y_true_plot.max(), y_pred_plot.max(), 1.0))
+        plt.plot([0, max_val], [0, max_val], "k--", linewidth=1.0)
+        plt.xlabel("True RUL (cycles)")
+        plt.ylabel("Predicted RUL (cycles)")
+        plt.title("Decoder v1: True vs Predicted RUL (Test EOL)")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        scatter_path = DECODER_RESULTS_DIR / "true_vs_pred_decoder_v1.png"
+        plt.savefig(scatter_path)
+        plt.close()
+        print(f"[decoder_v1] Saved true-vs-pred scatter to {scatter_path}")
+    except ImportError:
+        print("[decoder_v1] matplotlib not available; skipping plots.")
 
 
 if __name__ == "__main__":
-    # Standalone usage with hardcoded config matching v3d config
-    from src.experiment_configs import get_fd004_decoder_v1_from_encoder_v3d_config
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser = argparse.ArgumentParser(description="Train RUL Trajectory Decoder v1 on FD004/v3d encoder.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use: 'cuda', 'cpu', or 'auto'")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=256, help="Batch size for training")
     args = parser.parse_args()
-    
-    config = get_fd004_decoder_v1_from_encoder_v3d_config()
-    # Override epochs
-    if args.epochs:
-        config["training_params"]["num_epochs"] = args.epochs
-        
-    train_rul_decoder_v1(config, device=torch.device(args.device))
+
+    train_rul_decoder_v1(device=args.device, epochs=args.epochs, batch_size=args.batch_size)
+
+

@@ -313,40 +313,7 @@ def load_model_from_experiment(
             cond_emb_dim = state_dict["encoder.cond_emb.weight"].shape[1]
     
     # Handle different encoder types
-    if encoder_type == "decoder_v1":
-        from src.models.rul_decoder import RULTrajectoryDecoderV1, DecoderV1Wrapper
-        
-        encoder_checkpoint = config.get("encoder_checkpoint")
-        if not encoder_checkpoint:
-             # Try to infer relative to experiment dir if not absolute
-             # But usually it is full path in config
-             raise ValueError("encoder_checkpoint missing in config for decoder_v1")
-             
-        print(f"Loading frozen encoder from {encoder_checkpoint}...")
-        # Recursive call to load encoder
-        encoder_model, enc_config, _ = reconstruct_model_from_checkpoint(encoder_checkpoint, device=device)
-        encoder_model.eval()
-        latent_dim = getattr(encoder_model, "d_model", 64)
-        
-        # Init decoder
-        decoder = RULTrajectoryDecoderV1(
-            latent_dim=latent_dim,
-            hidden_dim=128,
-            num_layers=2,
-            dropout=0.1
-        )
-        
-        # Load decoder weights
-        # Check if state_dict is directly the dict or wrapped
-        if isinstance(state_dict, dict) and "state_dict" in state_dict:
-             decoder.load_state_dict(state_dict["state_dict"])
-        else:
-             decoder.load_state_dict(state_dict)
-             
-        model = DecoderV1Wrapper(encoder_model, decoder)
-        model.to(device)
-        
-    elif encoder_type == "world_model_universal_v3":
+    if encoder_type == "world_model_universal_v3":
         # World Model v3 with Health Index head
         from src.models.world_model import WorldModelUniversalV3
         
@@ -907,50 +874,6 @@ def load_model_from_experiment(
     model.eval()
     
     return model, config
-
-
-def reconstruct_model_from_checkpoint(
-    checkpoint_path: str | Path,
-    device: torch.device | str = "cpu",
-) -> Tuple[nn.Module, dict, object]:
-    """
-    Lightweight helper to reconstruct a model + config + scaler from a single
-    checkpoint file path.
-
-    This exists primarily for backwards compatibility with utilities that were
-    written before the more general `load_model_from_experiment` helper.
-
-    Args:
-        checkpoint_path: Full path to a `.pt` checkpoint file
-        device: Device to load the model onto
-
-    Returns:
-        model: Loaded PyTorch model (on `device`)
-        config: Configuration dictionary (from `summary.json` if available)
-        scaler: Loaded scaler object from `scaler.pkl` if present, else None
-    """
-    checkpoint_path = Path(checkpoint_path)
-    experiment_dir = checkpoint_path.parent
-
-    # Re‑use the robust logic in load_model_from_experiment. It will:
-    # - read summary.json
-    # - pick the best/best-v3 checkpoint in the directory
-    # - reconstruct the correct architecture
-    model, config = load_model_from_experiment(experiment_dir, device=device)
-
-    # Try to load scaler (if present)
-    scaler = None
-    scaler_path = experiment_dir / "scaler.pkl"
-    if scaler_path.exists():
-        try:
-            import pickle
-
-            with open(scaler_path, "rb") as f:
-                scaler = pickle.load(f)
-        except Exception as e:
-            print(f"[WARNING] Could not load scaler from {scaler_path}: {e}")
-
-    return model, config, scaler
 
 
 def rebuild_scaler_from_training_data(
