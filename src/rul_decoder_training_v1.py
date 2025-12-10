@@ -122,10 +122,16 @@ def train_rul_decoder_v1(config: Dict[str, Any], device: torch.device) -> Dict[s
     # 2) Continuous condition vector
     if phys_features_cfg.get("use_condition_vector", False):
         train_df_fe = build_condition_features(
-            train_df_fe, "UnitNumber", "TimeInCycles", version=phys_features_cfg.get("condition_vector_version", 2)
+            train_df_fe,
+            unit_col="UnitNumber",
+            cycle_col="TimeInCycles",
+            version=phys_features_cfg.get("condition_vector_version", 2),
         )
         test_df_fe = build_condition_features(
-            test_df_fe, "UnitNumber", "TimeInCycles", version=phys_features_cfg.get("condition_vector_version", 2)
+            test_df_fe,
+            unit_col="UnitNumber",
+            cycle_col="TimeInCycles",
+            version=phys_features_cfg.get("condition_vector_version", 2),
         )
     
     # 3) Digital twin residuals
