@@ -552,7 +552,7 @@ def build_eval_data(
     feature_cols, _ = remove_rul_leakage(feature_cols)
     
     # Build full EOL sequences from train data (for scaler fitting)
-    X_full, y_full, unit_ids_full, cond_ids_full = build_full_eol_sequences_from_df(
+    result = build_full_eol_sequences_from_df(
         df=df_train_fe,
         feature_cols=feature_cols,
         past_len=past_len,

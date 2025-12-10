@@ -267,6 +267,22 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             rul_col="RUL",
             alpha_hybrid=0.7,
         )
+    
+    # For damage_v2 experiments: add HI_phys_v2 using the simpler per-row computation
+    # This creates a time-resolved HI_phys_seq target for training the damage head
+    experiment_name = config.get("experiment_name", "")
+    if "damage_v2" in experiment_name.lower():
+        print("  Computing HI_phys_v2 for damage_v2 experiment (time-resolved target)")
+        from src.hi_phys_targets import add_hi_phys_v2
+        df_train = add_hi_phys_v2(
+            df_train,
+            unit_col="UnitNumber",
+            time_col="TimeInCycles",
+            hpc_eff_col="Effizienz_HPC_Proxy",
+            egt_drift_col="EGT_Drift",
+            residual_prefix="Resid_",
+            baseline_len=30,
+        )
 
     feature_cols = [
         c for c in df_train.columns
@@ -568,7 +584,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     past_len = 30
     max_rul = 125
     
-    X_full, y_full, unit_ids_full, cond_ids_full = build_full_eol_sequences_from_df(
+    X_full, y_full, unit_ids_full, cond_ids_full, health_phys_seq_full = build_full_eol_sequences_from_df(
         df=df_train,
         feature_cols=feature_cols,
         past_len=past_len,
@@ -595,6 +611,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         y=y_full,
         unit_ids=unit_ids_full,
         cond_ids=cond_ids_full,
+        health_phys_seq=health_phys_seq_full,
         batch_size=config['training_params']['batch_size'],
         engine_train_ratio=config['training_params']['engine_train_ratio'],
         shuffle_engines=config['training_params']['shuffle_engines'],

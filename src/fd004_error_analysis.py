@@ -573,7 +573,7 @@ def analyze_experiment_fd004(
     from sklearn.preprocessing import StandardScaler
     
     # Build training sequences to fit scaler
-    X_train_full, _, unit_ids_train_full, cond_ids_train_full = build_full_eol_sequences_from_df(
+    result = build_full_eol_sequences_from_df(
         df=df_train,
         feature_cols=feature_cols,
         past_len=past_len,
@@ -583,6 +583,8 @@ def analyze_experiment_fd004(
         rul_col="RUL",
         cond_col="ConditionID",
     )
+    X_train_full, _, unit_ids_train_full, cond_ids_train_full = result[:4]
+    health_phys_seq_train_full = result[4] if len(result) > 4 else None
     
     # Use condition-wise scaling (standard for FD002/FD004)
     use_condition_wise = dataset_name in ["FD002", "FD004"]

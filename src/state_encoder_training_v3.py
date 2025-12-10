@@ -104,7 +104,7 @@ def build_state_encoder_dataloaders_fd004(cfg: SimpleNamespace):
     max_rul = float(cfg.data.max_rul)
 
     # Build full EOL-style sliding windows (like EOL encoder / diagnostics)
-    X_full, y_rul_full, unit_ids_full, cond_ids_full = build_full_eol_sequences_from_df(
+    result = build_full_eol_sequences_from_df(
         df=df_train,
         feature_cols=feature_cols,
         past_len=past_len,
@@ -114,6 +114,8 @@ def build_state_encoder_dataloaders_fd004(cfg: SimpleNamespace):
         rul_col="RUL",
         cond_col="ConditionID",
     )
+    X_full, y_rul_full, unit_ids_full, cond_ids_full = result[:4]
+    health_phys_seq_full = result[4] if len(result) > 4 else None
 
     # Engine-based train/val split
     (X_tr, y_rul_tr, cond_ids_tr), (X_val, y_rul_val, cond_ids_val) = _engine_based_split(

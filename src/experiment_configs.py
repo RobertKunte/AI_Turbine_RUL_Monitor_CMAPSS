@@ -1195,6 +1195,38 @@ def get_fd004_state_encoder_v3_physics_C3_msdt_rulonly_config() -> ExperimentCon
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v2_config() -> ExperimentConfig:
+    """
+    FD004 ms+DT EOLFullTransformerEncoder with cumulative DamageHead,
+    trained against a physics-based HI_phys_v2 trajectory (HI_phys_seq).
+
+    This is an evolution of _damage_v1:
+      - same ms_dt_v2 feature pipeline,
+      - same EOL losses,
+      - PLUS: stronger supervision of the damage head on HI_phys_seq.
+    """
+    base = get_fd004_transformer_encoder_ms_dt_v2_config()
+    cfg: ExperimentConfig = copy.deepcopy(base)
+
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v2"
+
+    enc_kwargs = cfg.setdefault("encoder_kwargs", {})
+    enc_kwargs["use_damage_head"] = True
+    enc_kwargs.setdefault("damage_L_ref", 300.0)  # Note: parameter name is damage_L_ref in model
+    enc_kwargs.setdefault("damage_alpha_base", 0.1)  # Note: parameter name is damage_alpha_base in model
+    enc_kwargs.setdefault("damage_hidden_dim", 64)
+
+    loss_params = cfg.setdefault("loss_params", {})
+    # Keep existing RUL + standard HI weights, but reduce standard HI a bit
+    loss_params["rul_weight"] = loss_params.get("rul_weight", 1.0)
+    loss_params["health_loss_weight"] = loss_params.get("health_loss_weight", 0.1)
+    # New: physics-based damage HI weight (stronger, main supervision for damage head)
+    loss_params["damage_hi_weight"] = 1.0
+
+    # keep mono_late_weight, mono_global_weight, etc. as in base config
+    return cfg
+
+
 def get_fd004_state_encoder_v3_damage_msdt_v1_config() -> ExperimentConfig:
     """
     FD004 – State Encoder V3 with cumulative damage head (ms+DT v2 features).
@@ -2663,6 +2695,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_state_encoder_v3_physics_C3_msdt_rulonly_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v1":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v1_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v2":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v2_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":

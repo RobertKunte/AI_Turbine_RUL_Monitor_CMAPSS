@@ -126,7 +126,7 @@ def build_state_encoder_dataloaders_fd004_physics(cfg: SimpleNamespace):
     max_rul = float(cfg.data.max_rul)
 
     # Build full sliding windows (no scaling here; we rely on engineered features only)
-    X_full, y_rul_full, unit_ids_full, cond_ids_full = build_full_eol_sequences_from_df(
+    result = build_full_eol_sequences_from_df(
         df=df_train,
         feature_cols=feature_cols,
         past_len=past_len,

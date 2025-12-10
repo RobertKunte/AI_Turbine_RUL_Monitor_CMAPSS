@@ -330,7 +330,7 @@ def main(
     
     # Build sequences
     print(f"[{dataset}] Building sequences...")
-    X_full, y_full, unit_ids_full, cond_ids_full = build_full_eol_sequences_from_df(
+    result = build_full_eol_sequences_from_df(
         df=df_train,
         feature_cols=feature_cols,
         past_len=30,
@@ -338,7 +338,10 @@ def main(
         unit_col="UnitNumber",
         cycle_col="TimeInCycles",
         rul_col="RUL",
+        cond_col="ConditionID",
     )
+    X_full, y_full, unit_ids_full, cond_ids_full = result[:4]
+    health_phys_seq_full = result[4] if len(result) > 4 else None
     
     # Create dataloader (use full dataset for analysis)
     print(f"[{dataset}] Creating dataloader...")

@@ -38,7 +38,7 @@ def build_full_eol_sequences_from_df(
     cycle_col: str = "TimeInCycles",
     rul_col: str = "RUL",
     cond_col: str = "ConditionID",
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Baut Sliding-Window-Sequenzen über die KOMPLETTE Lebensdauer jeder Engine.
 
@@ -47,6 +47,7 @@ def build_full_eol_sequences_from_df(
       - laufe t = past_len .. T
       - X_seq = Features[t-past_len:t, :]
       - y_seq = min(RUL_t, max_rul)
+      - health_phys_seq = HI_phys_v2[t-past_len:t] (if available)
 
     Args:
         df: DataFrame mit mindestens feature_cols, unit_col, cycle_col, rul_col
@@ -56,19 +57,25 @@ def build_full_eol_sequences_from_df(
         unit_col: Name der Unit/Engine-Spalte
         cycle_col: Name der Cycle/Time-Spalte
         rul_col: Name der RUL-Spalte
+        cond_col: Name der Condition-Spalte
 
     Returns:
         X: FloatTensor [N, past_len, num_features] - Input-Sequenzen
         y: FloatTensor [N] - RUL-Targets (gecappt auf max_rul)
         unit_ids: IntTensor [N] - Unit-IDs für jedes Sample
         cond_ids: IntTensor [N] - Condition-IDs für jedes Sample
+        health_phys_seq: Optional[FloatTensor [N, past_len]] - HI_phys_v2 sequences (None if not available)
     """
     X_list = []
     y_list = []
     unit_id_list = []
     cond_id_list = []
+    health_phys_seq_list = []
 
     unit_ids = df[unit_col].unique()
+    
+    # Check if HI_phys_v2 column exists
+    has_hi_phys_v2 = "HI_phys_v2" in df.columns
 
     print("============================================================")
     print("[build_full_eol_sequences_from_df] Summary")
@@ -107,6 +114,12 @@ def build_full_eol_sequences_from_df(
 
         values = df_u[feature_cols].to_numpy(dtype=np.float32)
         rul_values = df_u[rul_col].to_numpy(dtype=np.float32)
+        
+        # Extract HI_phys_v2 if available
+        if has_hi_phys_v2:
+            hi_phys_values = df_u["HI_phys_v2"].to_numpy(dtype=np.float32)
+        else:
+            hi_phys_values = None
 
         # Sliding window über den gesamten Lebenslauf
         for i in range(past_len - 1, len(df_u)):
@@ -118,6 +131,11 @@ def build_full_eol_sequences_from_df(
             y_list.append(rul_capped)
             unit_id_list.append(uid)
             cond_id_list.append(cond_id)
+            
+            # Extract HI_phys_v2 sequence for this window
+            if has_hi_phys_v2 and hi_phys_values is not None:
+                hi_phys_window = hi_phys_values[i - past_len + 1 : i + 1]  # [past_len]
+                health_phys_seq_list.append(hi_phys_window)
 
     if len(X_list) == 0:
         raise ValueError(
@@ -129,8 +147,16 @@ def build_full_eol_sequences_from_df(
     y = torch.from_numpy(np.array(y_list, dtype=np.float32))  # [N]
     unit_ids_tensor = torch.from_numpy(np.array(unit_id_list, dtype=np.int32))  # [N]
     cond_ids_tensor = torch.from_numpy(np.array(cond_id_list, dtype=np.int64))  # [N]
+    
+    # Build health_phys_seq if available
+    if health_phys_seq_list and len(health_phys_seq_list) > 0:
+        health_phys_seq = torch.from_numpy(np.stack(health_phys_seq_list))  # [N, past_len]
+        print(f"X shape: {X.shape}, y shape: {y.shape}, unit_ids shape: {unit_ids_tensor.shape}, cond_ids shape: {cond_ids_tensor.shape}, health_phys_seq shape: {health_phys_seq.shape}")
+    else:
+        health_phys_seq = None
+        print(f"X shape: {X.shape}, y shape: {y.shape}, unit_ids shape: {unit_ids_tensor.shape}, cond_ids shape: {cond_ids_tensor.shape}, health_phys_seq: None")
 
-    print(f"X shape: {X.shape}, y shape: {y.shape}, unit_ids shape: {unit_ids_tensor.shape}, cond_ids shape: {cond_ids_tensor.shape}")
+    return X, y, unit_ids_tensor, cond_ids_tensor, health_phys_seq
     print(
         f"RUL stats (capped at {max_rul}): min={y.min().item():.2f}, "
         f"max={y.max().item():.2f}, mean={y.mean().item():.2f}, "
@@ -146,20 +172,30 @@ def build_full_eol_sequences_from_df(
 
 class SequenceDatasetWithUnits:
     """Dataset that includes unit_ids and condition_ids for each sample."""
-    def __init__(self, X: torch.Tensor, y: torch.Tensor, unit_ids: torch.Tensor, cond_ids: torch.Tensor = None):
+    def __init__(
+        self, 
+        X: torch.Tensor, 
+        y: torch.Tensor, 
+        unit_ids: torch.Tensor, 
+        cond_ids: torch.Tensor = None,
+        health_phys_seq: Optional[torch.Tensor] = None,
+    ):
         self.X = X
         self.y = y
         self.unit_ids = unit_ids
         self.cond_ids = cond_ids if cond_ids is not None else torch.zeros(len(unit_ids), dtype=torch.int64)
+        self.health_phys_seq = health_phys_seq
 
     def __len__(self):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
+        items = [self.X[idx], self.y[idx], self.unit_ids[idx]]
         if self.cond_ids is not None:
-            return self.X[idx], self.y[idx], self.unit_ids[idx], self.cond_ids[idx]
-        else:
-            return self.X[idx], self.y[idx], self.unit_ids[idx]
+            items.append(self.cond_ids[idx])
+        if self.health_phys_seq is not None:
+            items.append(self.health_phys_seq[idx])
+        return tuple(items)
 
 
 def build_test_sequences_from_df(
@@ -458,6 +494,7 @@ def create_full_dataloaders(
     y: torch.Tensor,
     unit_ids: torch.Tensor,
     cond_ids: torch.Tensor = None,
+    health_phys_seq: Optional[torch.Tensor] = None,
     batch_size: int = 256,
     engine_train_ratio: float = 0.8,
     shuffle_engines: bool = True,
@@ -525,6 +562,10 @@ def create_full_dataloaders(
     X_val = X[val_mask]
     y_val = y[val_mask]
     cond_ids_val = cond_ids[val_mask]
+    
+    # Split health_phys_seq if available
+    health_phys_seq_train = health_phys_seq[train_mask] if health_phys_seq is not None else None
+    health_phys_seq_val = health_phys_seq[val_mask] if health_phys_seq is not None else None
 
     # Feature-Scaling: Fit nur auf Train-Daten
     N_train, past_len, num_features = X_train.shape
@@ -611,8 +652,8 @@ def create_full_dataloaders(
     train_unit_ids_samples = unit_ids[train_mask]
     val_unit_ids_samples = unit_ids[val_mask]
 
-    train_dataset = SequenceDatasetWithUnits(X_train_scaled, y_train, train_unit_ids_samples, cond_ids_train)
-    val_dataset = SequenceDatasetWithUnits(X_val_scaled, y_val, val_unit_ids_samples, cond_ids_val)
+    train_dataset = SequenceDatasetWithUnits(X_train_scaled, y_train, train_unit_ids_samples, cond_ids_train, health_phys_seq=health_phys_seq_train)
+    val_dataset = SequenceDatasetWithUnits(X_val_scaled, y_val, val_unit_ids_samples, cond_ids_val, health_phys_seq=health_phys_seq_val)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -1440,14 +1481,27 @@ def train_eol_full_lstm(
         } if use_health_head else None
 
         for batch in train_loader:
-            if len(batch) == 4:  # SequenceDatasetWithUnits with cond_ids
+            # Handle different batch formats:
+            # - 5 elements: X, y, unit_ids, cond_ids, health_phys_seq
+            # - 4 elements: X, y, unit_ids, cond_ids
+            # - 3 elements: X, y, unit_ids
+            # - 2 elements: X, y (fallback)
+            health_phys_seq_batch = None
+            if len(batch) == 5:
+                X_batch, y_batch, _, cond_ids_batch, health_phys_seq_batch = batch
+            elif len(batch) == 4:  # SequenceDatasetWithUnits with cond_ids
                 X_batch, y_batch, _, cond_ids_batch = batch
+                cond_ids_batch = cond_ids_batch.to(device)
             elif len(batch) == 3:  # SequenceDatasetWithUnits without cond_ids (backward compat)
                 X_batch, y_batch, _ = batch
                 cond_ids_batch = torch.zeros(len(y_batch), dtype=torch.int64, device=device)
             else:  # Fallback für TensorDataset
                 X_batch, y_batch = batch
                 cond_ids_batch = torch.zeros(len(y_batch), dtype=torch.int64, device=device)
+            
+            # Move health_phys_seq to device if present
+            if health_phys_seq_batch is not None:
+                health_phys_seq_batch = health_phys_seq_batch.to(device)
             
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
@@ -1554,17 +1608,24 @@ def train_eol_full_lstm(
                             and hasattr(model, "damage_head")
                             and getattr(model, "damage_head", None) is not None
                         ):
-                            # Analytic HI target sequence from RUL sequence
-                            rul_seq_clamped = torch.clamp(rul_seq_batch, 0.0, float(max_rul))
-                            hi_target_seq = torch.ones_like(rul_seq_clamped)
-                            mask_eol = rul_seq_clamped <= float(HI_EOL_THRESH)
-                            mask_plateau = rul_seq_clamped >= float(hi_plateau_threshold)
-                            mask_mid = (~mask_eol) & (~mask_plateau)
-                            denom = max(hi_plateau_threshold - float(HI_EOL_THRESH), 1e-6)
-                            hi_target_seq[mask_eol] = 0.0
-                            hi_target_seq[mask_mid] = (
-                                (rul_seq_clamped[mask_mid] - float(HI_EOL_THRESH)) / denom
-                            ).clamp(0.0, 1.0)
+                            # Determine HI target sequence:
+                            # - If health_phys_seq_batch is available (damage_v2), use it directly
+                            # - Otherwise, compute from RUL (damage_v1 legacy behavior)
+                            if health_phys_seq_batch is not None:
+                                # damage_v2: use physics-based HI_phys_seq target
+                                hi_target_seq = health_phys_seq_batch  # [B, T]
+                            else:
+                                # damage_v1: compute analytic HI target from RUL sequence
+                                rul_seq_clamped = torch.clamp(rul_seq_batch, 0.0, float(max_rul))
+                                hi_target_seq = torch.ones_like(rul_seq_clamped)
+                                mask_eol = rul_seq_clamped <= float(HI_EOL_THRESH)
+                                mask_plateau = rul_seq_clamped >= float(hi_plateau_threshold)
+                                mask_mid = (~mask_eol) & (~mask_plateau)
+                                denom = max(hi_plateau_threshold - float(HI_EOL_THRESH), 1e-6)
+                                hi_target_seq[mask_eol] = 0.0
+                                hi_target_seq[mask_mid] = (
+                                    (rul_seq_clamped[mask_mid] - float(HI_EOL_THRESH)) / denom
+                                ).clamp(0.0, 1.0)
 
                             # Encoder latents for damage head
                             try:
@@ -1592,7 +1653,17 @@ def train_eol_full_lstm(
                                 hi_seq_damage, _, damage_seq_dbg, delta_damage_dbg = model.damage_head(
                                     enc_seq_dmg, cond_seq=cond_seq_dmg
                                 )
-                                damage_hi_loss = F.mse_loss(hi_seq_damage, hi_target_seq)
+                                
+                                # Align shapes if necessary (safety check)
+                                if hi_seq_damage.shape != hi_target_seq.shape:
+                                    T = min(hi_seq_damage.size(1), hi_target_seq.size(1))
+                                    hi_seq_damage_ = hi_seq_damage[:, :T]
+                                    hi_target_seq_ = hi_target_seq[:, :T]
+                                else:
+                                    hi_seq_damage_ = hi_seq_damage
+                                    hi_target_seq_ = hi_target_seq
+                                
+                                damage_hi_loss = F.mse_loss(hi_seq_damage_, hi_target_seq_)
                                 loss = loss + damage_hi_weight * damage_hi_loss
                                 
                                 # ====================================================================
@@ -1876,7 +1947,11 @@ def train_eol_full_lstm(
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_loader):
-                if len(batch) == 4:  # SequenceDatasetWithUnits with cond_ids
+                # Handle different batch formats (same as training)
+                health_phys_seq_batch = None
+                if len(batch) == 5:
+                    X_batch, y_batch, _, cond_ids_batch, health_phys_seq_batch = batch
+                elif len(batch) == 4:  # SequenceDatasetWithUnits with cond_ids
                     X_batch, y_batch, _, cond_ids_batch = batch
                 elif len(batch) == 3:  # SequenceDatasetWithUnits without cond_ids (backward compat)
                     X_batch, y_batch, _ = batch
@@ -1887,7 +1962,11 @@ def train_eol_full_lstm(
                 
                 X_batch = X_batch.to(device)
                 y_batch = y_batch.to(device)
-                cond_ids_batch = cond_ids_batch.to(device)
+                if cond_ids_batch is not None:
+                    cond_ids_batch = cond_ids_batch.to(device)
+                # Move health_phys_seq to device if present
+                if health_phys_seq_batch is not None:
+                    health_phys_seq_batch = health_phys_seq_batch.to(device)
 
                 if use_health_head:
                     # Phase 2: Pass cond_ids if condition embedding is enabled
@@ -2021,9 +2100,59 @@ def train_eol_full_lstm(
                     val_mono_global.append(mono_global.item())
                     val_smooth_hi_raw.append(smooth_hi_raw.item())
                     val_smooth_hi.append(smooth_hi.item())
+                    
+                    # Optional cumulative damage-based HI loss (Transformer encoder with damage head)
+                    val_damage_hi_loss_batch = torch.tensor(0.0, device=health_seq_flat.device)
+                    if (
+                        damage_hi_weight > 0.0
+                        and hasattr(model, "damage_head")
+                        and getattr(model, "damage_head", None) is not None
+                    ):
+                        # Determine HI target sequence (same logic as training)
+                        if health_phys_seq_batch is not None:
+                            hi_target_seq = health_phys_seq_batch  # [B, T]
+                        else:
+                            rul_seq_clamped = torch.clamp(rul_seq_batch, 0.0, float(max_rul))
+                            hi_target_seq = torch.ones_like(rul_seq_clamped)
+                            mask_eol = rul_seq_clamped <= float(HI_EOL_THRESH)
+                            mask_plateau = rul_seq_clamped >= float(hi_plateau_threshold)
+                            mask_mid = (~mask_eol) & (~mask_plateau)
+                            denom = max(hi_plateau_threshold - float(HI_EOL_THRESH), 1e-6)
+                            hi_target_seq[mask_eol] = 0.0
+                            hi_target_seq[mask_mid] = (
+                                (rul_seq_clamped[mask_mid] - float(HI_EOL_THRESH)) / denom
+                            ).clamp(0.0, 1.0)
+                        
+                        try:
+                            enc_seq_dmg, _ = model.encode(X_batch, cond_ids=cond_ids_batch, return_seq=True)
+                        except TypeError:
+                            enc_seq_dmg = None
+                        
+                        if enc_seq_dmg is not None:
+                            cond_seq_dmg = None
+                            if getattr(model, "use_cond_encoder", False) and getattr(model, "cond_in_dim", 0) > 0:
+                                if (
+                                    hasattr(model, "cond_feature_indices")
+                                    and model.cond_feature_indices is not None
+                                    and len(model.cond_feature_indices) == getattr(model, "cond_in_dim", 0)
+                                ):
+                                    cond_seq_dmg = X_batch[:, :, model.cond_feature_indices]
+                            
+                            hi_seq_damage, _, _, _ = model.damage_head(enc_seq_dmg, cond_seq=cond_seq_dmg)
+                            
+                            # Align shapes if necessary
+                            if hi_seq_damage.shape != hi_target_seq.shape:
+                                T = min(hi_seq_damage.size(1), hi_target_seq.size(1))
+                                hi_seq_damage_ = hi_seq_damage[:, :T]
+                                hi_target_seq_ = hi_target_seq[:, :T]
+                            else:
+                                hi_seq_damage_ = hi_seq_damage
+                                hi_target_seq_ = hi_target_seq
+                            
+                            val_damage_hi_loss_batch = F.mse_loss(hi_seq_damage_, hi_target_seq_)
+                    
+                    val_damage_hi_losses.append(val_damage_hi_loss_batch.item())
                     val_cond_losses.append(val_cond_losses[-1] if val_cond_losses else 0.0)
-                    # For damage HI we only track loss value (already appended via damage_hi_loss)
-                    # Aggregate below when computing history entries.
                     
                     val_preds.append(rul_pred.cpu())
                     val_health_preds.append(health_last.cpu())
