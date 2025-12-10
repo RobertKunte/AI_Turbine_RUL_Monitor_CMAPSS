@@ -290,11 +290,11 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     ]
     feature_cols, _ = remove_rul_leakage(feature_cols)
     # Never feed HI_* targets as input features to the encoder; they are used
-    # as supervised targets for the physics state encoder.
+    # as supervised targets for the physics state encoder or damage head.
     feature_cols = [
         c
         for c in feature_cols
-        if c not in ["HI_phys_final", "HI_target_hybrid"]
+        if c not in ["HI_phys_final", "HI_target_hybrid", "HI_phys_v2"]
     ]
 
     print(f"Using {len(feature_cols)} features for model input.")

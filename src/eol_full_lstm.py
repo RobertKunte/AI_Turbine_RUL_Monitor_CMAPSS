@@ -1089,18 +1089,26 @@ def evaluate_eol_full_lstm(
     
     with torch.no_grad():
         for batch in val_loader:
-            if len(batch) == 4:  # SequenceDatasetWithUnits with cond_ids
+            # Handle different batch formats:
+            # - 5 elements: X, y, unit_ids, cond_ids, health_phys_seq
+            # - 4 elements: X, y, unit_ids, cond_ids
+            # - 3 elements: X, y, unit_ids
+            # - 2 elements: X, y (fallback)
+            if len(batch) == 5:
+                X_batch, y_batch, unit_ids_batch, cond_ids_batch, _ = batch
+                unit_ids_all.append(unit_ids_batch.cpu().numpy() if isinstance(unit_ids_batch, torch.Tensor) else unit_ids_batch)
+            elif len(batch) == 4:  # SequenceDatasetWithUnits with cond_ids
                 X_batch, y_batch, unit_ids_batch, cond_ids_batch = batch
-                unit_ids_all.append(unit_ids_batch.numpy())
+                unit_ids_all.append(unit_ids_batch.cpu().numpy() if isinstance(unit_ids_batch, torch.Tensor) else unit_ids_batch)
             elif len(batch) == 3:  # SequenceDatasetWithUnits without cond_ids (backward compat)
                 X_batch, y_batch, unit_ids_batch = batch
                 cond_ids_batch = None
-                unit_ids_all.append(unit_ids_batch.numpy())
+                unit_ids_all.append(unit_ids_batch.cpu().numpy() if isinstance(unit_ids_batch, torch.Tensor) else unit_ids_batch)
             else:  # Fallback für TensorDataset
                 X_batch, y_batch = batch
                 cond_ids_batch = None
                 unit_ids_all.append(None)
-
+            
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
             if cond_ids_batch is not None:
