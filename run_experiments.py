@@ -793,6 +793,16 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         encoder_kwargs["damage_mlp_num_layers"] = damage_mlp_num_layers
         encoder_kwargs["damage_mlp_dropout"] = damage_mlp_dropout
         
+        # NEW (v3d): delta cumsum parameters
+        damage_use_delta_cumsum = encoder_kwargs.get(
+            "damage_use_delta_cumsum", model_cfg_raw.get("damage_use_delta_cumsum", False)
+        )
+        damage_delta_alpha = encoder_kwargs.get(
+            "damage_delta_alpha", model_cfg_raw.get("damage_delta_alpha", 1.0)
+        )
+        encoder_kwargs["damage_use_delta_cumsum"] = damage_use_delta_cumsum
+        encoder_kwargs["damage_delta_alpha"] = damage_delta_alpha
+
         model = EOLFullTransformerEncoder(
             input_dim=X_full.shape[-1],
             d_model=d_model,
@@ -817,6 +827,8 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             damage_mlp_hidden_factor=damage_mlp_hidden_factor,
             damage_mlp_num_layers=damage_mlp_num_layers,
             damage_mlp_dropout=damage_mlp_dropout,
+            damage_use_delta_cumsum=damage_use_delta_cumsum,
+            damage_delta_alpha=damage_delta_alpha,
         )
 
         # If we inferred Cond_* feature indices, attach them to the model so it can

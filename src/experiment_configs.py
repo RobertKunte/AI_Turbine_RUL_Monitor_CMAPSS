@@ -1330,6 +1330,50 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_config() -> 
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase_config() -> ExperimentConfig:
+    """
+    FD004 ms+DT Transformer-Encoder with Delta-Cumsum DamageHead (v3d) and two-phase training.
+    
+    - Starts from v3c (MLP base), but activates use_delta_cumsum=True
+    - Adds smoothness loss on delta_damage increments
+    - Adjusts loss balance to favor RUL trajectory stability
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase"
+
+    # Modell / Encoder
+    # Config keys may be under "encoder_kwargs" (from v3c base)
+    model_cfg = cfg.get("model", {})
+    enc = cfg.setdefault("encoder_kwargs", model_cfg.get("encoder_kwargs", {}))
+    # Note: v3c puts them in "encoder_kwargs" directly in previous function
+    
+    enc["use_damage_head"] = True
+    enc["damage_use_mlp"] = True
+    enc["damage_use_delta_cumsum"] = True
+    enc["damage_delta_alpha"] = 1.0  # ggf. 0.5–2.0 tunable
+    enc["damage_L_ref"] = 300.0
+    enc["damage_hidden_dim"] = 64
+
+    # Training / Two-Phase
+    train = cfg.setdefault("training_params", {})
+    train["damage_two_phase"] = True
+    train["damage_warmup_epochs"] = 10
+    train["damage_phase1_damage_weight"] = 10.0
+    train["damage_phase2_damage_weight"] = 3.0
+    # NEW: Smoothness weights
+    train["damage_phase1_smooth_weight"] = 0.1
+    train["damage_phase2_smooth_weight"] = 0.03
+
+    # Loss-Params: RUL-Trajektorie stärker gewichten
+    loss = cfg.setdefault("loss_params", {})
+    loss["damage_hi_weight"] = 5.0   # Basis
+    loss["rul_traj_weight"] = 1.5    # NEU, falls unterstützt
+
+    cfg["hi_target_type"] = "phys_v3"
+
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
     """
     Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
@@ -2835,6 +2879,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":

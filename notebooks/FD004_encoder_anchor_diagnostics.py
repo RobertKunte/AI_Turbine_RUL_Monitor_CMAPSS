@@ -29,6 +29,7 @@ import torch
 
 # Ensure project root (containing 'src') is on sys.path, regardless of CWD
 import sys
+from pathlib import Path
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(THIS_DIR, ".."))

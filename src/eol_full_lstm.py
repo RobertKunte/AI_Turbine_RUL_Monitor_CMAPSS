@@ -1366,6 +1366,11 @@ def train_eol_full_lstm(
     damage_warmup_epochs: int = 0,
     damage_phase1_damage_weight: float | None = None,
     damage_phase2_damage_weight: float | None = None,
+    # NEW: Smoothness loss weights for damage increments
+    damage_phase1_smooth_weight: float | None = None,
+    damage_phase2_smooth_weight: float | None = None,
+    # NEW: RUL Trajectory weight (v3d)
+    rul_traj_weight: float = 1.0,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Training-Loop für Full-Trajectory LSTM.
@@ -1475,6 +1480,12 @@ def train_eol_full_lstm(
         print("[train_eol_full_lstm] Mixed Precision Training (FP16) enabled - saves ~50% GPU memory")
     else:
         scaler = None
+
+    # Init damage smoothness weights
+    if damage_phase1_smooth_weight is None:
+        damage_phase1_smooth_weight = 0.1
+    if damage_phase2_smooth_weight is None:
+        damage_phase2_smooth_weight = 0.03
 
     best_val_loss = float("inf")
     best_epoch = -1
@@ -1645,10 +1656,11 @@ def train_eol_full_lstm(
                             hi_mono_weight=0.0,  # Disable monotonicity in multitask loss
                             hi_mono_rul_beta=HI_MONO_RUL_BETA,
                             return_components=True,
+                            rul_traj_weight=rul_traj_weight,
                         )
 
                         # ------------------------------------------------------------------
-                        # Two-phase damage training schedule (v3c)
+                        # Two-phase damage training schedule (v3c / v3d)
                         # Phase 1: focus on damage HI (no RUL/standard HI supervision)
                         # Phase 2: full multi-task (RUL + HI) as before
                         # ------------------------------------------------------------------
@@ -1656,6 +1668,7 @@ def train_eol_full_lstm(
                             # Phase 1 (damage-focused warmup): suppress RUL/HI loss.
                             loss = mt_loss.new_tensor(0.0)
                             damage_weight_eff = damage_phase1_damage_weight
+                            smooth_weight_eff = damage_phase1_smooth_weight
                             phase_tag = "P1-Damage"
                         else:
                             # Phase 2 (or no two-phase): use full multitask loss.
@@ -1663,6 +1676,7 @@ def train_eol_full_lstm(
                             damage_weight_eff = (
                                 damage_phase2_damage_weight if damage_two_phase else damage_hi_weight
                             )
+                            smooth_weight_eff = damage_phase2_smooth_weight if damage_two_phase else 0.0
                             phase_tag = "P2-Multi" if damage_two_phase else "SinglePhase"
                         
                         # Late monotonicity loss (RUL <= beta)
@@ -1761,6 +1775,17 @@ def train_eol_full_lstm(
                                 damage_hi_loss = F.mse_loss(hi_seq_damage_, hi_target_seq_)
                                 # Use phase-dependent damage HI weight (v3c)
                                 loss = loss + damage_weight_eff * damage_hi_loss
+
+                                # NEW: Smoothness loss on delta_damage (v3d)
+                                damage_smooth_raw = torch.zeros((), device=device)
+                                if delta_damage_dbg is not None:
+                                    d = delta_damage_dbg
+                                    if d.size(1) > 1:
+                                        diff = d[:, 1:] - d[:, :-1]
+                                        damage_smooth_raw = (diff ** 2).mean()
+                                
+                                if smooth_weight_eff > 0:
+                                    loss = loss + smooth_weight_eff * damage_smooth_raw
 
                                 # DEBUG: Inspect damage-head input/targets/preds once on first batch
                                 if (

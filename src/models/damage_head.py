@@ -29,24 +29,34 @@ class CumulativeDamageHead(nn.Module):
         mlp_hidden_factor: int = 2,
         mlp_num_layers: int = 2,
         mlp_dropout: float = 0.1,
+        # NEW: v3d delta-cumsum mode
+        use_delta_cumsum: bool = False,
+        delta_alpha: float = 1.0,
+        eps: float = 1e-6,
     ) -> None:
         """
         Args:
             d_model: latent dimension from encoder
             cond_dim: optional condition feature dimension
             L_ref, alpha_base, hidden_dim: legacy cumulative-damage parameters
-            use_mlp, mlp_*: if True, use a direct MLP on encoder states to
-                predict HI_seq via a sigmoid, bypassing the cumulative damage
-                integration. This is used for the damage_v3c experiments.
+            use_mlp, mlp_*: if True, use a direct MLP on encoder states.
+                If use_delta_cumsum=False (v3c), predicts HI_seq directly via sigmoid.
+                If use_delta_cumsum=True (v3d), predicts delta_damage via softplus and accumulates.
+            use_delta_cumsum: enable delta-damage + cumsum mode (v3d)
+            delta_alpha: scaling factor for delta damage in v3d mode
+            eps: small epsilon for division
         """
         super().__init__()
 
         self.L_ref = float(L_ref)
         self.alpha_base = float(alpha_base)
         self.use_mlp = bool(use_mlp)
+        self.use_delta_cumsum = bool(use_delta_cumsum)
+        self.delta_alpha = float(delta_alpha)
+        self.eps = float(eps)
 
         # ------------------------------------------------------------------
-        # NEW: simple MLP head (damage_v3c) – operates directly on z_seq
+        # NEW: simple MLP head (damage_v3c / v3d) – operates directly on z_seq
         # ------------------------------------------------------------------
         if self.use_mlp:
             hidden_dim_mlp = int(mlp_hidden_factor * d_model)
@@ -123,19 +133,46 @@ class CumulativeDamageHead(nn.Module):
         B, T, D = z_seq.shape
 
         # ------------------------------------------------------------------
-        # NEW: Simple MLP-based HI head (v3c)
+        # NEW: Simple MLP-based HI head (v3c) or Delta-Cumsum (v3d)
         # ------------------------------------------------------------------
         if self.use_mlp:
             z_flat = z_seq.reshape(B * T, D)
             out = self.mlp_head(z_flat)  # [B*T, 1]
-            hi_seq = torch.sigmoid(out).view(B, T)
-            hi_last = hi_seq[:, -1]
-            # For compatibility with callers expecting damage sequences,
-            # we construct a surrogate damage sequence as 1 - HI and set
-            # per-step increments to zeros.
-            damage_seq = 1.0 - hi_seq
-            delta_damage = z_seq.new_zeros(B, T)
-            return hi_seq, hi_last, damage_seq, delta_damage
+            
+            if self.use_delta_cumsum:
+                # v3d: Delta-Damage + Cumsum
+                delta_raw = out.view(B, T)
+                
+                # Only positive increments
+                delta_damage = F.softplus(delta_raw) * self.delta_alpha
+                
+                # Cumulative damage
+                damage_seq = torch.cumsum(delta_damage, dim=1)
+                
+                # Map to Health Index
+                hi_seq = 1.0 - damage_seq / (self.L_ref + self.eps)
+                hi_seq = torch.clamp(hi_seq, 0.0, 1.0)
+                
+                hi_last = hi_seq[:, -1]
+                
+                # DEBUG print (rarely)
+                if getattr(self, "debug", False) and torch.rand(1).item() < 0.001:
+                     print(f"[DEBUG V3d DamageHead] delta_damage[0, :5]: {delta_damage[0, :5].detach().cpu().numpy()}")
+                     print(f"[DEBUG V3d DamageHead] damage_seq[0, :5]:   {damage_seq[0, :5].detach().cpu().numpy()}")
+                     print(f"[DEBUG V3d DamageHead] hi_seq[0, :5]:       {hi_seq[0, :5].detach().cpu().numpy()}")
+
+                return hi_seq, hi_last, damage_seq, delta_damage
+
+            else:
+                # v3c: Direct HI prediction
+                hi_seq = torch.sigmoid(out).view(B, T)
+                hi_last = hi_seq[:, -1]
+                # For compatibility with callers expecting damage sequences,
+                # we construct a surrogate damage sequence as 1 - HI and set
+                # per-step increments to zeros.
+                damage_seq = 1.0 - hi_seq
+                delta_damage = z_seq.new_zeros(B, T)
+                return hi_seq, hi_last, damage_seq, delta_damage
 
         # ------------------------------------------------------------------
         # Legacy cumulative damage path (default for all existing runs)

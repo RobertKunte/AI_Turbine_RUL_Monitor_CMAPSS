@@ -699,6 +699,9 @@ def load_model_from_experiment(
         damage_mlp_hidden_factor = int(config.get("damage_mlp_hidden_factor", 2))
         damage_mlp_num_layers = int(config.get("damage_mlp_num_layers", 2))
         damage_mlp_dropout = float(config.get("damage_mlp_dropout", 0.1))
+        # NEW (v3d): delta cumsum parameters
+        damage_use_delta_cumsum = bool(config.get("damage_use_delta_cumsum", False))
+        damage_delta_alpha = float(config.get("damage_delta_alpha", 1.0))
 
         model = EOLFullTransformerEncoder(
             input_dim=input_dim,
@@ -725,6 +728,8 @@ def load_model_from_experiment(
             damage_mlp_hidden_factor=damage_mlp_hidden_factor,
             damage_mlp_num_layers=damage_mlp_num_layers,
             damage_mlp_dropout=damage_mlp_dropout,
+            damage_use_delta_cumsum=damage_use_delta_cumsum,
+            damage_delta_alpha=damage_delta_alpha,
         )
 
         # Optional advanced RUL head (phys_v3/phys_v4 experiments).

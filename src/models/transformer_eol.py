@@ -254,6 +254,9 @@ class EOLFullTransformerEncoder(nn.Module):
         damage_mlp_hidden_factor: int = 2,
         damage_mlp_num_layers: int = 2,
         damage_mlp_dropout: float = 0.1,
+        # NEW: v3d delta cumsum parameters
+        damage_use_delta_cumsum: bool = False,
+        damage_delta_alpha: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -407,6 +410,8 @@ class EOLFullTransformerEncoder(nn.Module):
                 mlp_hidden_factor=damage_mlp_hidden_factor,
                 mlp_num_layers=damage_mlp_num_layers,
                 mlp_dropout=damage_mlp_dropout,
+                use_delta_cumsum=damage_use_delta_cumsum,
+                delta_alpha=damage_delta_alpha,
             )
         else:
             self.damage_head = None

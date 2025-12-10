@@ -285,6 +285,7 @@ def multitask_rul_health_loss(
     hi_mono_weight: float = 0.0,
     hi_mono_rul_beta: float = 30.0,
     return_components: bool = False,
+    rul_traj_weight: float = 1.0,  # NEW: Weight for RUL MSE part
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
     """
     Multi-task loss that combines:
@@ -317,6 +318,7 @@ def multitask_rul_health_loss(
         hi_mono_rul_beta: scale parameter (in cycles) for RUL weighting in monotonicity.
                          Smaller beta -> stronger emphasis on late cycles.
         return_components: if True, return (loss, components_dict) instead of just loss
+        rul_traj_weight: multiplier for the RUL MSE loss term
     
     Returns:
         scalar loss tensor, or (loss, components_dict) if return_components=True
@@ -343,7 +345,7 @@ def multitask_rul_health_loss(
     rul_loss_unscaled = (weights * rul_error).mean()
     
     # Apply RUL loss scaling to balance with HI losses
-    rul_loss = rul_loss_unscaled * RUL_LOSS_SCALE
+    rul_loss = rul_loss_unscaled * RUL_LOSS_SCALE * rul_traj_weight
     
     # 2) Health Index target: plateau at 1 for RUL > plateau_thresh, 
     #    then linear decay from plateau_thresh → 0
