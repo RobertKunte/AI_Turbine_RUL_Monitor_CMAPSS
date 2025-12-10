@@ -909,6 +909,50 @@ def load_model_from_experiment(
     return model, config
 
 
+def reconstruct_model_from_checkpoint(
+    checkpoint_path: str | Path,
+    device: torch.device | str = "cpu",
+) -> Tuple[nn.Module, dict, object]:
+    """
+    Lightweight helper to reconstruct a model + config + scaler from a single
+    checkpoint file path.
+
+    This exists primarily for backwards compatibility with utilities that were
+    written before the more general `load_model_from_experiment` helper.
+
+    Args:
+        checkpoint_path: Full path to a `.pt` checkpoint file
+        device: Device to load the model onto
+
+    Returns:
+        model: Loaded PyTorch model (on `device`)
+        config: Configuration dictionary (from `summary.json` if available)
+        scaler: Loaded scaler object from `scaler.pkl` if present, else None
+    """
+    checkpoint_path = Path(checkpoint_path)
+    experiment_dir = checkpoint_path.parent
+
+    # Re‑use the robust logic in load_model_from_experiment. It will:
+    # - read summary.json
+    # - pick the best/best-v3 checkpoint in the directory
+    # - reconstruct the correct architecture
+    model, config = load_model_from_experiment(experiment_dir, device=device)
+
+    # Try to load scaler (if present)
+    scaler = None
+    scaler_path = experiment_dir / "scaler.pkl"
+    if scaler_path.exists():
+        try:
+            import pickle
+
+            with open(scaler_path, "rb") as f:
+                scaler = pickle.load(f)
+        except Exception as e:
+            print(f"[WARNING] Could not load scaler from {scaler_path}: {e}")
+
+    return model, config, scaler
+
+
 def rebuild_scaler_from_training_data(
     df_train: pd.DataFrame,
     feature_cols: list[str],
