@@ -1821,14 +1821,15 @@ def train_eol_full_lstm(
                         loss_components = None
                 scaler.scale(loss).backward()
 
-                # Debug: log damage-head gradients for first few batches of epoch 1
+                # Debug: log damage-head gradients for first few batches of epoch 1.
+                # Hinweis: Hier sind die Gradienten noch skaliert, aber für die
+                # Erkennung von "keine Gradienten" vs. "nicht-null" ist das egal.
                 if epoch == 1 and batch_idx < 3:
-                    # Gradients are scaled; unscale before inspection
-                    scaler.unscale_(optimizer)
                     log_damage_head_gradients(
                         model,
-                        prefix=f"[DEBUG DamageHeadGrad] epoch={epoch} batch={batch_idx} (AMP)",
+                        prefix=f"[DEBUG DamageHeadGrad] epoch={epoch} batch={batch_idx} (AMP, scaled)",
                     )
+
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
