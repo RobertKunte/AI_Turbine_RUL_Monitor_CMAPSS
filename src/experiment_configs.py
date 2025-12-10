@@ -1329,6 +1329,34 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_config() -> 
 
     return cfg
 
+
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
+    """
+    Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
+    Phase-2 damage weight. Same architecture and feature setup as v3c.
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_config()
+
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned"
+
+    training = cfg.setdefault("training_params", {})
+
+    # Stronger warmup on HI_phys_v3
+    training["damage_two_phase"] = True
+    training["damage_warmup_epochs"] = 10  # Phase 1: epochs 0–9
+
+    # Stronger focus on damage in Phase 1, slightly increased in Phase 2
+    loss_params = cfg.setdefault("loss_params", {})
+    base_damage_w = loss_params.get("damage_hi_weight", 5.0)
+
+    training["damage_phase1_damage_weight"] = 10.0  # was 5.0
+    training["damage_phase2_damage_weight"] = 4.0   # was 3.0
+
+    # Keep base damage_hi_weight as reference (for non-two-phase runs)
+    loss_params["damage_hi_weight"] = base_damage_w
+
+    return cfg
+
 def get_fd004_state_encoder_v3_damage_msdt_v1_config() -> ExperimentConfig:
     """
     FD004 – State Encoder V3 with cumulative damage head (ms+DT v2 features).
@@ -2805,6 +2833,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3b_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":

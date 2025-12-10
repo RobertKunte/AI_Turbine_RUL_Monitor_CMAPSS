@@ -1294,6 +1294,7 @@ def plot_hi_phys_v3_true_vs_pred(
     df_test_fe: pd.DataFrame,
     trajectories: List[EngineTrajectory],
     out_path: Path,
+    metrics_path: Optional[Path] = None,
     title: str = "HI_phys_v3 true vs predicted",
     max_engines: int = 10,
 ) -> None:
@@ -1320,6 +1321,9 @@ def plot_hi_phys_v3_true_vs_pred(
     num_engines = min(len(traj_with_damage), max_engines)
     fig, axes = plt.subplots(2, 5, figsize=(20, 8))
     axes = axes.flatten()
+
+    # Store HI sequences for RMSE computation
+    hi_rmse_per_engine: Dict[int, float] = {}
 
     for idx, traj in enumerate(traj_with_damage[:max_engines]):
         ax = axes[idx]
@@ -1359,6 +1363,16 @@ def plot_hi_phys_v3_true_vs_pred(
         ax.grid(True, alpha=0.3)
         ax.set_title(f"Engine #{uid} – HI_phys_v3 true vs pred")
 
+        # Compute per-engine RMSE between HI_phys_v3 and HI_damage
+        mask_valid = ~np.isnan(hi_true_aligned)
+        if np.any(mask_valid):
+            hi_true = hi_true_aligned[mask_valid].astype(float)
+            hi_pred = np.asarray(traj.hi_damage, dtype=float)[mask_valid]
+            T = min(len(hi_true), len(hi_pred))
+            if T > 0:
+                rmse = float(np.sqrt(np.mean((hi_true[:T] - hi_pred[:T]) ** 2)))
+                hi_rmse_per_engine[int(uid)] = rmse
+
     # Hide unused subplots
     for j in range(num_engines, len(axes)):
         axes[j].axis("off")
@@ -1369,6 +1383,45 @@ def plot_hi_phys_v3_true_vs_pred(
     plt.close()
 
     print(f"Saved HI_phys_v3 true vs pred trajectories to {out_path}")
+
+    # Optionally, log and persist RMSE summary for HI_phys_v3 vs HI_damage
+    if hi_rmse_per_engine:
+        rmse_values = np.array(list(hi_rmse_per_engine.values()), dtype=float)
+        hi_rmse_mean = float(rmse_values.mean())
+        hi_rmse_median = float(np.median(rmse_values))
+        hi_rmse_std = float(rmse_values.std())
+        hi_rmse_min = float(rmse_values.min())
+        hi_rmse_max = float(rmse_values.max())
+
+        print("============================================================")
+        print("[Diagnostics] HI_phys_v3 vs HI_damage – per-engine RMSE")
+        print("============================================================")
+        print(f"Num engines: {len(rmse_values)}")
+        print(f"RMSE mean:   {hi_rmse_mean:.6f}")
+        print(f"RMSE median: {hi_rmse_median:.6f}")
+        print(f"RMSE std:    {hi_rmse_std:.6f}")
+        print(f"RMSE min:    {hi_rmse_min:.6f}")
+        print(f"RMSE max:    {hi_rmse_max:.6f}")
+
+        if metrics_path is not None:
+            try:
+                import json
+
+                metrics = {
+                    "hi_rmse_per_engine": {str(k): float(v) for k, v in hi_rmse_per_engine.items()},
+                    "summary": {
+                        "rmse_mean": hi_rmse_mean,
+                        "rmse_median": hi_rmse_median,
+                        "rmse_std": hi_rmse_std,
+                        "rmse_min": hi_rmse_min,
+                        "rmse_max": hi_rmse_max,
+                    },
+                }
+                with open(metrics_path, "w") as f:
+                    json.dump(metrics, f, indent=2)
+                print(f"  ✓ Saved HI damage metrics to: {metrics_path}")
+            except Exception as e:
+                print(f"  ⚠️  Could not save HI damage metrics to {metrics_path}: {e}")
 
 
 def run_diagnostics_for_run(
@@ -1546,9 +1599,11 @@ def run_diagnostics_for_run(
     # Build evaluation data
     # ------------------------------------------------------------------
     # Physically-informed Transformer variants (transformer_encoder_phys_v2/v3/v4)
-    # use continuous condition vector + digital twin features during training.
-    # If phys_features were persisted in summary.json we reuse them directly;
-    # otherwise we reconstruct a consistent default based on the experiment name.
+    # und ms_dt_v1/v2-Experimente (ms+DT) nutzen während des Trainings einen
+    # kontinuierlichen Condition-Vektor + Digital-Twin-Residuals.
+    # Wenn phys_features in summary.json persistiert wurden, verwenden wir sie
+    # direkt; andernfalls rekonstruieren wir eine konsistente Default-Config
+    # basierend auf dem Experimentnamen (muss exakt zu run_experiments passen).
     phys_features_cfg = config.get("phys_features", None)
     if phys_features_cfg is None:
         name_lower = (experiment_name or run_name).lower()
@@ -1574,9 +1629,32 @@ def run_diagnostics_for_run(
                 # phys_v2 uses the original condition vector (version 2)
                 "condition_vector_version": 2,
             }
+        elif "transformer_encoder_ms_dt_v" in name_lower:
+            # ms+DT-Experimente (ms_dt_v1/v2, inkl. damage_v2/v3/v3b/v3c) –
+            # Standard-Einstellungen wie in experiment_configs.py
+            phys_features_cfg = {
+                "use_condition_vector": True,
+                "use_twin_features": True,
+                "twin_baseline_len": 30,
+                "condition_vector_version": 3,
+            }
     
+    # Twin-/Residual-Flags explizit loggen, damit klar ist, was in Diagnostics
+    # wirklich aktiv ist (Phase-4-Residuals vs. Twin-Residuals).
+    use_twin_features_flag = False
+    if phys_features_cfg is not None:
+        use_twin_features_flag = bool(
+            phys_features_cfg.get(
+                "use_twin_features",
+                phys_features_cfg.get("use_digital_twin_residuals", False),
+            )
+        )
+
     print(f"[2] Building evaluation data ({dataset_name} pipeline)...")
-    print(f"  Residual features enabled: {is_phase4_residual}")
+    # is_phase4_residual steuert nur die expliziten Physics-Residual-Features
+    # (PhysicsFeatureConfig.use_residuals), NICHT die HealthyTwin-Residuals.
+    print(f"  Phase-4 residual features enabled (physics_config): {is_phase4_residual}")
+    print(f"  Digital-twin residuals enabled (phys_features):    {use_twin_features_flag}")
     if is_phase4_residual:
         print(f"  Residual config: mode={physics_config.residual.mode}, baseline_len={physics_config.residual.baseline_len}, include_original={physics_config.residual.include_original}")
     
@@ -1956,7 +2034,8 @@ def run_diagnostics_for_run(
 
             # Additional diagnostics for HI_phys_v3-based experiments:
             # 1) True HI_phys_v3 trajectories for several engines.
-            # 2) True vs predicted HI_phys_v3 (using damage-head HI as prediction).
+            # 2) True vs predicted HI_phys_v3 (using damage-head HI as prediction),
+            #    plus per-engine RMSE summary between HI_phys_v3 and HI_damage.
             if "HI_phys_v3" in df_test_fe.columns and "damage_v3" in experiment_name.lower():
                 print("  Creating HI_phys_v3 diagnostics plots (true + true vs pred)...")
                 plot_hi_phys_v3_true_trajectories(
@@ -1970,6 +2049,7 @@ def run_diagnostics_for_run(
                     df_test_fe=df_test_fe,
                     trajectories=selected_trajectories,
                     out_path=experiment_dir / "hi_phys_v3_true_vs_pred_10_degraded.png",
+                    metrics_path=experiment_dir / "hi_damage_metrics.json",
                     title=f"{dataset_name} HI_phys_v3 true vs pred – 10 degraded engines",
                     max_engines=10,
                 )
