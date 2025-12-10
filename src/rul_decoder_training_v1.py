@@ -359,11 +359,22 @@ def prepare_fd004_ms_dt_v3d_data(
         physics_config=physics_config,
     )
 
-    # 5) HI_phys_v3 column must already exist in df_train for v3d runs
+    # 5) HI_phys_v3: compute if missing (mirrors run_experiments damage_v3 path)
     if "HI_phys_v3" not in df_train.columns:
-        raise RuntimeError(
-            "[decoder_v1] Expected HI_phys_v3 in df_train. "
-            "Please ensure the v3d encoder experiment was run with HI_phys_v3 computation."
+        print("  [decoder_v1] HI_phys_v3 not found in df_train – computing via residual pipeline.")
+        from src.features.hi_phys_v3 import compute_hi_phys_v3_from_residuals
+
+        hi_v3_series = compute_hi_phys_v3_from_residuals(
+            df_train,
+            unit_col="UnitNumber",
+            cycle_col="TimeInCycles",
+        )
+        df_train["HI_phys_v3"] = hi_v3_series
+        print(
+            f"  HI_phys_v3 stats (decoder_v1): "
+            f"min={hi_v3_series.min():.4f}, "
+            f"max={hi_v3_series.max():.4f}, "
+            f"mean={hi_v3_series.mean():.4f}"
         )
 
     # ------------------------------------------------------------------
