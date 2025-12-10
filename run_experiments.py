@@ -400,6 +400,15 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         return summary
     
     # ===================================================================
+    # Decoder V1 Training
+    # ===================================================================
+    if config["encoder_type"] == "decoder_v1":
+        from src.rul_decoder_training_v1 import train_rul_decoder_v1
+        print("\n[2] Training RUL Trajectory Decoder V1 (on frozen encoder)...")
+        summary = train_rul_decoder_v1(config, device=device)
+        return summary
+
+    # ===================================================================
     # World Model Training (Phase 4/5 Residual)
     # ===================================================================
     if is_world_model:

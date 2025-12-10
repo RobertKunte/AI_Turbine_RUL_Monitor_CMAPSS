@@ -313,7 +313,40 @@ def load_model_from_experiment(
             cond_emb_dim = state_dict["encoder.cond_emb.weight"].shape[1]
     
     # Handle different encoder types
-    if encoder_type == "world_model_universal_v3":
+    if encoder_type == "decoder_v1":
+        from src.models.rul_decoder import RULTrajectoryDecoderV1, DecoderV1Wrapper
+        
+        encoder_checkpoint = config.get("encoder_checkpoint")
+        if not encoder_checkpoint:
+             # Try to infer relative to experiment dir if not absolute
+             # But usually it is full path in config
+             raise ValueError("encoder_checkpoint missing in config for decoder_v1")
+             
+        print(f"Loading frozen encoder from {encoder_checkpoint}...")
+        # Recursive call to load encoder
+        encoder_model, enc_config, _ = reconstruct_model_from_checkpoint(encoder_checkpoint, device=device)
+        encoder_model.eval()
+        latent_dim = getattr(encoder_model, "d_model", 64)
+        
+        # Init decoder
+        decoder = RULTrajectoryDecoderV1(
+            latent_dim=latent_dim,
+            hidden_dim=128,
+            num_layers=2,
+            dropout=0.1
+        )
+        
+        # Load decoder weights
+        # Check if state_dict is directly the dict or wrapped
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+             decoder.load_state_dict(state_dict["state_dict"])
+        else:
+             decoder.load_state_dict(state_dict)
+             
+        model = DecoderV1Wrapper(encoder_model, decoder)
+        model.to(device)
+        
+    elif encoder_type == "world_model_universal_v3":
         # World Model v3 with Health Index head
         from src.models.world_model import WorldModelUniversalV3
         

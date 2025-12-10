@@ -660,4 +660,48 @@ class EOLFullTransformerEncoder(nn.Module):
             return enc_out, pooled
         return pooled
 
+    def encode_with_hi(self, x, cond_ids=None, cond_vec=None):
+        """
+        Runs the encoder (frozen or trainable) and returns:
+          - z_seq: latent sequence [B, T, D]
+          - hi_phys_seq: physics HI_phys_v3_seq [B, T] if available, else None
+          - hi_damage_seq: learned damage HI_seq [B, T] from damage_head if available, else None
+        """
+        # existing encode logic should already allow return_seq=True
+        enc_outputs = self.encode(
+            x,
+            cond_ids=cond_ids,
+            cond_vec=cond_vec,
+            return_seq=True,
+            return_pooled=False,
+        )
+        # enc_outputs is typically (z_seq, pooled) or just z_seq
+        if isinstance(enc_outputs, tuple):
+            z_seq = enc_outputs[0]
+        else:
+            z_seq = enc_outputs
+
+        hi_phys_seq = None
+        hi_damage_seq = None
+
+        # If health_phys_seq is available in the batch, it is passed separately in training.
+        # For inference/decoder training we only use the learned damage_head.
+        if hasattr(self, "damage_head") and self.damage_head is not None:
+            # we can run the damage head with the encoder sequence only, cond_seq=None
+            
+            # Determine cond_seq if model uses it
+            cond_seq_dmg = None
+            if self.use_cond_encoder and self.cond_in_dim > 0 and self.cond_feature_indices is not None:
+                # We need x to be [B, T, F] to extract cond features
+                if x.dim() == 3:
+                    cond_seq_dmg = x[:, :, self.cond_feature_indices]
+            
+            hi_damage_seq, _, _, _ = self.damage_head(
+                z_seq,
+                cond_seq=cond_seq_dmg,
+            )  # hi_damage_seq shape: [B, T]
+
+        return z_seq, hi_phys_seq, hi_damage_seq
+
+
 
