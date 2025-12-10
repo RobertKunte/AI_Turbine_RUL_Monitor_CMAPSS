@@ -1361,6 +1361,11 @@ def train_eol_full_lstm(
     cond_recon_weight: float = 0.0,
     # NEW: damage-based HI loss weight (for Transformer encoder with cumulative damage head)
     damage_hi_weight: float = 0.0,
+    # NEW (v3c): two-phase damage training schedule
+    damage_two_phase: bool = False,
+    damage_warmup_epochs: int = 0,
+    damage_phase1_damage_weight: float | None = None,
+    damage_phase2_damage_weight: float | None = None,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Training-Loop für Full-Trajectory LSTM.
@@ -1416,6 +1421,12 @@ def train_eol_full_lstm(
     # Use provided weights or fall back to config defaults
     mono_late_weight = hi_mono_late_weight if hi_mono_late_weight is not None else HI_MONO_WEIGHT
     mono_global_weight = hi_mono_global_weight if hi_mono_global_weight is not None else HI_GLOBAL_MONO_WEIGHT
+    # Two-phase damage HI configuration (v3c)
+    damage_two_phase = bool(damage_two_phase)
+    if damage_phase1_damage_weight is None:
+        damage_phase1_damage_weight = damage_hi_weight
+    if damage_phase2_damage_weight is None:
+        damage_phase2_damage_weight = damage_hi_weight
     
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -1619,7 +1630,7 @@ def train_eol_full_lstm(
                         health_seq_flat = health_seq.squeeze(-1) if health_seq.dim() == 3 else health_seq
                         
                         # Compute multitask loss (without monotonicity, we'll add it separately)
-                        loss, loss_components = multitask_rul_health_loss(
+                        mt_loss, loss_components = multitask_rul_health_loss(
                             rul_pred=rul_pred.squeeze(-1) if rul_pred.dim() > 1 else rul_pred,
                             rul_true=y_batch,
                             health_pred=health_last.squeeze(-1) if health_last.dim() > 1 else health_last,
@@ -1635,6 +1646,24 @@ def train_eol_full_lstm(
                             hi_mono_rul_beta=HI_MONO_RUL_BETA,
                             return_components=True,
                         )
+
+                        # ------------------------------------------------------------------
+                        # Two-phase damage training schedule (v3c)
+                        # Phase 1: focus on damage HI (no RUL/standard HI supervision)
+                        # Phase 2: full multi-task (RUL + HI) as before
+                        # ------------------------------------------------------------------
+                        if damage_two_phase and epoch <= damage_warmup_epochs:
+                            # Phase 1 (damage-focused warmup): suppress RUL/HI loss.
+                            loss = mt_loss.new_tensor(0.0)
+                            damage_weight_eff = damage_phase1_damage_weight
+                            phase_tag = "P1-Damage"
+                        else:
+                            # Phase 2 (or no two-phase): use full multitask loss.
+                            loss = mt_loss
+                            damage_weight_eff = (
+                                damage_phase2_damage_weight if damage_two_phase else damage_hi_weight
+                            )
+                            phase_tag = "P2-Multi" if damage_two_phase else "SinglePhase"
                         
                         # Late monotonicity loss (RUL <= beta)
                         if USE_HI_MONOTONICITY:
@@ -1730,7 +1759,8 @@ def train_eol_full_lstm(
                                     hi_target_seq_ = hi_target_seq
                                 
                                 damage_hi_loss = F.mse_loss(hi_seq_damage_, hi_target_seq_)
-                                loss = loss + damage_hi_weight * damage_hi_loss
+                                # Use phase-dependent damage HI weight (v3c)
+                                loss = loss + damage_weight_eff * damage_hi_loss
 
                                 # DEBUG: Inspect damage-head input/targets/preds once on first batch
                                 if (
@@ -2360,13 +2390,28 @@ def train_eol_full_lstm(
         if use_health_head and train_component_losses is not None:
             # Log damage_hi_loss explicitly (should already be in train_damage_hi_loss)
             log_damage_hi = train_damage_hi_loss if damage_hi_weight > 0.0 else 0.0
-            
-            print(f"\n[DEBUG Loss-Balance] Epoch {epoch+1}:")
+
+            # Determine current phase and effective damage weight (v3c)
+            if damage_two_phase and epoch <= damage_warmup_epochs:
+                phase_tag = "P1-Damage"
+                damage_weight_eff_epoch = damage_phase1_damage_weight
+            elif damage_two_phase:
+                phase_tag = "P2-Multi"
+                damage_weight_eff_epoch = damage_phase2_damage_weight
+            else:
+                phase_tag = "SinglePhase"
+                damage_weight_eff_epoch = damage_hi_weight
+
+            print(f"\n[DEBUG Loss-Balance] Epoch {epoch+1} ({phase_tag}):")
             print(f"  RUL Loss (scaled):        {train_rul_loss:.4f}")
             print(f"  HI Loss (standard):       {train_health_loss:.4f}")
             if damage_hi_weight > 0.0:
                 print(f"  Damage HI Loss (raw):     {log_damage_hi:.4f}")
-                print(f"  Damage HI Loss (weighted): {damage_hi_weight * log_damage_hi:.4f}")
+                print(
+                    f"  Damage HI Loss (weighted): "
+                    f"{(damage_weight_eff_epoch or 0.0) * log_damage_hi:.4f}"
+                )
+                print(f"  Damage HI Weight (eff.):  {damage_weight_eff_epoch:.4f}")
             else:
                 print(f"  Damage HI Loss:            N/A (damage_hi_weight=0)")
             print(f"  Mono Late (weighted):      {train_mono_late:.4f}")

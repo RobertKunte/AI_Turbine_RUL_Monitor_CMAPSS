@@ -694,6 +694,11 @@ def load_model_from_experiment(
         damage_L_ref = float(config.get("L_ref", 300.0))
         damage_alpha_base = float(config.get("alpha_base", 0.1))
         damage_hidden_dim = int(config.get("damage_hidden_dim", 64))
+        # NEW (v3c): optional MLP-based damage head configuration
+        damage_use_mlp = bool(config.get("damage_use_mlp", False))
+        damage_mlp_hidden_factor = int(config.get("damage_mlp_hidden_factor", 2))
+        damage_mlp_num_layers = int(config.get("damage_mlp_num_layers", 2))
+        damage_mlp_dropout = float(config.get("damage_mlp_dropout", 0.1))
 
         model = EOLFullTransformerEncoder(
             input_dim=input_dim,
@@ -716,6 +721,10 @@ def load_model_from_experiment(
             damage_L_ref=damage_L_ref,
             damage_alpha_base=damage_alpha_base,
             damage_hidden_dim=damage_hidden_dim,
+            damage_use_mlp=damage_use_mlp,
+            damage_mlp_hidden_factor=damage_mlp_hidden_factor,
+            damage_mlp_num_layers=damage_mlp_num_layers,
+            damage_mlp_dropout=damage_mlp_dropout,
         )
 
         # Optional advanced RUL head (phys_v3/phys_v4 experiments).

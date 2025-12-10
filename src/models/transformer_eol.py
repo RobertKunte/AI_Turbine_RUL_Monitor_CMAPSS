@@ -249,6 +249,11 @@ class EOLFullTransformerEncoder(nn.Module):
         damage_L_ref: float = 300.0,
         damage_alpha_base: float = 0.1,
         damage_hidden_dim: int = 64,
+        # NEW (v3c): optional MLP-based damage head configuration
+        damage_use_mlp: bool = False,
+        damage_mlp_hidden_factor: int = 2,
+        damage_mlp_num_layers: int = 2,
+        damage_mlp_dropout: float = 0.1,
     ) -> None:
         super().__init__()
 
@@ -398,6 +403,10 @@ class EOLFullTransformerEncoder(nn.Module):
                 L_ref=damage_L_ref,
                 alpha_base=damage_alpha_base,
                 hidden_dim=damage_hidden_dim,
+                use_mlp=damage_use_mlp,
+                mlp_hidden_factor=damage_mlp_hidden_factor,
+                mlp_num_layers=damage_mlp_num_layers,
+                mlp_dropout=damage_mlp_dropout,
             )
         else:
             self.damage_head = None

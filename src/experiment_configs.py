@@ -1286,6 +1286,49 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v3b_config() -> ExperimentConf
 
     return cfg
 
+
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_config() -> ExperimentConfig:
+    """
+    FD004 ms+DT Transformer-Encoder with MLP-based DamageHead and two-phase training.
+
+    - Starts from _damage_v3b (same ms_dt_v2 feature pipeline and HI_phys_v3 target)
+    - Uses an MLP-based damage head on top of encoder states
+    - Trains with a two-phase schedule:
+        Phase 1: focus on Damage-HI (HI_phys_v3), no RUL/standard HI loss
+        Phase 2: full multi-task (RUL + HI + Damage-HI) with slightly reduced damage weight
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v3b_config()
+
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase"
+
+    # Encoder: enable MLP-based damage head
+    enc = cfg.setdefault("encoder_kwargs", {})
+    enc["use_damage_head"] = True
+    enc.setdefault("damage_L_ref", 300.0)
+    enc.setdefault("damage_alpha_base", 0.1)
+    enc.setdefault("damage_hidden_dim", 64)
+    enc["damage_use_mlp"] = True
+    enc["damage_mlp_hidden_factor"] = 2
+    enc["damage_mlp_num_layers"] = 2
+    enc["damage_mlp_dropout"] = 0.1
+
+    # Training: two-phase schedule for damage HI loss
+    train_params = cfg.setdefault("training_params", {})
+    train_params["damage_two_phase"] = True
+    train_params["damage_warmup_epochs"] = 5
+    train_params["damage_phase1_damage_weight"] = 5.0  # strong focus in warmup
+    train_params["damage_phase2_damage_weight"] = 3.0  # slightly reduced in full multi-task
+
+    # Keep loss_params (including damage_hi_weight=5.0) from v3b as base
+    loss_params = cfg.setdefault("loss_params", {})
+    loss_params["rul_weight"] = loss_params.get("rul_weight", 1.0)
+    loss_params["health_loss_weight"] = loss_params.get("health_loss_weight", 0.1)
+    loss_params["damage_hi_weight"] = loss_params.get("damage_hi_weight", 5.0)
+
+    cfg["hi_target_type"] = "phys_v3"
+
+    return cfg
+
 def get_fd004_state_encoder_v3_damage_msdt_v1_config() -> ExperimentConfig:
     """
     FD004 – State Encoder V3 with cumulative damage head (ms+DT v2 features).
@@ -2760,6 +2803,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v3b":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3b_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":

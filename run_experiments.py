@@ -769,12 +769,29 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         damage_L_ref = encoder_kwargs.get("L_ref", model_cfg_raw.get("L_ref", 300.0))
         damage_alpha_base = encoder_kwargs.get("alpha_base", model_cfg_raw.get("alpha_base", 0.1))
         damage_hidden_dim = encoder_kwargs.get("damage_hidden_dim", model_cfg_raw.get("damage_hidden_dim", 64))
-        
+        # NEW (v3c): optional MLP-based damage head configuration
+        damage_use_mlp = encoder_kwargs.get(
+            "damage_use_mlp", model_cfg_raw.get("damage_use_mlp", False)
+        )
+        damage_mlp_hidden_factor = encoder_kwargs.get(
+            "damage_mlp_hidden_factor", model_cfg_raw.get("damage_mlp_hidden_factor", 2)
+        )
+        damage_mlp_num_layers = encoder_kwargs.get(
+            "damage_mlp_num_layers", model_cfg_raw.get("damage_mlp_num_layers", 2)
+        )
+        damage_mlp_dropout = encoder_kwargs.get(
+            "damage_mlp_dropout", model_cfg_raw.get("damage_mlp_dropout", 0.1)
+        )
+
         # Store in encoder_kwargs so they get saved to summary.json
         encoder_kwargs["use_damage_head"] = use_damage_head
         encoder_kwargs["L_ref"] = damage_L_ref
         encoder_kwargs["alpha_base"] = damage_alpha_base
         encoder_kwargs["damage_hidden_dim"] = damage_hidden_dim
+        encoder_kwargs["damage_use_mlp"] = damage_use_mlp
+        encoder_kwargs["damage_mlp_hidden_factor"] = damage_mlp_hidden_factor
+        encoder_kwargs["damage_mlp_num_layers"] = damage_mlp_num_layers
+        encoder_kwargs["damage_mlp_dropout"] = damage_mlp_dropout
         
         model = EOLFullTransformerEncoder(
             input_dim=X_full.shape[-1],
@@ -796,6 +813,10 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             damage_L_ref=damage_L_ref,
             damage_alpha_base=damage_alpha_base,
             damage_hidden_dim=damage_hidden_dim,
+            damage_use_mlp=damage_use_mlp,
+            damage_mlp_hidden_factor=damage_mlp_hidden_factor,
+            damage_mlp_num_layers=damage_mlp_num_layers,
+            damage_mlp_dropout=damage_mlp_dropout,
         )
 
         # If we inferred Cond_* feature indices, attach them to the model so it can
@@ -926,6 +947,17 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     results_dir = Path("results") / dataset_name.lower() / experiment_name
     results_dir.mkdir(parents=True, exist_ok=True)
 
+    # Optional two-phase schedule for damage HI (used in damage_v3c)
+    training_cfg = config.get("training_params", {})
+    damage_two_phase = training_cfg.get("damage_two_phase", False)
+    damage_warmup_epochs = training_cfg.get("damage_warmup_epochs", 0)
+    damage_phase1_damage_weight = training_cfg.get(
+        "damage_phase1_damage_weight", config["loss_params"].get("damage_hi_weight", 0.0)
+    )
+    damage_phase2_damage_weight = training_cfg.get(
+        "damage_phase2_damage_weight", config["loss_params"].get("damage_hi_weight", 0.0)
+    )
+
     model, history = train_eol_full_lstm(
         model=model,
         train_loader=train_loader,
@@ -955,6 +987,11 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         cond_recon_weight=config['loss_params'].get('cond_recon_weight', 0.0),
         # NEW: cumulative damage-based HI loss (enabled only for damage-head configs)
         damage_hi_weight=config['loss_params'].get('damage_hi_weight', 0.0),
+        # NEW (v3c): two-phase damage HI training schedule
+        damage_two_phase=damage_two_phase,
+        damage_warmup_epochs=damage_warmup_epochs,
+        damage_phase1_damage_weight=damage_phase1_damage_weight,
+        damage_phase2_damage_weight=damage_phase2_damage_weight,
     )
     
     # ===================================================================

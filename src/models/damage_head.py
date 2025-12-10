@@ -24,35 +24,82 @@ class CumulativeDamageHead(nn.Module):
         L_ref: float = 300.0,
         alpha_base: float = 0.1,
         hidden_dim: int = 64,
+        # NEW: Optional MLP-based damage/HI head (v3c)
+        use_mlp: bool = False,
+        mlp_hidden_factor: int = 2,
+        mlp_num_layers: int = 2,
+        mlp_dropout: float = 0.1,
     ) -> None:
+        """
+        Args:
+            d_model: latent dimension from encoder
+            cond_dim: optional condition feature dimension
+            L_ref, alpha_base, hidden_dim: legacy cumulative-damage parameters
+            use_mlp, mlp_*: if True, use a direct MLP on encoder states to
+                predict HI_seq via a sigmoid, bypassing the cumulative damage
+                integration. This is used for the damage_v3c experiments.
+        """
         super().__init__()
 
         self.L_ref = float(L_ref)
         self.alpha_base = float(alpha_base)
+        self.use_mlp = bool(use_mlp)
 
-        # Global base-damage parameter
-        self.base_bias = nn.Parameter(torch.zeros(1))
+        # ------------------------------------------------------------------
+        # NEW: simple MLP head (damage_v3c) – operates directly on z_seq
+        # ------------------------------------------------------------------
+        if self.use_mlp:
+            hidden_dim_mlp = int(mlp_hidden_factor * d_model)
+            layers = []
+            in_dim = d_model
+            for _ in range(mlp_num_layers):
+                layers.append(nn.Linear(in_dim, hidden_dim_mlp))
+                layers.append(nn.GELU())
+                layers.append(nn.Dropout(mlp_dropout))
+                in_dim = hidden_dim_mlp
+            layers.append(nn.Linear(in_dim, 1))
+            self.mlp_head = nn.Sequential(*layers)
 
-        # Optional condition MLP (stress contribution)
-        if cond_dim is not None and cond_dim > 0:
-            self.cond_mlp = nn.Sequential(
-                nn.Linear(cond_dim, hidden_dim),
+            # For the MLP-mode we still register dummy parameters to keep
+            # the state_dict structure compatible, but they will not be used.
+            self.base_bias = nn.Parameter(torch.zeros(1))
+            self.cond_mlp = None
+            self.sens_mlp = nn.Sequential(
+                nn.Linear(d_model, hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, 1),
             )
+            # Global scaling parameters are not used in the simple MLP path,
+            # but we keep them for backwards compatibility with checkpoints.
+            self.gamma = nn.Parameter(torch.tensor(1.0))
+            self.beta = nn.Parameter(torch.tensor(0.0))
         else:
-            self.cond_mlp = None
+            # ------------------------------------------------------------------
+            # Legacy cumulative damage head (default for all existing runs)
+            # ------------------------------------------------------------------
+            # Global base-damage parameter
+            self.base_bias = nn.Parameter(torch.zeros(1))
 
-        # Latent / sensor-based damage (observable degradation term)
-        self.sens_mlp = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+            # Optional condition MLP (stress contribution)
+            if cond_dim is not None and cond_dim > 0:
+                self.cond_mlp = nn.Sequential(
+                    nn.Linear(cond_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, 1),
+                )
+            else:
+                self.cond_mlp = None
 
-        # Global scaling parameters for damage → [0, 1]
-        self.gamma = nn.Parameter(torch.tensor(1.0))
-        self.beta = nn.Parameter(torch.tensor(0.0))
+            # Latent / sensor-based damage (observable degradation term)
+            self.sens_mlp = nn.Sequential(
+                nn.Linear(d_model, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+
+            # Global scaling parameters for damage → [0, 1]
+            self.gamma = nn.Parameter(torch.tensor(1.0))
+            self.beta = nn.Parameter(torch.tensor(0.0))
 
     def forward(
         self,
@@ -75,6 +122,24 @@ class CumulativeDamageHead(nn.Module):
 
         B, T, D = z_seq.shape
 
+        # ------------------------------------------------------------------
+        # NEW: Simple MLP-based HI head (v3c)
+        # ------------------------------------------------------------------
+        if self.use_mlp:
+            z_flat = z_seq.reshape(B * T, D)
+            out = self.mlp_head(z_flat)  # [B*T, 1]
+            hi_seq = torch.sigmoid(out).view(B, T)
+            hi_last = hi_seq[:, -1]
+            # For compatibility with callers expecting damage sequences,
+            # we construct a surrogate damage sequence as 1 - HI and set
+            # per-step increments to zeros.
+            damage_seq = 1.0 - hi_seq
+            delta_damage = z_seq.new_zeros(B, T)
+            return hi_seq, hi_last, damage_seq, delta_damage
+
+        # ------------------------------------------------------------------
+        # Legacy cumulative damage path (default for all existing runs)
+        # ------------------------------------------------------------------
         # Base damage per step (global, non-negative)
         base_step = (self.alpha_base / self.L_ref) * F.softplus(self.base_bias)
         base_delta = base_step.expand(B, T)  # [B, T]
