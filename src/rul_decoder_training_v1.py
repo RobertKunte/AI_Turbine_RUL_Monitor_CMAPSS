@@ -172,34 +172,80 @@ def train_rul_decoder_v1(config: Dict[str, Any], device: torch.device) -> Dict[s
         if c not in ["UnitNumber", "TimeInCycles", "RUL", "RUL_raw", "MaxTime", "ConditionID"]
     ]
     feature_cols, _ = remove_rul_leakage(feature_cols)
-        
-    # Filter features to match scaler
-    # We must match the features used by the loaded scaler.
-    # Since we loaded the scaler, we should check its input dimension.
-    if hasattr(scaler, "mean_"):
-        expected_dim = scaler.mean_.shape[0]
-        # We need to find the matching columns.
-        # This is tricky without the original feature list.
-        # Ideally model_config has "feature_cols".
+
+    # ------------------------------------------------------------------
+    # Align feature_cols with encoder scaler and apply scaling
+    # ------------------------------------------------------------------
+    if isinstance(scaler, dict):
+        # Condition-wise scaler: dict[cond_id] -> StandardScaler
+        # Try to honour feature_cols from encoder summary if present
         saved_feature_cols = model_config.get("feature_cols")
         if saved_feature_cols:
             feature_cols = saved_feature_cols
-            # Ensure all exist
             missing = [c for c in feature_cols if c not in train_df_fe.columns]
             if missing:
-                raise ValueError(f"Missing features: {missing}")
+                raise ValueError(f"[DecoderV1] Missing features (condition-wise scaler): {missing}")
         else:
-            print(f"Warning: feature_cols not in checkpoint config. Using all numeric features.")
-            # Filter standard
-            feature_cols = [c for c in train_df_fe.columns if c not in ["UnitNumber", "TimeInCycles", "RUL", "RUL_raw", "MaxTime", "ConditionID"]]
-            # Check dim
+            # Use current pipeline features; just log potential mismatch
+            first_scaler = next(iter(scaler.values()))
+            expected_dim = len(getattr(first_scaler, "mean_", np.zeros(len(feature_cols))))
             if len(feature_cols) != expected_dim:
-                print(f"Feature dim mismatch: Got {len(feature_cols)}, Expected {expected_dim}")
-                # Try to use current pipeline features
-                
-    # Scale
-    train_df_fe[feature_cols] = scaler.transform(train_df_fe[feature_cols])
-    test_df_fe[feature_cols] = scaler.transform(test_df_fe[feature_cols])
+                print(
+                    f"[DecoderV1] Warning: condition-wise scaler feature dim mismatch – "
+                    f"pipeline={len(feature_cols)}, scaler={expected_dim}. Continuing anyway."
+                )
+
+        # Apply scaling per condition ID
+        cond_ids_train = train_df_fe["ConditionID"].values
+        cond_ids_test = test_df_fe["ConditionID"].values
+
+        for cond_id, cond_scaler in scaler.items():
+            mask_tr = cond_ids_train == cond_id
+            if np.any(mask_tr):
+                train_df_fe.loc[mask_tr, feature_cols] = cond_scaler.transform(
+                    train_df_fe.loc[mask_tr, feature_cols]
+                )
+
+            mask_te = cond_ids_test == cond_id
+            if np.any(mask_te):
+                test_df_fe.loc[mask_te, feature_cols] = cond_scaler.transform(
+                    test_df_fe.loc[mask_te, feature_cols]
+                )
+
+        # Optional: warn if there are conditions without a scaler entry
+        known_conds = set(scaler.keys())
+        unknown_train = sorted(set(cond_ids_train) - known_conds)
+        unknown_test = sorted(set(cond_ids_test) - known_conds)
+        if unknown_train or unknown_test:
+            print(
+                f"[DecoderV1] Warning: some ConditionIDs have no scaler entry – "
+                f"train_missing={unknown_train}, test_missing={unknown_test}"
+            )
+    else:
+        # Global StandardScaler (single object)
+        if scaler is not None and hasattr(scaler, "mean_"):
+            expected_dim = scaler.mean_.shape[0]
+            saved_feature_cols = model_config.get("feature_cols")
+            if saved_feature_cols:
+                feature_cols = saved_feature_cols
+                missing = [c for c in feature_cols if c not in train_df_fe.columns]
+                if missing:
+                    raise ValueError(f"[DecoderV1] Missing features: {missing}")
+            else:
+                if len(feature_cols) != expected_dim:
+                    print(
+                        f"[DecoderV1] Warning: global scaler feature dim mismatch – "
+                        f"pipeline={len(feature_cols)}, scaler={expected_dim}. Continuing anyway."
+                    )
+        else:
+            # Should not happen if encoder run saved a scaler, but guard anyway
+            from sklearn.preprocessing import StandardScaler
+
+            print("[DecoderV1] Warning: scaler is None or invalid; fitting new global StandardScaler.")
+            scaler = StandardScaler().fit(train_df_fe[feature_cols].values)
+
+        train_df_fe[feature_cols] = scaler.transform(train_df_fe[feature_cols])
+        test_df_fe[feature_cols] = scaler.transform(test_df_fe[feature_cols])
     
     # Build sequences
     seq_len = 30
