@@ -562,6 +562,8 @@ def build_eval_data(
         rul_col="RUL",
         cond_col="ConditionID",
     )
+    X_full, y_full, unit_ids_full, cond_ids_full = result[:4]
+    health_phys_seq_full = result[4] if len(result) > 4 else None
     
     # Simple engine-based split (80/20) for scaler fitting
     unique_units = np.unique(unit_ids_full.numpy())
