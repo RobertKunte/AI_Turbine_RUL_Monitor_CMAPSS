@@ -1224,6 +1224,153 @@ def plot_hi_damage_trajectories(
     print(f"Saved HI Damage trajectories to {out_path}")
 
 
+def plot_hi_phys_v3_true_trajectories(
+    df_test_fe: pd.DataFrame,
+    trajectories: List[EngineTrajectory],
+    out_path: Path,
+    title: str = "HI_phys_v3 true trajectories",
+    max_engines: int = 10,
+) -> None:
+    """
+    Plot true HI_phys_v3 trajectories (no predictions) for a subset of engines.
+
+    Args:
+        df_test_fe: Test DataFrame with columns UnitNumber, TimeInCycles, HI_phys_v3.
+        trajectories: List of EngineTrajectory objects (used to select unit_ids).
+        out_path: Output file path.
+        title: Plot title.
+        max_engines: Maximum number of engines to plot.
+    """
+    if "HI_phys_v3" not in df_test_fe.columns:
+        print("  Warning: HI_phys_v3 not found in df_test_fe, skipping true HI_phys_v3 plot.")
+        return
+
+    unit_ids = [t.unit_id for t in trajectories][:max_engines]
+    if len(unit_ids) == 0:
+        print("  Warning: No trajectories available for HI_phys_v3 plot.")
+        return
+
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+    axes = axes.flatten()
+
+    for idx, uid in enumerate(unit_ids):
+        if idx >= len(axes):
+            break
+        ax = axes[idx]
+        g = (
+            df_test_fe[df_test_fe["UnitNumber"] == uid]
+            .sort_values("TimeInCycles")
+            .copy()
+        )
+        if g.empty or "HI_phys_v3" not in g.columns:
+            continue
+
+        ax.plot(
+            g["TimeInCycles"].to_numpy(),
+            g["HI_phys_v3"].to_numpy(),
+            "b-",
+            linewidth=2,
+            label="HI_phys_v3 (true)",
+        )
+        ax.set_xlabel("Time in Cycles")
+        ax.set_ylabel("HI_phys_v3")
+        ax.set_ylim([0.0, 1.05])
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f"Engine #{uid} – HI_phys_v3 (true)")
+
+    # Hide unused subplots
+    for j in range(len(unit_ids), len(axes)):
+        axes[j].axis("off")
+
+    plt.suptitle(title, fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved true HI_phys_v3 trajectories to {out_path}")
+
+
+def plot_hi_phys_v3_true_vs_pred(
+    df_test_fe: pd.DataFrame,
+    trajectories: List[EngineTrajectory],
+    out_path: Path,
+    title: str = "HI_phys_v3 true vs predicted",
+    max_engines: int = 10,
+) -> None:
+    """
+    Plot true vs predicted HI_phys_v3 trajectories for a subset of engines.
+
+    Uses:
+        - true HI_phys_v3 from df_test_fe["HI_phys_v3"]
+        - predicted damage-based HI from EngineTrajectory.hi_damage
+    """
+    if "HI_phys_v3" not in df_test_fe.columns:
+        print("  Warning: HI_phys_v3 not found in df_test_fe, skipping true-vs-pred plot.")
+        return
+
+    traj_with_damage = [
+        t for t in trajectories if t.hi_damage is not None and len(t.hi_damage) > 0
+    ]
+    if len(traj_with_damage) == 0:
+        print(
+            "  Warning: No trajectories with damage HI available, skipping true-vs-pred HI_phys_v3 plot."
+        )
+        return
+
+    num_engines = min(len(traj_with_damage), max_engines)
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+    axes = axes.flatten()
+
+    for idx, traj in enumerate(traj_with_damage[:max_engines]):
+        ax = axes[idx]
+        uid = traj.unit_id
+        g = (
+            df_test_fe[df_test_fe["UnitNumber"] == uid]
+            .sort_values("TimeInCycles")
+            .copy()
+        )
+        if g.empty:
+            continue
+
+        # Map cycle -> true HI_phys_v3
+        hi_map = dict(zip(g["TimeInCycles"].to_numpy(), g["HI_phys_v3"].to_numpy()))
+        hi_true_aligned = np.array([hi_map.get(c, np.nan) for c in traj.cycles])
+
+        ax.plot(
+            traj.cycles,
+            hi_true_aligned,
+            "b-",
+            linewidth=2,
+            label="HI_phys_v3 (true)",
+            alpha=0.8,
+        )
+        ax.plot(
+            traj.cycles,
+            traj.hi_damage,
+            "m--",
+            linewidth=2,
+            label="HI_damage (pred)",
+            alpha=0.8,
+        )
+
+        ax.set_xlabel("Time in Cycles")
+        ax.set_ylabel("Health Index")
+        ax.set_ylim([0.0, 1.05])
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f"Engine #{uid} – HI_phys_v3 true vs pred")
+
+    # Hide unused subplots
+    for j in range(num_engines, len(axes)):
+        axes[j].axis("off")
+
+    plt.suptitle(title, fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved HI_phys_v3 true vs pred trajectories to {out_path}")
+
+
 def run_diagnostics_for_run(
     exp_dir: Union[str, Path],
     dataset_name: str,
@@ -1462,6 +1609,30 @@ def run_diagnostics_for_run(
         physics_config=physics_config,
         phys_features=phys_features_cfg,
     )
+
+    # For damage_v3-style experiments, compute HI_phys_v3 on the test features
+    # for diagnostics (true physics-based HI trajectory). We do NOT add this
+    # column to feature_cols, so the encoder input dimensionality remains
+    # identical to training.
+    if "damage_v3" in experiment_name.lower():
+        try:
+            from src.features.hi_phys_v3 import compute_hi_phys_v3_from_residuals
+
+            print("  Computing HI_phys_v3 on test data for diagnostics...")
+            hi_v3_test = compute_hi_phys_v3_from_residuals(
+                df_test_fe,
+                unit_col="UnitNumber",
+                cycle_col="TimeInCycles",
+            )
+            df_test_fe["HI_phys_v3"] = hi_v3_test
+            print(
+                f"  HI_phys_v3 (test) stats: "
+                f"min={float(np.nanmin(hi_v3_test)):.4f}, "
+                f"max={float(np.nanmax(hi_v3_test)):.4f}, "
+                f"mean={float(np.nanmean(hi_v3_test)):.4f}"
+            )
+        except Exception as e:
+            print(f"  ⚠️  Could not compute HI_phys_v3 for diagnostics: {e}")
 
     # If we loaded a scaler from the experiment directory, prefer it over the
     # one fitted on-the-fly in build_eval_data to exactly mirror training –
@@ -1782,6 +1953,26 @@ def run_diagnostics_for_run(
                 max_engines=10,
             )
             print(f"  ✓ Saved HI Damage trajectory plots to {experiment_dir / 'hi_damage_10_degraded.png'}")
+
+            # Additional diagnostics for HI_phys_v3-based experiments:
+            # 1) True HI_phys_v3 trajectories for several engines.
+            # 2) True vs predicted HI_phys_v3 (using damage-head HI as prediction).
+            if "HI_phys_v3" in df_test_fe.columns and "damage_v3" in experiment_name.lower():
+                print("  Creating HI_phys_v3 diagnostics plots (true + true vs pred)...")
+                plot_hi_phys_v3_true_trajectories(
+                    df_test_fe=df_test_fe,
+                    trajectories=selected_trajectories,
+                    out_path=experiment_dir / "hi_phys_v3_true_10_degraded.png",
+                    title=f"{dataset_name} HI_phys_v3 true trajectories – 10 degraded engines",
+                    max_engines=10,
+                )
+                plot_hi_phys_v3_true_vs_pred(
+                    df_test_fe=df_test_fe,
+                    trajectories=selected_trajectories,
+                    out_path=experiment_dir / "hi_phys_v3_true_vs_pred_10_degraded.png",
+                    title=f"{dataset_name} HI_phys_v3 true vs pred – 10 degraded engines",
+                    max_engines=10,
+                )
         elif has_damage_hi:
             print(f"  ⚠️  Skipping HI Damage plot: damage HI exists but not in selected degraded engines")
         else:

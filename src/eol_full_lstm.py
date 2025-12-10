@@ -1472,6 +1472,8 @@ def train_eol_full_lstm(
     print(f"Device: {device}")
     print("============================================================")
 
+    first_damage_debug_done = False
+
     for epoch in range(1, num_epochs + 1):
         # Training
         model.train()
@@ -1492,7 +1494,7 @@ def train_eol_full_lstm(
             "damage_hi_loss": [],  # NEW: cumulative damage-based HI loss
         } if use_health_head else None
 
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             # Handle different batch formats:
             # - 5 elements: X, y, unit_ids, cond_ids, health_phys_seq
             # - 4 elements: X, y, unit_ids, cond_ids
@@ -1677,6 +1679,23 @@ def train_eol_full_lstm(
                                 
                                 damage_hi_loss = F.mse_loss(hi_seq_damage_, hi_target_seq_)
                                 loss = loss + damage_hi_weight * damage_hi_loss
+
+                                # DEBUG: Inspect targets and predictions for damage head once
+                                if (
+                                    epoch == 1
+                                    and batch_idx == 0
+                                    and health_phys_seq_batch is not None
+                                    and not first_damage_debug_done
+                                ):
+                                    first_damage_debug_done = True
+                                    with torch.no_grad():
+                                        print("\n[DEBUG damage_head] health_phys_seq_batch[0, :10]:",
+                                              health_phys_seq_batch[0, :10].detach().cpu().numpy())
+                                        print("[DEBUG damage_head] hi_target_seq_[0, :10]:",
+                                              hi_target_seq_[0, :10].detach().cpu().numpy())
+                                        print("[DEBUG damage_head] hi_seq_damage_[0, :10]:",
+                                              hi_seq_damage_[0, :10].detach().cpu().numpy())
+                                        print(f"[DEBUG damage_head] damage_hi_loss: {damage_hi_loss.item():.6e}")
                                 
                                 # ====================================================================
                                 # DEBUG: Sanity-Check des Damage-Heads (einmal pro 5 Epochen)
