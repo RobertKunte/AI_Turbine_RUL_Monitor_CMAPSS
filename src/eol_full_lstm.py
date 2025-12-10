@@ -1371,6 +1371,9 @@ def train_eol_full_lstm(
     damage_phase2_smooth_weight: float | None = None,
     # NEW: RUL Trajectory weight (v3d)
     rul_traj_weight: float = 1.0,
+    # NEW (v3e): damage alignment weights
+    damage_hi_align_start_weight: float = 0.0,
+    damage_hi_align_end_weight: float = 0.0,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Training-Loop für Full-Trajectory LSTM.
@@ -1786,6 +1789,25 @@ def train_eol_full_lstm(
                                 
                                 if smooth_weight_eff > 0:
                                     loss = loss + smooth_weight_eff * damage_smooth_raw
+
+                                # NEW: Alignment loss at start/end of trajectory (v3e)
+                                if (damage_hi_align_start_weight > 0.0 or damage_hi_align_end_weight > 0.0):
+                                    T_align = hi_seq_damage_.size(1)
+                                    k_align = max(1, T_align // 6)
+                                    
+                                    if damage_hi_align_start_weight > 0.0:
+                                        loss_start = F.mse_loss(
+                                            hi_seq_damage_[:, :k_align], 
+                                            hi_target_seq_[:, :k_align]
+                                        )
+                                        loss = loss + damage_hi_align_start_weight * loss_start
+                                    
+                                    if damage_hi_align_end_weight > 0.0:
+                                        loss_end = F.mse_loss(
+                                            hi_seq_damage_[:, -k_align:], 
+                                            hi_target_seq_[:, -k_align:]
+                                        )
+                                        loss = loss + damage_hi_align_end_weight * loss_end
 
                                 # DEBUG: Inspect damage-head input/targets/preds once on first batch
                                 if (

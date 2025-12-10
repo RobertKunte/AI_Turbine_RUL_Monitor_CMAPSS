@@ -702,6 +702,10 @@ def load_model_from_experiment(
         # NEW (v3d): delta cumsum parameters
         damage_use_delta_cumsum = bool(config.get("damage_use_delta_cumsum", False))
         damage_delta_alpha = float(config.get("damage_delta_alpha", 1.0))
+        # NEW (v3e): temporal smoothing
+        damage_use_temporal_conv = bool(config.get("damage_use_temporal_conv", False))
+        damage_temporal_conv_kernel_size = int(config.get("damage_temporal_conv_kernel_size", 3))
+        damage_temporal_conv_num_layers = int(config.get("damage_temporal_conv_num_layers", 1))
 
         model = EOLFullTransformerEncoder(
             input_dim=input_dim,
@@ -730,6 +734,9 @@ def load_model_from_experiment(
             damage_mlp_dropout=damage_mlp_dropout,
             damage_use_delta_cumsum=damage_use_delta_cumsum,
             damage_delta_alpha=damage_delta_alpha,
+            damage_use_temporal_conv=damage_use_temporal_conv,
+            damage_temporal_conv_kernel_size=damage_temporal_conv_kernel_size,
+            damage_temporal_conv_num_layers=damage_temporal_conv_num_layers,
         )
 
         # Optional advanced RUL head (phys_v3/phys_v4 experiments).

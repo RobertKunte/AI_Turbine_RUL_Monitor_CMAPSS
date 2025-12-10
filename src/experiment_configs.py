@@ -1374,6 +1374,47 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase_config() -
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v3e_smooth_config() -> ExperimentConfig:
+    """
+    FD004 ms+DT Transformer-Encoder with Delta-Cumsum DamageHead (v3e).
+    
+    - Based on v3d (delta-cumsum + two-phase)
+    - Adds temporal convolution smoother on delta_damage
+    - Increases smoothness penalties and adjusts RUL trajectory weights
+    - Adds gentle alignment to physical HI at start/end
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v3e_smooth"
+
+    # Encoder / Damage Head params
+    enc = cfg.setdefault("encoder_kwargs", {})
+    enc["damage_use_delta_cumsum"] = True
+    enc["damage_delta_alpha"] = 0.5  # Smaller steps -> smoother
+
+    # New Temporal Conv Smoother flags
+    enc["damage_use_temporal_conv"] = True
+    enc["damage_temporal_conv_kernel_size"] = 5
+    enc["damage_temporal_conv_num_layers"] = 1
+
+    # Training params
+    train = cfg.setdefault("training_params", {})
+    # Adjusted weights for smoothness
+    train["damage_phase1_damage_weight"] = 10.0
+    train["damage_phase2_damage_weight"] = 4.0  # Slightly increased from v3d (3.0)
+    train["damage_phase1_smooth_weight"] = 0.10 # Increased
+    train["damage_phase2_smooth_weight"] = 0.04 # Increased from v3d (0.03)
+
+    # Loss params
+    loss = cfg.setdefault("loss_params", {})
+    loss["rul_traj_weight"] = 2.0  # Increased from v3d (1.5)
+    
+    # New Alignment Weights
+    loss["damage_hi_align_start_weight"] = 0.01
+    loss["damage_hi_align_end_weight"] = 0.02
+
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
     """
     Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
@@ -2881,6 +2922,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v3e_smooth":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v3e_smooth_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":

@@ -33,6 +33,10 @@ class CumulativeDamageHead(nn.Module):
         use_delta_cumsum: bool = False,
         delta_alpha: float = 1.0,
         eps: float = 1e-6,
+        # NEW (v3e): temporal smoothing
+        damage_use_temporal_conv: bool = False,
+        damage_temporal_conv_kernel_size: int = 3,
+        damage_temporal_conv_num_layers: int = 1,
     ) -> None:
         """
         Args:
@@ -45,6 +49,9 @@ class CumulativeDamageHead(nn.Module):
             use_delta_cumsum: enable delta-damage + cumsum mode (v3d)
             delta_alpha: scaling factor for delta damage in v3d mode
             eps: small epsilon for division
+            damage_use_temporal_conv: if True, applies 1D Conv smoothing to delta_raw before accumulation (v3e)
+            damage_temporal_conv_kernel_size: kernel size for temporal smoother
+            damage_temporal_conv_num_layers: number of layers for temporal smoother
         """
         super().__init__()
 
@@ -54,6 +61,35 @@ class CumulativeDamageHead(nn.Module):
         self.use_delta_cumsum = bool(use_delta_cumsum)
         self.delta_alpha = float(delta_alpha)
         self.eps = float(eps)
+        self.damage_use_temporal_conv = bool(damage_use_temporal_conv)
+        self.damage_temporal_conv_kernel_size = int(damage_temporal_conv_kernel_size)
+        self.damage_temporal_conv_num_layers = int(damage_temporal_conv_num_layers)
+
+        # Optional Temporal Smoother (v3e)
+        if self.damage_use_temporal_conv:
+            conv_layers = []
+            in_channels = 1
+            kernel_size = self.damage_temporal_conv_kernel_size
+            padding = (kernel_size - 1) // 2  # "same" padding for odd kernel size
+
+            for i in range(self.damage_temporal_conv_num_layers):
+                conv_layers.append(nn.Conv1d(
+                    in_channels=in_channels,
+                    out_channels=1,
+                    kernel_size=kernel_size,
+                    padding=padding,
+                ))
+                # Add activation if it's not the last layer or just always?
+                # The user prompt example shows: conv -> ReLU.
+                # Since delta_raw is "raw" before softplus, ReLU here forces non-negativity early or just nonlinearity?
+                # However, softplus is applied AFTER smoother. If we use ReLU here, we might clip negatives that could be useful?
+                # But let's follow the user instruction: "conv_layers.append(nn.ReLU())"
+                conv_layers.append(nn.ReLU())
+                # channel remains 1
+            
+            self.delta_temporal_smoother = nn.Sequential(*conv_layers)
+        else:
+            self.delta_temporal_smoother = None
 
         # ------------------------------------------------------------------
         # NEW: simple MLP head (damage_v3c / v3d) – operates directly on z_seq
@@ -143,6 +179,13 @@ class CumulativeDamageHead(nn.Module):
                 # v3d: Delta-Damage + Cumsum
                 delta_raw = out.view(B, T)
                 
+                # Optional Temporal Smoother (v3e)
+                if self.delta_temporal_smoother is not None:
+                    # Conv1d expects [B, C, T]
+                    x = delta_raw.unsqueeze(1)          # [B, 1, T]
+                    x = self.delta_temporal_smoother(x) # [B, 1, T]
+                    delta_raw = x.squeeze(1)            # [B, T]
+
                 # Only positive increments
                 delta_damage = F.softplus(delta_raw) * self.delta_alpha
                 
