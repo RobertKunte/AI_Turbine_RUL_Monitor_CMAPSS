@@ -1601,33 +1601,58 @@ def run_diagnostics_for_run(
         # Extrahiere errors für Plots
         errors = rul_pred_full_np - y_true_eol
         
-        # Get nasa_scores - evaluate_on_test_data uses compute_eol_errors_and_nasa internally
-        # but nasa_scores may not be in the return dict, so we compute them for consistency
-        # However, since evaluate_on_test_data already caps values and computes metrics,
-        # we should use the same capped values for nasa_scores
-        from src.metrics import compute_eol_errors_and_nasa
-        nasa_stats_computed = compute_eol_errors_and_nasa(y_true_eol, rul_pred_full_np, max_rul=None)  # Already capped
-        
-        # Verwende Metriken direkt von evaluate_on_test_data (keine Neuberechnung!)
-        # WICHTIG: pt und nasa_pt kommen direkt aus evaluate_on_test_data, das intern
-        # compute_eol_errors_and_nasa verwendet - also sind die Werte identisch!
+        # WICHTIG: Verwende Metriken DIREKT von evaluate_on_test_data - keine Neuberechnung!
+        # evaluate_on_test_data verwendet intern compute_eol_errors_and_nasa und gibt bereits
+        # alle korrekten Metriken zurück. Jede Neuberechnung könnte zu Inkonsistenzen führen!
+        # 
+        # evaluate_on_test_data gibt zurück:
+        # - "pointwise": {mse, rmse, mae, bias, r2}
+        # - "nasa_pointwise": {score_sum, score_mean}
+        # - "y_true": capped true RUL
+        # - "y_pred": capped predicted RUL
+        # 
+        # Diese Werte sind 100% identisch mit den Werten im Training!
         eol_metrics_dict = {
-            "errors": errors,
-            "mean_error": pt["bias"],
+            "errors": errors,  # errors = rul_pred_full_np - y_true_eol (bereits aus capped Werten)
+            "mean_error": pt["bias"],  # Direkt von evaluate_on_test_data
             "std_error": float(np.std(errors)),
-            "mean_abs_error": pt["mae"],
+            "mean_abs_error": pt["mae"],  # Direkt von evaluate_on_test_data
             "median_error": float(np.median(errors)),
-            "mse": pt.get("mse", float(np.mean(errors ** 2))),
-            "rmse": pt["rmse"],
-            "mae": pt["mae"],
-            "bias": pt["bias"],
-            "r2": pt["r2"],
-            "nasa_scores": nasa_stats_computed["nasa_scores"],  # Use computed for consistency
-            "nasa_mean": nasa_pt["score_mean"],  # Use from evaluate_on_test_data (should match nasa_stats_computed)
-            "nasa_sum": nasa_pt.get("score_sum", nasa_pt["score_mean"] * len(y_true_eol)),
-            "nasa_median": float(np.median(nasa_stats_computed["nasa_scores"])),
+            "mse": pt["mse"],  # Direkt von evaluate_on_test_data
+            "rmse": pt["rmse"],  # Direkt von evaluate_on_test_data - WICHTIG!
+            "mae": pt["mae"],  # Direkt von evaluate_on_test_data
+            "bias": pt["bias"],  # Direkt von evaluate_on_test_data
+            "r2": pt["r2"],  # Direkt von evaluate_on_test_data
+            # NASA scores: evaluate_on_test_data berechnet diese bereits korrekt via compute_eol_errors_and_nasa
+            # Wir müssen sie NICHT neu berechnen, sondern direkt verwenden!
+            "nasa_scores": None,  # Nicht direkt verfügbar, aber nasa_mean/nasa_sum sind korrekt
+            "nasa_mean": nasa_pt["score_mean"],  # Direkt von evaluate_on_test_data - WICHTIG!
+            "nasa_sum": nasa_pt.get("score_sum", nasa_pt["score_mean"] * len(y_true_eol)),  # Direkt von evaluate_on_test_data
+            "nasa_median": None,  # Nicht direkt verfügbar, aber nicht kritisch
             "num_engines": len(y_true_eol),
         }
+        
+        # Für Plots: Berechne nasa_scores nur wenn nötig (für Histogramme etc.)
+        # Aber verwende für die Hauptmetriken die Werte von evaluate_on_test_data!
+        from src.metrics import nasa_phm_score_single
+        nasa_scores_for_plots = np.array([
+            nasa_phm_score_single(true_rul, pred_rul)
+            for true_rul, pred_rul in zip(y_true_eol, rul_pred_full_np)
+        ])
+        eol_metrics_dict["nasa_scores"] = nasa_scores_for_plots
+        eol_metrics_dict["nasa_median"] = float(np.median(nasa_scores_for_plots))
+        
+        # SANITY CHECK: Vergleiche nasa_mean aus evaluate_on_test_data mit unserer Berechnung
+        nasa_mean_computed = float(np.mean(nasa_scores_for_plots))
+        nasa_mean_from_eval = nasa_pt["score_mean"]
+        if abs(nasa_mean_computed - nasa_mean_from_eval) > 1e-6:
+            print(f"  ⚠️  WARNING: NASA mean mismatch!")
+            print(f"     From evaluate_on_test_data: {nasa_mean_from_eval:.6f}")
+            print(f"     Computed from nasa_scores: {nasa_mean_computed:.6f}")
+            print(f"     Difference: {abs(nasa_mean_computed - nasa_mean_from_eval):.6f}")
+            print(f"     Using value from evaluate_on_test_data (training-consistent)")
+        else:
+            print(f"  ✓ NASA mean matches: {nasa_mean_from_eval:.6f}")
 
         print(f"  Test RMSE (from evaluate_on_test_data): {pt['rmse']:.2f} cycles")
         print(f"  Test MAE  (from evaluate_on_test_data): {pt['mae']:.2f} cycles")
