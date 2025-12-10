@@ -3,7 +3,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Optional, Dict, Tuple, List, Any
+from typing import Dict, Any
 
 import numpy as np
 import torch
@@ -14,12 +14,18 @@ from torch.utils.data import DataLoader
 # Use absolute imports
 from src.analysis.inference import reconstruct_model_from_checkpoint
 from src.eol_full_lstm import build_full_eol_sequences_from_df
-from src.data_utils import load_all_data, process_data_frames
-from src.experiment_configs import get_experiment_by_name
-from src.feature_engineering import get_fd004_features_config
+from src.data_loading import load_cmapps_subset
 from src.models.rul_decoder import RULTrajectoryDecoderV1
-from src.models.transformer_eol import EOLFullTransformerEncoder
-from src.additional_features import FeatureConfig, PhysicsFeatureConfig, TemporalFeatureConfig
+from src.additional_features import (
+    FeatureConfig,
+    TemporalFeatureConfig,
+    PhysicsFeatureConfig,
+    create_physical_features,
+    create_all_features,
+    build_condition_features,
+    create_twin_features,
+)
+from src.feature_safety import remove_rul_leakage
 
 
 def build_rul_seq_from_last(rul_last: torch.Tensor, T: int) -> torch.Tensor:
@@ -79,75 +85,87 @@ def train_rul_decoder_v1(config: Dict[str, Any], device: torch.device) -> Dict[s
 
     # 2. Build Datasets
     print("[DecoderV1] Building datasets...")
-    # Load data
-    train_df, test_df = load_all_data(dataset_name)
+    # Load raw FD data (same helper as run_experiments)
+    train_df, test_df, _ = load_cmapps_subset(dataset_name, max_rul=None, clip_train=False, clip_test=True)
     
-    # Feature Config from current experiment config (to match v3d)
-    # We manually construct configs matching v3d/ms_dt_v2
-    # The config passed in (from experiment_configs) has 'features', 'phys_features'
+    # Feature Config from current experiment config (to match ms_dt_v2 style)
     features_cfg = config.get("features", {})
     ms_cfg = features_cfg.get("multiscale", {})
     phys_features_cfg = config.get("phys_features", {})
     
     feature_cfg = FeatureConfig(
-        use_clustering=features_cfg.get("use_clustering", True),
-        use_pca=features_cfg.get("use_pca", True),
-        use_condition_indicators=features_cfg.get("use_condition_indicators", True),
+        add_physical_core=True,
         add_temporal_features=features_cfg.get("use_multiscale_features", True),
         temporal=TemporalFeatureConfig(
-            short_windows=tuple(ms_cfg.get("windows_short", [5, 10])),
-            long_windows=tuple(ms_cfg.get("windows_long", [30])),
+            short_windows=tuple(ms_cfg.get("windows_short", (5, 10))),
+            long_windows=tuple(ms_cfg.get("windows_long", (30,))),
             add_rolling_mean=True,
+            add_rolling_std=False,
             add_trend=True,
-            add_delta=True
-        )
+            add_delta=True,
+            delta_lags=(5, 10),
+        ),
     )
     
-    # Physics Config
-    is_phase4_residual = False # Decoder experiment doesn't use phase4 residual logic implicitly? 
-    # v3d was not phase4? "fd004_transformer_encoder_ms_dt_v2_damage_v3d..."
-    # Usually ms_dt_v2 implies digital twin residuals.
+    # Physics Config (no explicit residual features for decoder)
+    physics_cfg = PhysicsFeatureConfig(
+        use_core=True,
+        use_extended=False,
+        use_residuals=False,
+        use_temporal_on_physics=False,
+    )
+    
+    # 1) Physics features
+    train_df_fe = create_physical_features(train_df, physics_cfg, "UnitNumber", "TimeInCycles")
+    test_df_fe = create_physical_features(test_df, physics_cfg, "UnitNumber", "TimeInCycles")
+    
+    # 2) Continuous condition vector
+    if phys_features_cfg.get("use_condition_vector", False):
+        train_df_fe = build_condition_features(
+            train_df_fe, "UnitNumber", "TimeInCycles", version=phys_features_cfg.get("condition_vector_version", 2)
+        )
+        test_df_fe = build_condition_features(
+            test_df_fe, "UnitNumber", "TimeInCycles", version=phys_features_cfg.get("condition_vector_version", 2)
+        )
+    
+    # 3) Digital twin residuals
     use_twin = phys_features_cfg.get("use_twin_features", False)
     twin_baseline = phys_features_cfg.get("twin_baseline_len", 30)
-    
-    physics_cfg = PhysicsFeatureConfig(
-        use_physics=True, 
-        use_hpc_efficiency=True, 
-        use_fan_efficiency=True,
-        use_residuals=False # Not Phase 4 residuals
-    )
-    
-    # Process features
-    # Note: we pass the scaler from the checkpoint to ensure consistency!
-    # process_data_frames can return a new scaler or use provided one.
-    # But process_data_frames fits scaler on train. We want to reuse the one from encoder training.
-    # Actually, if we use the same pipeline, fitting on train is deterministic and should match.
-    # But using the saved scaler is safer.
-    
-    print("[DecoderV1] Processing data frames...")
-    train_df_fe, test_df_fe, feature_cols, _ = process_data_frames(
-        train_df, test_df, 
-        feature_config=feature_cfg,
-        physics_config=physics_cfg,
-        temporal_config=feature_cfg.temporal,
-        scaler=None, # We'll scale manually
-        return_scaler=True
-    )
-    
-    # Add condition vector / twin features if enabled
-    if phys_features_cfg.get("use_condition_vector", False):
-        from src.additional_features import build_condition_features
-        train_df_fe = build_condition_features(train_df_fe, "UnitNumber", "TimeInCycles", version=phys_features_cfg.get("condition_vector_version", 2))
-        test_df_fe = build_condition_features(test_df_fe, "UnitNumber", "TimeInCycles", version=phys_features_cfg.get("condition_vector_version", 2))
-        
     if use_twin:
-        from src.additional_features import create_twin_features
         train_df_fe, twin_model = create_twin_features(
-            train_df_fe, "UnitNumber", "TimeInCycles", 
-            baseline_len=twin_baseline, 
-            condition_vector_version=phys_features_cfg.get("condition_vector_version", 2)
+            train_df_fe,
+            unit_col="UnitNumber",
+            cycle_col="TimeInCycles",
+            baseline_len=twin_baseline,
+            condition_vector_version=phys_features_cfg.get("condition_vector_version", 2),
         )
         test_df_fe = twin_model.add_twin_and_residuals(test_df_fe)
+    
+    # 4) Temporal / multi-scale features
+    train_df_fe = create_all_features(
+        train_df_fe,
+        "UnitNumber",
+        "TimeInCycles",
+        feature_cfg,
+        inplace=False,
+        physics_config=physics_cfg,
+    )
+    test_df_fe = create_all_features(
+        test_df_fe,
+        "UnitNumber",
+        "TimeInCycles",
+        feature_cfg,
+        inplace=False,
+        physics_config=physics_cfg,
+    )
+    
+    # 5) Feature columns (match training-time encoder pipeline)
+    feature_cols = [
+        c
+        for c in train_df_fe.columns
+        if c not in ["UnitNumber", "TimeInCycles", "RUL", "RUL_raw", "MaxTime", "ConditionID"]
+    ]
+    feature_cols, _ = remove_rul_leakage(feature_cols)
         
     # Filter features to match scaler
     # We must match the features used by the loaded scaler.
