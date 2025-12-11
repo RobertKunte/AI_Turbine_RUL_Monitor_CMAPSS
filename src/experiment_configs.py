@@ -1310,6 +1310,50 @@ def get_fd004_decoder_v1_from_encoder_v3d_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd004_decoder_v3_from_encoder_v3d_config() -> ExperimentConfig:
+    """
+    FD004 RUL Trajectory Decoder v3 on top of a frozen encoder v3d.
+
+    This config allows launching the standalone decoder v3 training script via
+    run_experiments.py using:
+
+        --experiments fd004_decoder_v3_from_encoder_v3d
+    """
+    encoder_experiment = "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase"
+    dataset = "FD004"
+
+    cfg: ExperimentConfig = {
+        "experiment_name": "fd004_decoder_v3_from_encoder_v3d",
+        "dataset": dataset,
+        # Custom encoder_type used as a switch in run_experiments.run_single_experiment
+        "encoder_type": "decoder_v3",
+        # Reference to the frozen encoder run
+        "encoder_experiment": encoder_experiment,
+        # Path to the global HI calibrator (fit via src.analysis.hi_calibration)
+        "hi_calibrator_path": (
+            f"results/{dataset.lower()}/{encoder_experiment}/hi_calibrator_{dataset}.pkl"
+        ),
+        # Decoder v3 hyperparameters and training settings
+        "past_len": 30,
+        "max_rul": 125.0,
+        "training_params": {
+            "num_epochs": 80,
+            "batch_size": 256,
+            "engine_train_ratio": 0.8,
+            "random_seed": 42,
+        },
+        "decoder_hidden_dim": 128,
+        "decoder_num_layers": 2,
+        "decoder_dropout": 0.1,
+        # Loss weights
+        "w_traj": 1.0,
+        "w_eol": 0.2,
+        "w_mono": 0.1,
+        "w_smooth": 0.01,
+        "w_slope": 0.2,
+    }
+    return cfg
+
 def get_fd004_decoder_v2_from_encoder_v3d_config() -> ExperimentConfig:
     """
     FD004 RUL Trajectory Decoder v2 on top of a frozen encoder v3d.
@@ -3011,6 +3055,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_decoder_v1_from_encoder_v3e_config()
     if experiment_name == "fd004_decoder_v2_from_encoder_v3d":
         return get_fd004_decoder_v2_from_encoder_v3d_config()
+    if experiment_name == "fd004_decoder_v3_from_encoder_v3d":
+        return get_fd004_decoder_v3_from_encoder_v3d_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":

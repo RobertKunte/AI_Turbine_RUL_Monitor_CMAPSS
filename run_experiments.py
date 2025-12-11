@@ -116,9 +116,10 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     experiment_name = config['experiment_name']
 
     # ===================================================================
-    # Special case: RUL Trajectory Decoder v1/v2 on top of frozen encoder v3d/v3e
+    # Special case: RUL Trajectory Decoders on top of frozen encoder v3d/v3e
     # ===================================================================
     encoder_type_cfg = config.get("encoder_type")
+
     if encoder_type_cfg in ["decoder_v1_from_encoder_v3d", "decoder_v1_from_encoder_v3e"]:
         from src.rul_decoder_training_v1 import train_rul_decoder_v1
 
@@ -126,7 +127,6 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         epochs = int(train_cfg.get("num_epochs", 50))
         batch_size = int(train_cfg.get("batch_size", 256))
 
-        # Map torch.device to simple string for the decoder script
         device_str = "cuda" if str(device).startswith("cuda") else "cpu"
 
         if encoder_type_cfg == "decoder_v1_from_encoder_v3d":
@@ -150,8 +150,6 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             decoder_results_subdir=decoder_subdir,
         )
 
-        # After training finishes, attempt to load its summary JSON to return
-        # a consistent summary dict to the caller.
         decoder_results_dir = Path("results") / dataset_name.lower() / decoder_subdir
         summary_path = decoder_results_dir / "summary_decoder_v1.json"
         if summary_path.exists():
@@ -174,6 +172,17 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             f"  -> encoder_experiment = {config.get('encoder_experiment', 'fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase')}\n"
         )
         summary = train_rul_decoder_v2(config, device)
+        return summary
+
+    if encoder_type_cfg == "decoder_v3":
+        from src.rul_decoder_training_v3 import train_rul_decoder_v3
+
+        print(
+            "\n[decoder_v3] Launching RUL Trajectory Decoder v3 training "
+            f"for experiment '{experiment_name}' on {device}\n"
+            f"  -> encoder_experiment = {config.get('encoder_experiment', 'fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase')}\n"
+        )
+        summary = train_rul_decoder_v3(config, device)
         return summary
     
     # ===================================================================
