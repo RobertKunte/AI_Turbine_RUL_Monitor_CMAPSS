@@ -37,7 +37,7 @@ from src.analysis.hi_calibration import load_hi_calibrator, calibrate_hi_array
 from src.analysis.decoder_v1_per_engine_plots import (
     prepare_fd004_test_full_sequences,
 )
-from src.models.rul_decoder import RULTrajectoryDecoderV2
+from src.models.rul_decoder import RULTrajectoryDecoderV2, RULTrajectoryDecoderV3
 from src.rul_decoder_training_v1 import apply_loaded_scaler
 
 
@@ -49,7 +49,41 @@ class EngineTrajectoryV2:
     rul_pred: np.ndarray       # [T_engine]
     hi_phys: np.ndarray        # [T_engine]
     hi_cal: np.ndarray         # [T_engine]
-    hi_damage: np.ndarray      # [T_engine]
+        hi_damage: np.ndarray      # [T_engine]
+
+
+# Slope windows used for Decoder v3 (must match training)
+SLOPE_WINDOW_SIZES: Tuple[int, ...] = (1, 3, 5)
+
+
+def compute_slope_features_for_v3(
+    hi_phys_seq: torch.Tensor,
+    hi_cal2_seq: torch.Tensor,
+    hi_damage_seq: torch.Tensor,
+    window_sizes: Tuple[int, ...] = SLOPE_WINDOW_SIZES,
+) -> torch.Tensor:
+    """
+    Compute local slopes/deltas for HI_phys, HI_cal2, HI_damage at multiple scales.
+
+    Mirrors the helper used in Decoder v3 training so that the decoder receives
+    the same slope feature layout at inference time.
+    """
+    signals = [hi_phys_seq, hi_cal2_seq, hi_damage_seq]
+    B, T = hi_phys_seq.shape
+    slope_feats: List[torch.Tensor] = []
+
+    for sig in signals:
+        for w in window_sizes:
+            if w <= 0:
+                continue
+            pad = sig[:, :1].expand(-1, w)  # [B, w]
+            padded = torch.cat([pad, sig], dim=1)  # [B, T + w]
+            prev = padded[:, :-w]  # [B, T]
+            curr = padded[:, w:]   # [B, T]
+            delta = (curr - prev) / float(w)
+            slope_feats.append(delta.unsqueeze(-1))
+
+    return torch.cat(slope_feats, dim=-1)  # [B, T, S]
 
 
 def load_encoder_and_decoder_v2(
@@ -58,7 +92,7 @@ def load_encoder_and_decoder_v2(
     device: torch.device,
 ) -> Tuple[nn.Module, nn.Module, Path, Dict[str, Any]]:
     """
-    Load frozen encoder and trained Decoder v2 for a given run.
+    Load frozen encoder and trained Decoder (v2 or v3) for a given run.
 
     Returns:
         encoder, decoder, results_dir_run, decoder_summary
@@ -67,24 +101,32 @@ def load_encoder_and_decoder_v2(
     if not results_dir_run.exists():
         raise FileNotFoundError(f"Decoder run directory not found: {results_dir_run}")
 
-    summary_path = results_dir_run / "summary_decoder_v2.json"
-    if not summary_path.exists():
-        # Fallback: delegate to decoder_v1 script if this is a v1 run
-        alt_summary_v1 = results_dir_run / "summary_decoder_v1.json"
-        if alt_summary_v1.exists():
-            raise RuntimeError(
-                f"summary_decoder_v2.json not found at {summary_path}. "
-                f"This looks like a decoder_v1 run; please use "
-                f"'python -m src.analysis.decoder_v1_per_engine_plots' instead."
-            )
-        raise FileNotFoundError(f"summary_decoder_v2.json not found at {summary_path}")
+    summary_v2 = results_dir_run / "summary_decoder_v2.json"
+    summary_v3 = results_dir_run / "summary_decoder_v3.json"
+    summary_v1 = results_dir_run / "summary_decoder_v1.json"
+
+    if summary_v2.exists():
+        decoder_version = "v2"
+        summary_path = summary_v2
+    elif summary_v3.exists():
+        decoder_version = "v3"
+        summary_path = summary_v3
+    elif summary_v1.exists():
+        raise RuntimeError(
+            f"Decoder v1 summary found at {summary_v1}. "
+            f"Please use 'python -m src.analysis.decoder_v1_per_engine_plots' for this run."
+        )
+    else:
+        raise FileNotFoundError(
+            f"Neither summary_decoder_v2.json nor summary_decoder_v3.json found in {results_dir_run}"
+        )
 
     with open(summary_path, "r") as f:
         summary = json.load(f)
 
     encoder_experiment = summary.get("encoder_experiment")
     if encoder_experiment is None:
-        raise RuntimeError("encoder_experiment missing from decoder_v2 summary.")
+        raise RuntimeError("encoder_experiment missing from decoder summary.")
 
     encoder_experiment_dir = Path("results") / dataset.lower() / encoder_experiment
     if not encoder_experiment_dir.exists():
@@ -102,25 +144,38 @@ def load_encoder_and_decoder_v2(
     if latent_dim is None:
         raise RuntimeError("Encoder is missing attribute d_model; expected Transformer encoder.")
 
-    # Instantiate decoder v2 (use defaults that match training script)
-    decoder = RULTrajectoryDecoderV2(
-        latent_dim=latent_dim,
-        hi_feature_dim=3,
-        hidden_dim=summary.get("training", {}).get("decoder_hidden_dim", 128),
-        num_layers=summary.get("training", {}).get("decoder_num_layers", 2),
-        dropout=summary.get("training", {}).get("decoder_dropout", 0.1),
-        use_zone_weights=True,
-    ).to(device)
+    # Instantiate appropriate decoder
+    if decoder_version == "v2":
+        decoder = RULTrajectoryDecoderV2(
+            latent_dim=latent_dim,
+            hi_feature_dim=3,
+            hidden_dim=summary.get("training", {}).get("decoder_hidden_dim", 128),
+            num_layers=summary.get("training", {}).get("decoder_num_layers", 2),
+            dropout=summary.get("training", {}).get("decoder_dropout", 0.1),
+            use_zone_weights=True,
+        ).to(device)
+        decoder_ckpt_path = results_dir_run / "decoder_v2_best.pt"
+    else:  # decoder_version == "v3"
+        decoder = RULTrajectoryDecoderV3(
+            latent_dim=latent_dim,
+            hi_feature_dim=4,
+            slope_feature_dim=len(SLOPE_WINDOW_SIZES) * 3,
+            hidden_dim=summary.get("training", {}).get("decoder_hidden_dim", 128),
+            num_layers=summary.get("training", {}).get("decoder_num_layers", 2),
+            dropout=summary.get("training", {}).get("decoder_dropout", 0.1),
+        ).to(device)
+        decoder_ckpt_path = results_dir_run / "decoder_v3_best.pt"
 
-    # Load decoder weights
-    decoder_ckpt_path = results_dir_run / "decoder_v2_best.pt"
     if not decoder_ckpt_path.exists():
-        raise FileNotFoundError(f"Decoder v2 checkpoint not found: {decoder_ckpt_path}")
+        raise FileNotFoundError(f"Decoder checkpoint not found: {decoder_ckpt_path}")
 
     ckpt = torch.load(decoder_ckpt_path, map_location=device)
     state_dict = ckpt.get("state_dict", ckpt)
     decoder.load_state_dict(state_dict)
     decoder.eval()
+
+    # Store version info in summary for downstream logic
+    summary.setdefault("decoder_version", decoder_version)
 
     return encoder, decoder, results_dir_run, summary
 
@@ -246,6 +301,159 @@ def build_engine_trajectories_v2(
         all_errors_traj.extend(err_traj_u.tolist())
 
         # EOL window = minimal true RUL (should correspond to last sample)
+        eol_local_idx = int(np.argmin(rul_true_u))
+        err_eol = float(rul_pred_u[eol_local_idx] - rul_true_u[eol_local_idx])
+        errors_eol[int(uid)] = err_eol
+        cond_ids_eol[int(uid)] = int(cond_ids_np[idxs_sorted[eol_local_idx]])
+        hi_phys_eol[int(uid)] = float(hi_phys_u[eol_local_idx])
+        hi_cal_eol[int(uid)] = float(hi_cal_u[eol_local_idx])
+
+        engine_trajs[int(uid)] = EngineTrajectoryV2(
+            unit_id=int(uid),
+            time_idx=time_idx_u,
+            rul_true=rul_true_u,
+            rul_pred=rul_pred_u,
+            hi_phys=hi_phys_u,
+            hi_cal=hi_cal_u,
+            hi_damage=hi_damage_u,
+        )
+
+    return (
+        engine_trajs,
+        errors_eol,
+        cond_ids_eol,
+        hi_phys_eol,
+        hi_cal_eol,
+        np.asarray(all_life_frac, dtype=np.float32),
+        np.asarray(all_errors_traj, dtype=np.float32),
+    )
+
+
+def build_engine_trajectories_v3(
+    encoder: nn.Module,
+    decoder: nn.Module,
+    X_full: torch.Tensor,
+    y_full: torch.Tensor,
+    unit_ids_full: torch.Tensor,
+    cond_ids_full: torch.Tensor,
+    hi_phys_seq_full: torch.Tensor,
+    hi_cal1_seq_full: torch.Tensor,
+    device: torch.device,
+) -> Tuple[
+    Dict[int, EngineTrajectoryV2],
+    Dict[int, float],
+    Dict[int, int],
+    Dict[int, float],
+    Dict[int, float],
+    np.ndarray,
+    np.ndarray,
+]:
+    """
+    Build per-engine trajectories and trajectory errors for Decoder v3.
+
+    This mirrors build_engine_trajectories_v2 but additionally computes
+    slope features and passes them to the v3 decoder.
+    """
+    encoder.eval()
+    decoder.eval()
+
+    unit_ids_np = unit_ids_full.cpu().numpy()
+    y_full_np = y_full.cpu().numpy()
+    cond_ids_np = cond_ids_full.cpu().numpy()
+
+    N = X_full.shape[0]
+    rul_true_all = np.zeros(N, dtype=np.float32)
+    rul_pred_all = np.zeros(N, dtype=np.float32)
+    hi_phys_all = np.zeros(N, dtype=np.float32)
+    hi_cal_all = np.zeros(N, dtype=np.float32)
+    hi_damage_all = np.zeros(N, dtype=np.float32)
+
+    batch_size = 512
+    num_batches = int(np.ceil(N / batch_size))
+
+    with torch.no_grad():
+        for b in range(num_batches):
+            start = b * batch_size
+            end = min((b + 1) * batch_size, N)
+            X_batch = X_full[start:end].to(device)
+            y_batch = y_full[start:end].to(device)
+            cond_ids_batch = cond_ids_full[start:end].to(device)
+
+            hi_phys_seq_batch = hi_phys_seq_full[start:end].to(device)
+            hi_cal1_seq_batch = hi_cal1_seq_full[start:end].to(device)
+            hi_cal2_seq_batch = 1.0 - hi_cal1_seq_batch
+
+            # Encoder -> latent + damage-based HI sequence
+            z_seq, _, hi_damage_seq = encoder.encode_with_hi(
+                X_batch,
+                cond_ids=cond_ids_batch,
+                cond_vec=None,
+            )
+
+            if hi_damage_seq.dim() == 3:
+                hi_damage_seq_use = hi_damage_seq.squeeze(-1)
+            else:
+                hi_damage_seq_use = hi_damage_seq
+
+            slope_feats = compute_slope_features_for_v3(
+                hi_phys_seq_batch, hi_cal2_seq_batch, hi_damage_seq_use, SLOPE_WINDOW_SIZES
+            )
+
+            # Decoder v3 RUL trajectory
+            rul_seq_pred, _ = decoder(
+                z_seq=z_seq,
+                hi_phys_seq=hi_phys_seq_batch,
+                hi_cal1_seq=hi_cal1_seq_batch,
+                hi_cal2_seq=hi_cal2_seq_batch,
+                hi_damage_seq=hi_damage_seq_use,
+                slope_feats=slope_feats,
+            )
+            eol_pred = rul_seq_pred[:, -1]
+
+            # HI values at last timestep of window
+            hi_phys_last = hi_phys_seq_batch[:, -1]
+            hi_cal_last = hi_cal1_seq_batch[:, -1]
+            hi_damage_last = hi_damage_seq_use[:, -1]
+
+            idx_slice = slice(start, end)
+            rul_true_all[idx_slice] = y_batch.cpu().numpy()
+            rul_pred_all[idx_slice] = eol_pred.cpu().numpy()
+            hi_phys_all[idx_slice] = hi_phys_last.cpu().numpy()
+            hi_cal_all[idx_slice] = hi_cal_last.cpu().numpy()
+            hi_damage_all[idx_slice] = hi_damage_last.cpu().numpy()
+
+    # Build per-engine trajectories (same structure as v2)
+    engine_trajs: Dict[int, EngineTrajectoryV2] = {}
+    errors_eol: Dict[int, float] = {}
+    cond_ids_eol: Dict[int, int] = {}
+    hi_phys_eol: Dict[int, float] = {}
+    hi_cal_eol: Dict[int, float] = {}
+    all_life_frac: List[float] = []
+    all_errors_traj: List[float] = []
+
+    unique_units = np.unique(unit_ids_np)
+    for uid in unique_units:
+        mask = unit_ids_np == uid
+        idxs = np.nonzero(mask)[0]
+        if idxs.size == 0:
+            continue
+
+        idxs_sorted = np.sort(idxs)
+
+        rul_true_u = rul_true_all[idxs_sorted]
+        rul_pred_u = rul_pred_all[idxs_sorted]
+        hi_phys_u = hi_phys_all[idxs_sorted]
+        hi_cal_u = hi_cal_all[idxs_sorted]
+        hi_damage_u = hi_damage_all[idxs_sorted]
+
+        T_u = len(idxs_sorted)
+        time_idx_u = np.arange(T_u, dtype=np.float32)
+
+        life_frac_u = (time_idx_u + 1.0) / float(T_u)
+        err_traj_u = rul_pred_u - rul_true_u
+        all_life_frac.extend(life_frac_u.tolist())
+        all_errors_traj.extend(err_traj_u.tolist())
+
         eol_local_idx = int(np.argmin(rul_true_u))
         err_eol = float(rul_pred_u[eol_local_idx] - rul_true_u[eol_local_idx])
         errors_eol[int(uid)] = err_eol
@@ -486,13 +694,15 @@ def main(args: argparse.Namespace) -> None:
     print(f"[decoder_v2] Using device: {device}")
 
     # ------------------------------------------------------------------
-    # 1) Load encoder + decoder v2
+    # 1) Load encoder + decoder (v2 or v3)
     # ------------------------------------------------------------------
     encoder, decoder, results_dir_run, summary = load_encoder_and_decoder_v2(dataset, run, device)
 
     encoder_experiment = summary.get("encoder_experiment")
     if encoder_experiment is None:
-        raise RuntimeError("encoder_experiment missing from decoder_v2 summary.")
+        raise RuntimeError("encoder_experiment missing from decoder summary.")
+
+    decoder_version = summary.get("decoder_version", summary.get("model_type", "decoder_v2"))
 
     # ------------------------------------------------------------------
     # 2) Prepare full TEST sliding windows (features + HI_phys_v3)
@@ -565,25 +775,46 @@ def main(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # 4) Build per-engine trajectories and EOL errors
     # ------------------------------------------------------------------
-    (
-        engine_trajs,
-        errors_eol,
-        cond_ids_eol,
-        hi_phys_eol,
-        hi_cal_eol,
-        all_life_frac,
-        all_errors_traj,
-    ) = build_engine_trajectories_v2(
-        encoder=encoder,
-        decoder=decoder,
-        X_full=X_full_test_scaled,
-        y_full=y_full_test,
-        unit_ids_full=unit_ids_full_test,
-        cond_ids_full=cond_ids_full_test,
-        hi_phys_seq_full=hi_phys_seq_test,
-        hi_cal_seq_full=hi_cal_seq_test,
-        device=device,
-    )
+    if str(decoder_version).endswith("v3") or decoder_version == "decoder_v3":
+        (
+            engine_trajs,
+            errors_eol,
+            cond_ids_eol,
+            hi_phys_eol,
+            hi_cal_eol,
+            all_life_frac,
+            all_errors_traj,
+        ) = build_engine_trajectories_v3(
+            encoder=encoder,
+            decoder=decoder,
+            X_full=X_full_test_scaled,
+            y_full=y_full_test,
+            unit_ids_full=unit_ids_full_test,
+            cond_ids_full=cond_ids_full_test,
+            hi_phys_seq_full=hi_phys_seq_test,
+            hi_cal1_seq_full=hi_cal_seq_test,
+            device=device,
+        )
+    else:
+        (
+            engine_trajs,
+            errors_eol,
+            cond_ids_eol,
+            hi_phys_eol,
+            hi_cal_eol,
+            all_life_frac,
+            all_errors_traj,
+        ) = build_engine_trajectories_v2(
+            encoder=encoder,
+            decoder=decoder,
+            X_full=X_full_test_scaled,
+            y_full=y_full_test,
+            unit_ids_full=unit_ids_full_test,
+            cond_ids_full=cond_ids_full_test,
+            hi_phys_seq_full=hi_phys_seq_test,
+            hi_cal_seq_full=hi_cal_seq_test,
+            device=device,
+        )
 
     # ------------------------------------------------------------------
     # 5) Select worst / medium / best groups by |EOL error|
