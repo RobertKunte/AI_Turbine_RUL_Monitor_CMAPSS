@@ -173,6 +173,25 @@ def calibrate_hi_array(
     return hi_cal.astype(hi_phys_arr.dtype, copy=False)
 
 
+def hi_cal_v2_from_v1(hi_cal_v1: np.ndarray) -> np.ndarray:
+    """
+    Convert HI_cal_v1 (0=worst, 1=best) to HI_cal_v2 (1=healthy, 0=EOL).
+
+    Supports both 1D [N] and 2D [N, T] arrays and preserves the input dtype.
+    Ensures the result is clipped to [0, 1].
+    """
+    hi = np.asarray(hi_cal_v1, dtype=float)
+    if hi.ndim == 0:
+        hi = hi[None]
+    # Invert: 1 - h, then clip to [0, 1]
+    inv = 1.0 - hi
+    inv = np.clip(inv, 0.0, 1.0)
+    # Cast back to original dtype if it was float32/float64
+    if np.issubdtype(hi_cal_v1.dtype, np.floating):
+        inv = inv.astype(hi_cal_v1.dtype, copy=False)
+    return inv
+
+
 def _build_fd004_train_hi_arrays(
     dataset: str,
     encoder_run: str,

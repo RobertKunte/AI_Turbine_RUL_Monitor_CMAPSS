@@ -9,7 +9,7 @@ NASA CMAPSS specifics. The training scripts are responsible for providing
 properly prepared inputs.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -265,3 +265,98 @@ class DecoderV2Wrapper(nn.Module):
         rul_seq_pred = self.decoder(z_seq, hi_phys_seq, hi_cal_seq, hi_damage_seq)
         return rul_seq_pred
 
+
+class RULTrajectoryDecoderV3(nn.Module):
+    """
+    RUL trajectory decoder with explicit modelling of degradation dynamics.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        hi_feature_dim: int = 4,
+        slope_feature_dim: int = 6,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        self.lat = latent_dim
+        self.hi_feature_dim = hi_feature_dim
+        self.slope_feature_dim = slope_feature_dim
+
+        input_dim = latent_dim + hi_feature_dim + slope_feature_dim
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.rnn = nn.GRU(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        # Main RUL trajectory head
+        self.rul_head = nn.Linear(hidden_dim, 1)
+
+        # Auxiliary degradation-rate head (per time step)
+        self.degradation_head = nn.Linear(hidden_dim, 1)
+
+    def forward(
+        self,
+        z_seq: torch.Tensor,
+        hi_phys_seq: torch.Tensor,
+        hi_cal1_seq: torch.Tensor,
+        hi_cal2_seq: torch.Tensor,
+        hi_damage_seq: torch.Tensor,
+        slope_feats: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            z_seq:         [B, T, D_z] latent encoder sequence
+            hi_phys_seq:   [B, T]     physics HI
+            hi_cal1_seq:   [B, T]     HI_cal_v1 (0..1, healthy high)
+            hi_cal2_seq:   [B, T]     HI_cal_v2 (1..0, healthy->EOL)
+            hi_damage_seq: [B, T]     learned damage HI
+            slope_feats:   [B, T, S]  slope features for health signals
+
+        Returns:
+            rul_seq_pred:  [B, T] predicted RUL trajectory
+            degr_rate_pred:[B, T] predicted degradation rate per timestep
+        """
+        if z_seq.dim() != 3:
+            raise ValueError(f"z_seq must be [B,T,D_z], got shape {tuple(z_seq.shape)}")
+
+        B, T, _ = z_seq.shape
+
+        def _ensure_bt(x: torch.Tensor, name: str) -> torch.Tensor:
+            if x.dim() == 3:
+                x = x.squeeze(-1)
+            if x.shape[:2] != (B, T):
+                raise ValueError(
+                    f\"{name} must be [B,T], got {tuple(x.shape)} vs expected {(B, T)}\"
+                )
+            return x
+
+        hi_phys_seq = _ensure_bt(hi_phys_seq, "hi_phys_seq")
+        hi_cal1_seq = _ensure_bt(hi_cal1_seq, "hi_cal1_seq")
+        hi_cal2_seq = _ensure_bt(hi_cal2_seq, "hi_cal2_seq")
+        hi_damage_seq = _ensure_bt(hi_damage_seq, "hi_damage_seq")
+
+        if slope_feats.dim() != 3 or slope_feats.shape[:2] != (B, T):
+            raise ValueError(
+                f"slope_feats must be [B,T,S], got {tuple(slope_feats.shape)}"
+            )
+
+        hi_stack = torch.stack(
+            [hi_phys_seq, hi_cal1_seq, hi_cal2_seq, hi_damage_seq], dim=-1
+        )  # [B, T, 4]
+        x = torch.cat([z_seq, hi_stack, slope_feats], dim=-1)  # [B, T, latent+4+S]
+
+        x_proj = torch.relu(self.input_proj(x))  # [B, T, H]
+        rnn_out, _ = self.rnn(x_proj)  # [B, T, H]
+
+        rul_seq_pred = self.rul_head(rnn_out).squeeze(-1)  # [B, T]
+        degr_rate_pred = self.degradation_head(rnn_out).squeeze(-1)  # [B, T]
+
+        return rul_seq_pred, degr_rate_pred
