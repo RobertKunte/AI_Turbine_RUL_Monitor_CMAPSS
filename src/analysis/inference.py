@@ -709,10 +709,26 @@ def load_model_from_experiment(
         damage_temporal_conv_num_layers = int(config.get("damage_temporal_conv_num_layers", 1))
 
         # v4/v5: calibrated HI head + v5-specific flags
-        use_hi_cal_head = bool(config.get("use_hi_cal_head", False))
-        use_condition_normalizer = bool(config.get("use_condition_normalizer", False))
-        condition_normalizer_hidden_dim = int(config.get("condition_normalizer_hidden_dim", 64))
+        # Prefer checkpoint structure when summary is missing these flags (backward compatible)
+        keys = list(state_dict.keys())
+        has_hi_cal_head = any("hi_cal_head.0.weight" in k for k in keys)
+        has_cond_norm = any("condition_normalizer.net.0.weight" in k for k in keys)
+        fc_rul_key = next((k for k in keys if k.endswith("fc_rul.weight")), None)
+        fc_rul_in = state_dict[fc_rul_key].shape[1] if fc_rul_key is not None else d_model
+
+        use_hi_cal_head = bool(config.get("use_hi_cal_head", has_hi_cal_head))
+        use_condition_normalizer = bool(config.get("use_condition_normalizer", has_cond_norm))
+        cond_hidden_cfg = config.get("condition_normalizer_hidden_dim")
+        if cond_hidden_cfg is None and has_cond_norm and "condition_normalizer.net.0.weight" in state_dict:
+            # condition_normalizer.net.0 is the first Linear layer: [hidden_dim, cond_dim]
+            cond_hidden_cfg = state_dict["condition_normalizer.net.0.weight"].shape[0]
+        condition_normalizer_hidden_dim = int(cond_hidden_cfg or 64)
+        # Detect if RUL head was trained with HI_cal fusion by comparing input dim
         use_hi_cal_fusion_for_rul = bool(config.get("use_hi_cal_fusion_for_rul", False))
+        if fc_rul_key is not None and fc_rul_in != d_model:
+            # Checkpoint fc_rul expects a larger input (typically d_model+1), so
+            # enable HI_cal fusion flag to match training-time architecture.
+            use_hi_cal_fusion_for_rul = True
 
         model = EOLFullTransformerEncoder(
             input_dim=input_dim,
