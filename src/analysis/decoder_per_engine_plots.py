@@ -49,7 +49,7 @@ class EngineTrajectoryV2:
     rul_pred: np.ndarray       # [T_engine]
     hi_phys: np.ndarray        # [T_engine]
     hi_cal: np.ndarray         # [T_engine]
-        hi_damage: np.ndarray      # [T_engine]
+    hi_damage: np.ndarray      # [T_engine]
 
 
 # Slope windows used for Decoder v3 (must match training)
