@@ -751,6 +751,18 @@ def load_model_from_experiment(
             use_hi_cal_fusion_for_rul=use_hi_cal_fusion_for_rul,
         )
 
+        # For v5 runs with a ConditionNormalizer, instantiate it before loading
+        # the state dict so that its parameters are present in the module tree.
+        if use_condition_normalizer and "condition_normalizer.net.0.weight" in state_dict:
+            w0 = state_dict["condition_normalizer.net.0.weight"]  # [hidden_dim, cond_dim]
+            w4 = state_dict["condition_normalizer.net.4.weight"]  # [sensor_dim, hidden_dim]
+            cond_dim_sd = w0.shape[1]
+            sensor_dim_sd = w4.shape[0]
+            try:
+                model.set_condition_normalizer_dims(cond_dim=cond_dim_sd, sensor_dim=sensor_dim_sd)
+            except Exception as e:
+                print(f"[WARNING] Failed to initialise ConditionNormalizer from checkpoint shapes: {e}")
+
         # Optional advanced RUL head (phys_v3/phys_v4 experiments).
         # summary.json stores flat keys describing the RUL head configuration.
         rul_head_type = config.get("rul_head_type", "linear")
