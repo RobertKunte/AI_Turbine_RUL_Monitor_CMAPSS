@@ -275,7 +275,7 @@ class RULTrajectoryDecoderV3(nn.Module):
         self,
         latent_dim: int,
         hi_feature_dim: int = 4,
-        slope_feature_dim: int = 6,
+        slope_feature_dim: int = 9,
         hidden_dim: int = 128,
         num_layers: int = 2,
         dropout: float = 0.1,

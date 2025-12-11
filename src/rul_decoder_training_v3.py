@@ -59,6 +59,9 @@ from src.analysis.inference import load_model_from_experiment
 DATASET_NAME = "FD004"
 DEFAULT_ENCODER_EXPERIMENT_V3D = "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase"
 
+# Window sizes used for slope features (must stay in sync with decoder.slope_feature_dim)
+SLOPE_WINDOW_SIZES: Tuple[int, ...] = (1, 3, 5)
+
 
 def build_rul_seq_from_last(rul_last: torch.Tensor, T: int) -> torch.Tensor:
     """
@@ -628,7 +631,7 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
     decoder = RULTrajectoryDecoderV3(
         latent_dim=latent_dim,
         hi_feature_dim=4,
-        slope_feature_dim=6 * 3,  # 3 signals * 3 window sizes (1,3,5)
+        slope_feature_dim=len(SLOPE_WINDOW_SIZES) * 3,  # 3 signals * len(window_sizes)
         hidden_dim=decoder_hidden_dim,
         num_layers=decoder_num_layers,
         dropout=decoder_dropout,
@@ -694,7 +697,7 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
 
             # Compute slope features
             slope_feats = compute_slope_features(
-                hi_phys_batch, hi_cal2_batch, hi_damage_seq_use
+                hi_phys_batch, hi_cal2_batch, hi_damage_seq_use, SLOPE_WINDOW_SIZES
             )  # [B, T, S]
 
             # Forward pass
@@ -784,7 +787,7 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
 
                 hi_cal2_batch = 1.0 - hi_cal1_batch
                 slope_feats = compute_slope_features(
-                    hi_phys_batch, hi_cal2_batch, hi_damage_seq_use
+                    hi_phys_batch, hi_cal2_batch, hi_damage_seq_use, SLOPE_WINDOW_SIZES
                 )
 
                 rul_seq_pred, _ = decoder(
@@ -853,7 +856,7 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
             hi_damage_test_use = hi_damage_seq_test
 
         slope_feats_test = compute_slope_features(
-            hi_phys_test, hi_cal2_test, hi_damage_test_use
+            hi_phys_test, hi_cal2_test, hi_damage_test_use, SLOPE_WINDOW_SIZES
         )
 
         T_test = Xb_test.size(1)
