@@ -158,6 +158,43 @@ def prepare_fd004_test_full_sequences(
         clip_test=True,
     )
 
+    # ------------------------------------------------------------------
+    # Add synthetic RUL column to TEST set for full sliding-window targets.
+    # y_test_true[i] is the (capped) RUL at the last observed test cycle
+    # for engine i+1. We reconstruct a simple per-cycle RUL by counting
+    # backwards from that value.
+    # ------------------------------------------------------------------
+    df_test = df_test.copy()
+    max_rul_cfg = float(summary_cfg.get("max_rul", 125.0))
+    unit_ids_test_unique = np.sort(df_test["UnitNumber"].unique())
+
+    if len(unit_ids_test_unique) != len(y_test_true):
+        # Fallback: create a mapping by UnitNumber -> index (NASA style: idx = unit_id - 1)
+        print(
+            f"[decoder_v1] WARNING: Length mismatch between y_test_true "
+            f"({len(y_test_true)}) and unique test units ({len(unit_ids_test_unique)}). "
+            "Using UnitNumber-1 as index mapping."
+        )
+
+    for i, uid in enumerate(unit_ids_test_unique):
+        # Map engine index to y_test_true index
+        if len(y_test_true) == len(unit_ids_test_unique):
+            rul_end = float(y_test_true[i])
+        else:
+            idx = int(uid) - 1
+            if 0 <= idx < len(y_test_true):
+                rul_end = float(y_test_true[idx])
+            else:
+                rul_end = float(y_test_true[-1])
+
+        df_u = df_test[df_test["UnitNumber"] == uid].sort_values("TimeInCycles")
+        L_u = len(df_u)
+        # RUL at step k (0..L-1) within test segment: rul_end + (L-1-k)
+        rul_seq = rul_end + (L_u - 1 - np.arange(L_u, dtype=np.float32))
+        # Optional capping at max_rul_cfg for consistency
+        rul_seq = np.minimum(rul_seq, max_rul_cfg)
+        df_test.loc[df_u.index, "RUL"] = rul_seq
+
     # Physics & feature configs (mirror rul_decoder_training_v1 / run_experiments)
     name_lower = encoder_experiment.lower()
     is_phase4_residual = (
