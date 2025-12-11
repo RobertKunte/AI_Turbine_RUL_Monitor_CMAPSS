@@ -1503,7 +1503,7 @@ def train_eol_full_lstm(
     # Mixed Precision Training (FP16) für weniger GPU-Memory
     use_amp = use_mixed_precision and torch.cuda.is_available()
     if use_amp:
-        from torch.cuda.amp import autocast, GradScaler
+        from torch.cuda.amp import GradScaler
         scaler = GradScaler()
         print("[train_eol_full_lstm] Mixed Precision Training (FP16) enabled - saves ~50% GPU memory")
     else:
@@ -1627,7 +1627,8 @@ def train_eol_full_lstm(
             
             # Mixed Precision Training (FP16)
             if use_amp and scaler is not None:
-                with autocast():
+                # Use new torch.amp.autocast API to avoid FutureWarning
+                with torch.amp.autocast("cuda"):
                     if use_health_head:
                         # Phase 2: Pass cond_ids if condition embedding is enabled
                         # NEW: optional condition reconstruction head (Transformer encoder V2)

@@ -2142,7 +2142,13 @@ def run_diagnostics_for_run(
             # 1) True HI_phys_v3 trajectories for several engines.
             # 2) True vs predicted HI_phys_v3 (using damage-head HI as prediction),
             #    plus per-engine RMSE summary between HI_phys_v3 and HI_damage.
-            if "HI_phys_v3" in df_test_fe.columns and ("damage_v3" in experiment_name.lower() or "damage_v4" in experiment_name.lower()):
+            #    Trigger this block for v3/v4/v5 damage encoders.
+            exp_lower = experiment_name.lower()
+            if "HI_phys_v3" in df_test_fe.columns and (
+                "damage_v3" in exp_lower
+                or "damage_v4" in exp_lower
+                or "damage_v5" in exp_lower
+            ):
                 print("  Creating HI_phys_v3 diagnostics plots (true + true vs pred)...")
                 plot_hi_phys_v3_true_trajectories(
                     df_test_fe=df_test_fe,

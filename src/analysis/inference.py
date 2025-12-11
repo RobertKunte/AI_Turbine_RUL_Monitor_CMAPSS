@@ -708,6 +708,12 @@ def load_model_from_experiment(
         damage_temporal_conv_kernel_size = int(config.get("damage_temporal_conv_kernel_size", 3))
         damage_temporal_conv_num_layers = int(config.get("damage_temporal_conv_num_layers", 1))
 
+        # v4/v5: calibrated HI head + v5-specific flags
+        use_hi_cal_head = bool(config.get("use_hi_cal_head", False))
+        use_condition_normalizer = bool(config.get("use_condition_normalizer", False))
+        condition_normalizer_hidden_dim = int(config.get("condition_normalizer_hidden_dim", 64))
+        use_hi_cal_fusion_for_rul = bool(config.get("use_hi_cal_fusion_for_rul", False))
+
         model = EOLFullTransformerEncoder(
             input_dim=input_dim,
             d_model=d_model,
@@ -738,6 +744,11 @@ def load_model_from_experiment(
             damage_use_temporal_conv=damage_use_temporal_conv,
             damage_temporal_conv_kernel_size=damage_temporal_conv_kernel_size,
             damage_temporal_conv_num_layers=damage_temporal_conv_num_layers,
+            # v4/v5: calibrated HI + condition normaliser + HI_cal fusion
+            use_hi_cal_head=use_hi_cal_head,
+            use_condition_normalizer=use_condition_normalizer,
+            condition_normalizer_hidden_dim=condition_normalizer_hidden_dim,
+            use_hi_cal_fusion_for_rul=use_hi_cal_fusion_for_rul,
         )
 
         # Optional advanced RUL head (phys_v3/phys_v4 experiments).
