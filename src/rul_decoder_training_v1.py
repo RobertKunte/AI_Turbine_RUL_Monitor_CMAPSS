@@ -798,7 +798,7 @@ def train_rul_decoder_v1(
         {
             "state_dict": best_state,
             "meta": {
-                "encoder_experiment": EXPERIMENT_NAME_V3D,
+                "encoder_experiment": encoder_experiment,
                 "dataset": DATASET_NAME,
                 "latent_dim": latent_dim,
             },
