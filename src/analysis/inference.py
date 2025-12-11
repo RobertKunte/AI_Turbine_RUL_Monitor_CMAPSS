@@ -1018,20 +1018,21 @@ def run_inference_for_experiment(
         clip_test=True,
     )
     
-    # Feature engineering (match training; enable residuals and multiscale features
-    # based on the original training config / phys_features)
+    # Feature engineering (match training; enable residuals ONLY for dedicated
+    # residual experiments, and use phys_features for condition vector + twin).
     from src.config import ResidualFeatureConfig
     exp_name_lower = experiment_dir.name.lower()
 
-    phys_features_cfg = config.get("phys_features", {})
-    # Detect whether residual / twin features were used during training.
-    # We prefer explicit config flags over name-based heuristics.
+    # Residuals in the sense of PhysicsFeatureConfig (phase4-style residual
+    # experiments) are controlled by experiment name / explicit flag – this
+    # must match run_experiments.py.
     use_residuals = bool(
-        phys_features_cfg.get("use_digital_twin_residuals", False)
-        or phys_features_cfg.get("use_twin_features", False)
-        or config.get("use_residuals", False)
+        config.get("use_residuals", False)
         or ("residual" in exp_name_lower)
+        or ("resid" in exp_name_lower)
     )
+
+    phys_features_cfg = config.get("phys_features", {})
 
     residual_cfg = ResidualFeatureConfig(
         enabled=use_residuals,
@@ -1072,11 +1073,77 @@ def run_inference_for_experiment(
         add_temporal_features=use_temporal_features,
         temporal=temporal_cfg,
     )
-    
+
+    # ------------------------------------------------------------------
+    # Reproduce the ms+DT feature pipeline from run_experiments.py:
+    #   1) Physics core features
+    #   2) Continuous condition vector (Cond_*)
+    #   3) Digital Twin + residuals
+    #   4) Temporal / multi-scale features
+    # ------------------------------------------------------------------
+
+    # Optional physics-informed condition/twin features
+    phys_opts = phys_features_cfg
+    use_phys_condition_vec = phys_opts.get("use_condition_vector", False)
+    use_twin_features = phys_opts.get(
+        "use_twin_features",
+        phys_opts.get("use_digital_twin_residuals", False),
+    )
+    twin_baseline_len = phys_opts.get("twin_baseline_len", 30)
+    condition_vector_version = phys_opts.get("condition_vector_version", 2)
+
     df_train = create_physical_features(df_train, physics_config, "UnitNumber", "TimeInCycles")
-    df_train = create_all_features(df_train, "UnitNumber", "TimeInCycles", feature_config, inplace=False, physics_config=physics_config)
     df_test = create_physical_features(df_test, physics_config, "UnitNumber", "TimeInCycles")
-    df_test = create_all_features(df_test, "UnitNumber", "TimeInCycles", feature_config, inplace=False, physics_config=physics_config)
+
+    # 2) Continuous condition vector
+    if use_phys_condition_vec:
+        from src.additional_features import build_condition_features
+
+        print("  Using continuous condition vector features (Cond_*) [inference]")
+        df_train = build_condition_features(
+            df_train,
+            unit_col="UnitNumber",
+            cycle_col="TimeInCycles",
+            version=condition_vector_version,
+        )
+        df_test = build_condition_features(
+            df_test,
+            unit_col="UnitNumber",
+            cycle_col="TimeInCycles",
+            version=condition_vector_version,
+        )
+
+    # 3) Digital twin + residuals (HealthyTwinRegressor)
+    if use_twin_features:
+        from src.additional_features import create_twin_features
+
+        print(f"  Using HealthyTwinRegressor (baseline_len={twin_baseline_len}) [inference]")
+        df_train, twin_model = create_twin_features(
+            df_train,
+            unit_col="UnitNumber",
+            cycle_col="TimeInCycles",
+            baseline_len=twin_baseline_len,
+            condition_vector_version=condition_vector_version,
+        )
+        df_test = twin_model.add_twin_and_residuals(df_test)
+
+    # 4) Temporal / multi-scale features
+    df_train = create_all_features(
+        df_train,
+        "UnitNumber",
+        "TimeInCycles",
+        feature_config,
+        inplace=False,
+        physics_config=physics_config,
+    )
+    df_test = create_all_features(
+        df_test,
+        "UnitNumber",
+        "TimeInCycles",
+        feature_config,
+        inplace=False,
+        physics_config=physics_config,
+    )
     
     feature_cols = [
         c for c in df_train.columns
