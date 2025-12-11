@@ -116,9 +116,10 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     experiment_name = config['experiment_name']
 
     # ===================================================================
-    # Special case: RUL Trajectory Decoder v1 on top of frozen encoder v3d/v3e
+    # Special case: RUL Trajectory Decoder v1/v2 on top of frozen encoder v3d/v3e
     # ===================================================================
-    if config.get("encoder_type") in ["decoder_v1_from_encoder_v3d", "decoder_v1_from_encoder_v3e"]:
+    encoder_type_cfg = config.get("encoder_type")
+    if encoder_type_cfg in ["decoder_v1_from_encoder_v3d", "decoder_v1_from_encoder_v3e"]:
         from src.rul_decoder_training_v1 import train_rul_decoder_v1
 
         train_cfg = config.get("training_params", {})
@@ -128,7 +129,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         # Map torch.device to simple string for the decoder script
         device_str = "cuda" if str(device).startswith("cuda") else "cpu"
 
-        if config.get("encoder_type") == "decoder_v1_from_encoder_v3d":
+        if encoder_type_cfg == "decoder_v1_from_encoder_v3d":
             encoder_experiment = "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase"
             decoder_subdir = "decoder_v1_from_encoder_v3d"
         else:  # decoder_v1_from_encoder_v3e
@@ -162,6 +163,17 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 "dataset": dataset_name,
                 "note": "Decoder v1 training finished, but summary_decoder_v1.json was not found.",
             }
+        return summary
+
+    if encoder_type_cfg == "decoder_v2":
+        from src.rul_decoder_training_v2 import train_rul_decoder_v2
+
+        print(
+            "\n[decoder_v2] Launching RUL Trajectory Decoder v2 training "
+            f"for experiment '{experiment_name}' on {device}\n"
+            f"  -> encoder_experiment = {config.get('encoder_experiment', 'fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase')}\n"
+        )
+        summary = train_rul_decoder_v2(config, device)
         return summary
     
     # ===================================================================
