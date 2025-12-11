@@ -1540,6 +1540,50 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v3e_smooth_config() -> Experim
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v4_hi_cal_config() -> ExperimentConfig:
+    """
+    FD004 ms+DT Transformer-Encoder v4 with cumulative DamageHead and HI_cal_v2 head.
+
+    - Starts from v3d (delta-cumsum + two-phase) configuration.
+    - Adds an additional calibrated HI head (HI_cal_v2) trained against the global
+      HI_phys_v3 -> HI_cal_v1/v2 calibrator.
+    - Adds encoder-level monotonicity and slope-regularisation losses on HI_cal_v2.
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase_config()
+
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v4_hi_cal"
+
+    # Encoder kwargs: enable HI_cal head
+    enc = cfg.setdefault("encoder_kwargs", {})
+    enc["use_hi_cal_head"] = True
+
+    # Loss weights for HI_cal_v2 and its regularisation
+    loss = cfg.setdefault("loss_params", {})
+    loss.setdefault("w_rul_eol", 1.0)
+    loss.setdefault("w_hi_phys", loss.get("health_loss_weight", 0.3))
+    loss.setdefault("w_hi_damage", loss.get("damage_hi_weight", 5.0))
+    loss.setdefault("w_hi_cal", 0.5)
+    loss.setdefault("w_mono_damage", 0.05)
+    loss.setdefault("w_mono_hi_cal", 0.05)
+    loss.setdefault("w_slope_hi_cal", 0.1)
+
+    # Training hyperparameters (inherit and, if needed, override)
+    train = cfg.setdefault("training_params", {})
+    train.setdefault("num_epochs", 120)
+    train.setdefault("batch_size", 256)
+    train.setdefault("engine_train_ratio", 0.8)
+    train.setdefault("random_seed", 42)
+
+    # Path to global HI calibrator (fit beforehand via src.analysis.hi_calibration)
+    dataset = cfg.get("dataset", "FD004")
+    encoder_run_base = "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase"
+    cfg["hi_calibrator_path"] = (
+        f"results/{dataset.lower()}/{encoder_run_base}/hi_calibrator_{dataset}.pkl"
+    )
+
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
     """
     Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
@@ -3049,6 +3093,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v3e_smooth":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3e_smooth_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v4_hi_cal":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v4_hi_cal_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3e":

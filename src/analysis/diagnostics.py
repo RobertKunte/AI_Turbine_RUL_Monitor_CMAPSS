@@ -1384,6 +1384,112 @@ def plot_hi_phys_v3_true_vs_pred(
 
     print(f"Saved HI_phys_v3 true vs pred trajectories to {out_path}")
 
+
+def plot_hi_cal_v2_trajectories(
+    trajectories: List[EngineTrajectory],
+    out_path: Path,
+    title: str = "HI_cal_v2 (v4) trajectories",
+    max_engines: int = 10,
+) -> None:
+    """
+    Plot predicted HI_cal_v2 trajectories (encoder v4) for a subset of engines.
+
+    Uses EngineTrajectory.hi_cal (if present), aligned to engine cycles.
+    """
+    traj_with_hi_cal = [
+        t for t in trajectories if getattr(t, "hi_cal", None) is not None and len(t.hi_cal) > 0
+    ]
+    if len(traj_with_hi_cal) == 0:
+        print("  Warning: No HI_cal_v2 trajectories available, skipping HI_cal_v2 plot.")
+        return
+
+    num_engines = min(len(traj_with_hi_cal), max_engines)
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+    axes = axes.flatten()
+
+    for idx, traj in enumerate(traj_with_hi_cal[:max_engines]):
+        ax = axes[idx]
+        ax.plot(traj.cycles, traj.hi_cal, "c-", linewidth=2, label="HI_cal_v2 (pred)")
+        ax.set_xlabel("Time in Cycles")
+        ax.set_ylabel("HI_cal_v2")
+        ax.set_ylim([0.0, 1.05])
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f"Engine #{traj.unit_id} – HI_cal_v2 (v4)")
+
+    for j in range(num_engines, len(axes)):
+        axes[j].axis("off")
+
+    plt.suptitle(title, fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved HI_cal_v2 trajectories to {out_path}")
+
+
+def plot_hi_cal_v2_vs_hi_phys_v3(
+    df_test_fe: pd.DataFrame,
+    trajectories: List[EngineTrajectory],
+    out_path: Path,
+    title: str = "HI_cal_v2 (v4) vs HI_phys_v3 at EOL",
+) -> None:
+    """
+    Scatter plot: predicted HI_cal_v2 (v4) vs true HI_phys_v3 at EOL for engines.
+
+    - HI_cal_v2 comes from EngineTrajectory.hi_cal (last timestep).
+    - HI_phys_v3 comes from df_test_fe["HI_phys_v3"] at the engine's last cycle.
+    """
+    if "HI_phys_v3" not in df_test_fe.columns:
+        print("  Warning: HI_phys_v3 not found in df_test_fe, skipping HI_cal_v2 vs HI_phys_v3 plot.")
+        return
+
+    xs: List[float] = []
+    ys: List[float] = []
+
+    for traj in trajectories:
+        hi_cal_traj = getattr(traj, "hi_cal", None)
+        if hi_cal_traj is None or len(hi_cal_traj) == 0:
+            continue
+
+        uid = traj.unit_id
+        g = (
+            df_test_fe[df_test_fe["UnitNumber"] == uid]
+            .sort_values("TimeInCycles")
+            .copy()
+        )
+        if g.empty:
+            continue
+
+        # EOL: last cycle in df_test_fe for this engine
+        last_row = g.iloc[-1]
+        hi_phys_eol = float(last_row.get("HI_phys_v3", np.nan))
+        hi_cal_eol = float(hi_cal_traj[-1])
+
+        if np.isnan(hi_phys_eol):
+            continue
+
+        xs.append(hi_phys_eol)
+        ys.append(hi_cal_eol)
+
+    if not xs:
+        print("  Warning: No valid HI_cal_v2/HI_phys_v3 pairs for scatter plot.")
+        return
+
+    xs_arr = np.asarray(xs, dtype=float)
+    ys_arr = np.asarray(ys, dtype=float)
+
+    plt.figure(figsize=(6, 5))
+    plt.scatter(xs_arr, ys_arr, alpha=0.7, c="c", edgecolors="k")
+    plt.xlabel("HI_phys_v3 at EOL")
+    plt.ylabel("HI_cal_v2 (v4) at EOL")
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved HI_cal_v2 vs HI_phys_v3 scatter to {out_path}")
+
     # Optionally, log and persist RMSE summary for HI_phys_v3 vs HI_damage
     if hi_rmse_per_engine:
         rmse_values = np.array(list(hi_rmse_per_engine.values()), dtype=float)
@@ -2036,7 +2142,7 @@ def run_diagnostics_for_run(
             # 1) True HI_phys_v3 trajectories for several engines.
             # 2) True vs predicted HI_phys_v3 (using damage-head HI as prediction),
             #    plus per-engine RMSE summary between HI_phys_v3 and HI_damage.
-            if "HI_phys_v3" in df_test_fe.columns and "damage_v3" in experiment_name.lower():
+            if "HI_phys_v3" in df_test_fe.columns and ("damage_v3" in experiment_name.lower() or "damage_v4" in experiment_name.lower()):
                 print("  Creating HI_phys_v3 diagnostics plots (true + true vs pred)...")
                 plot_hi_phys_v3_true_trajectories(
                     df_test_fe=df_test_fe,
@@ -2053,6 +2159,26 @@ def run_diagnostics_for_run(
                     title=f"{dataset_name} HI_phys_v3 true vs pred – 10 degraded engines",
                     max_engines=10,
                 )
+
+                # HI_cal_v2 (encoder v4) diagnostics, if trajectories contain HI_cal
+                traj_with_hi_cal = [
+                    t for t in selected_trajectories
+                    if getattr(t, "hi_cal", None) is not None and len(t.hi_cal) > 0
+                ]
+                if len(traj_with_hi_cal) > 0:
+                    print("  Creating HI_cal_v2 (v4) diagnostics plots...")
+                    plot_hi_cal_v2_trajectories(
+                        trajectories=traj_with_hi_cal,
+                        out_path=experiment_dir / "hi_cal_v2_10_degraded.png",
+                        title=f"{dataset_name} HI_cal_v2 (v4) trajectories – 10 degraded engines",
+                        max_engines=10,
+                    )
+                    plot_hi_cal_v2_vs_hi_phys_v3(
+                        df_test_fe=df_test_fe,
+                        trajectories=traj_with_hi_cal,
+                        out_path=experiment_dir / "hi_cal_v2_vs_hi_phys_v3_eol.png",
+                        title=f"{dataset_name} HI_cal_v2 (v4) vs HI_phys_v3 at EOL",
+                    )
         elif has_damage_hi:
             print(f"  ⚠️  Skipping HI Damage plot: damage HI exists but not in selected degraded engines")
         else:

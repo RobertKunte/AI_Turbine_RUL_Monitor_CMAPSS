@@ -1374,6 +1374,11 @@ def train_eol_full_lstm(
     # NEW (v3e): damage alignment weights
     damage_hi_align_start_weight: float = 0.0,
     damage_hi_align_end_weight: float = 0.0,
+    # NEW (v4): calibrated HI (HI_cal_v2) supervision and slope regularisation
+    hi_cal_weight: float = 0.0,
+    hi_cal_mono_weight: float = 0.0,
+    hi_cal_slope_weight: float = 0.0,
+    hi_calibrator_path: str | None = None,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Training-Loop für Full-Trajectory LSTM.
@@ -1425,6 +1430,7 @@ def train_eol_full_lstm(
         HI_GLOBAL_MONO_WEIGHT,
     )
     from src.loss import health_smoothness_loss
+    from src.models.transformer_eol import EOLFullTransformerEncoder
     
     # Use provided weights or fall back to config defaults
     mono_late_weight = hi_mono_late_weight if hi_mono_late_weight is not None else HI_MONO_WEIGHT
@@ -1435,6 +1441,25 @@ def train_eol_full_lstm(
         damage_phase1_damage_weight = damage_hi_weight
     if damage_phase2_damage_weight is None:
         damage_phase2_damage_weight = damage_hi_weight
+
+    # Optional HI_cal_v2 calibrator (v4)
+    hi_calibrator = None
+    if hi_cal_weight > 0.0 or hi_cal_mono_weight > 0.0 or hi_cal_slope_weight > 0.0:
+        if hi_calibrator_path is None:
+            raise ValueError(
+                "HI_cal-related weights > 0 but hi_calibrator_path is None. "
+                "Please provide a valid calibrator path in the experiment config."
+            )
+        from pathlib import Path as _Path
+        from src.analysis.hi_calibration import load_hi_calibrator, calibrate_hi_array, hi_cal_v2_from_v1
+
+        cal_path = _Path(hi_calibrator_path)
+        if not cal_path.exists():
+            raise FileNotFoundError(
+                f"HI_calibrator file not found at {cal_path}. "
+                "Fit it first via src.analysis.hi_calibration."
+            )
+        hi_calibrator = load_hi_calibrator(cal_path)
     
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -1808,6 +1833,57 @@ def train_eol_full_lstm(
                                             hi_target_seq_[:, -k_align:]
                                         )
                                         loss = loss + damage_hi_align_end_weight * loss_end
+
+                                # ------------------------------------------------------------------
+                                # NEW (v4): HI_cal_v2 supervision and slope regularisation
+                                # ------------------------------------------------------------------
+                                if (
+                                    hi_calibrator is not None
+                                    and (hi_cal_weight > 0.0 or hi_cal_mono_weight > 0.0 or hi_cal_slope_weight > 0.0)
+                                    and isinstance(model, EOLFullTransformerEncoder)
+                                    and getattr(model, "use_hi_cal_head", False)
+                                ):
+                                    # Compute HI_cal_v1/v2 targets from HI_phys_v3 using global calibrator
+                                    if health_phys_seq_batch is None:
+                                        # Fallback: derive HI_phys-like target from RUL if explicit HI_phys is absent
+                                        rul_seq_clamped = torch.clamp(rul_seq_batch, 0.0, float(max_rul))
+                                        hi_phys_target = torch.ones_like(rul_seq_clamped)
+                                        mask_eol = rul_seq_clamped <= float(HI_EOL_THRESH)
+                                        mask_plateau = rul_seq_clamped >= float(hi_plateau_threshold)
+                                        mask_mid = (~mask_eol) & (~mask_plateau)
+                                        denom = max(hi_plateau_threshold - float(HI_EOL_THRESH), 1e-6)
+                                        hi_phys_target[mask_eol] = 0.0
+                                        hi_phys_target[mask_mid] = (
+                                            (rul_seq_clamped[mask_mid] - float(HI_EOL_THRESH)) / denom
+                                        ).clamp(0.0, 1.0)
+                                    else:
+                                        hi_phys_target = health_phys_seq_batch
+
+                                    hi_phys_np = hi_phys_target.detach().cpu().numpy()
+                                    from src.analysis.hi_calibration import calibrate_hi_array, hi_cal_v2_from_v1
+                                    hi_cal1_np = calibrate_hi_array(hi_phys_np, hi_calibrator)
+                                    hi_cal2_np = hi_cal_v2_from_v1(hi_cal1_np)
+                                    hi_cal2_target = torch.from_numpy(hi_cal2_np).to(
+                                        dtype=hi_phys_target.dtype, device=hi_phys_target.device
+                                    )
+
+                                    # Use encoder sequence for HI_cal head (reuse enc_seq_dmg)
+                                    hi_cal_seq_pred = model.predict_hi_cal_seq(enc_seq_dmg)  # [B, T]
+
+                                    # (4) Alignment loss HI_cal_v2
+                                    hi_cal_loss = F.mse_loss(hi_cal_seq_pred, hi_cal2_target)
+                                    loss = loss + hi_cal_weight * hi_cal_loss
+
+                                    # (5) Monotonicity penalty on HI_cal_v2 (should decrease over time)
+                                    diff_cal = hi_cal_seq_pred[:, 1:] - hi_cal_seq_pred[:, :-1]
+                                    mono_violation_cal = F.relu(diff_cal)
+                                    mono_loss_hi_cal = mono_violation_cal.mean()
+                                    loss = loss + hi_cal_mono_weight * mono_loss_hi_cal
+
+                                    # (6) Slope-consistency between predicted and target HI_cal_v2 slopes
+                                    diff_cal_true = hi_cal2_target[:, 1:] - hi_cal2_target[:, :-1]
+                                    slope_loss_hi_cal = F.mse_loss(diff_cal, diff_cal_true)
+                                    loss = loss + hi_cal_slope_weight * slope_loss_hi_cal
 
                                 # DEBUG: Inspect damage-head input/targets/preds once on first batch
                                 if (

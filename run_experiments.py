@@ -1046,7 +1046,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     results_dir = Path("results") / dataset_name.lower() / experiment_name
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Optional two-phase schedule for damage HI (used in damage_v3c)
+    # Optional two-phase schedule for damage HI (used in damage_v3c / v3d / v4)
     training_cfg = config.get("training_params", {})
     damage_two_phase = training_cfg.get("damage_two_phase", False)
     damage_warmup_epochs = training_cfg.get("damage_warmup_epochs", 0)
@@ -1091,6 +1091,11 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         damage_warmup_epochs=damage_warmup_epochs,
         damage_phase1_damage_weight=damage_phase1_damage_weight,
         damage_phase2_damage_weight=damage_phase2_damage_weight,
+        # NEW (v4): calibrated HI (HI_cal_v2) supervision and slope regularisation
+        hi_cal_weight=config['loss_params'].get('w_hi_cal', 0.0),
+        hi_cal_mono_weight=config['loss_params'].get('w_mono_hi_cal', 0.0),
+        hi_cal_slope_weight=config['loss_params'].get('w_slope_hi_cal', 0.0),
+        hi_calibrator_path=config.get('hi_calibrator_path', None),
     )
     
     # ===================================================================

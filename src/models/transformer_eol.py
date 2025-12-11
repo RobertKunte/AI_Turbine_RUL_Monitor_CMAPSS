@@ -261,6 +261,8 @@ class EOLFullTransformerEncoder(nn.Module):
         damage_use_temporal_conv: bool = False,
         damage_temporal_conv_kernel_size: int = 3,
         damage_temporal_conv_num_layers: int = 1,
+        # NEW (v4): optional calibrated HI head (HI_cal_v2 supervision)
+        use_hi_cal_head: bool = False,
     ) -> None:
         super().__init__()
 
@@ -378,6 +380,19 @@ class EOLFullTransformerEncoder(nn.Module):
         )
         self.damage_softplus_beta = DAMAGE_SOFTPLUS_BETA
 
+        # ------------------------------------------------------------------
+        # Optional: calibrated HI head (v4, predicts HI_cal_v2 sequence)
+        # ------------------------------------------------------------------
+        self.use_hi_cal_head: bool = bool(use_hi_cal_head)
+        if self.use_hi_cal_head:
+            self.hi_cal_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, 1),
+            )
+        else:
+            self.hi_cal_head = None
+
         # Placeholder for optional improved RUL head (v3).
         # These attributes may be set from the outside (e.g. in run_experiments)
         # without breaking older experiments.
@@ -441,6 +456,14 @@ class EOLFullTransformerEncoder(nn.Module):
             nn.init.xavier_normal_(self.fc_damage.weight, gain=0.1)
             if self.fc_damage.bias is not None:
                 nn.init.zeros_(self.fc_damage.bias)
+
+        # Small init for HI_cal head to avoid large initial deviations
+        if getattr(self, "hi_cal_head", None) is not None:
+            for m in self.hi_cal_head.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     def forward(
         self,
@@ -659,6 +682,31 @@ class EOLFullTransformerEncoder(nn.Module):
         if return_seq:
             return enc_out, pooled
         return pooled
+
+    # ------------------------------------------------------------------
+    # Helper: HI_cal_v2 prediction from encoder sequence (v4)
+    # ------------------------------------------------------------------
+    def predict_hi_cal_seq(self, enc_seq: torch.Tensor) -> torch.Tensor:
+        """
+        Predict calibrated HI_cal_v2 sequence from encoder latent sequence.
+
+        Args:
+            enc_seq: [B, T, d_model] latent sequence from the Transformer encoder.
+
+        Returns:
+            hi_cal_seq_pred: [B, T] predicted HI_cal_v2 trajectory.
+        """
+        if not (self.use_hi_cal_head and self.hi_cal_head is not None):
+            raise RuntimeError(
+                "predict_hi_cal_seq called but use_hi_cal_head=False or hi_cal_head is None."
+            )
+
+        B, T, H = enc_seq.shape
+        flat = enc_seq.reshape(B * T, H)  # [B*T, d_model]
+        hi_flat = self.hi_cal_head(flat).squeeze(-1)  # [B*T]
+        hi_seq = hi_flat.view(B, T)  # [B, T]
+        # Optionally clamp to [0, 1] as HI_cal_v2 is a bounded health index
+        return torch.clamp(hi_seq, 0.0, 1.0)
 
     # ------------------------------------------------------------------
     # Encoder + HI helper for downstream decoders (e.g. RUL trajectory)

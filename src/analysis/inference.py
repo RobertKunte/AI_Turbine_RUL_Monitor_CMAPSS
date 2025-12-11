@@ -64,6 +64,7 @@ class EngineTrajectory:
     true_rul: np.ndarray  # shape (T,)
     pred_rul: np.ndarray  # shape (T,)
     hi_damage: Optional[np.ndarray] = None  # shape (T,) - optional damage-based HI trajectory
+    hi_cal: Optional[np.ndarray] = None     # shape (T,) - optional calibrated HI (v4) trajectory
 
 
 def load_model_from_experiment(
@@ -1292,6 +1293,24 @@ def run_inference_for_experiment(
         else:
             hi_last = None
             hi_seq = None
+
+        # Optional: HI_cal_v2 sequence for Transformer encoder v4
+        hi_cal_seq = None
+        if (
+            return_hi_trajectories
+            and isinstance(model, EOLFullTransformerEncoder)
+            and getattr(model, "use_hi_cal_head", False)
+        ):
+            try:
+                enc_seq, _ = model.encode(
+                    X_split,
+                    cond_ids=cond_ids_tensor,
+                    return_seq=True,
+                )
+                hi_cal_seq = model.predict_hi_cal_seq(enc_seq)  # [B, T]
+            except Exception as e:  # pragma: no cover - defensive logging
+                print(f"[WARNING] Failed to compute HI_cal_v2 sequence for diagnostics: {e}")
+                hi_cal_seq = None
     
     rul_pred = rul_pred.cpu().numpy().flatten()
     
@@ -1405,6 +1424,27 @@ def run_inference_for_experiment(
             else:
                 # No HI available - use placeholder
                 hi_traj = np.full(len(cycles), 0.5)
+
+            # HI_cal_v2 trajectory (if available)
+            hi_cal_traj: Optional[np.ndarray]
+            if hi_cal_seq is not None:
+                hi_cal_window = hi_cal_seq[i].cpu().numpy() if torch.is_tensor(hi_cal_seq) else hi_cal_seq[i]
+                if len(cycles) >= past_len:
+                    hi_cal_traj = np.full(len(cycles), np.nan)
+                    target_len = past_len
+                    source_len = len(hi_cal_window)
+                    copy_len = min(target_len, source_len)
+                    if copy_len > 0:
+                        hi_cal_traj[-copy_len:] = hi_cal_window[:copy_len]
+                    for j in range(len(cycles) - past_len - 1, -1, -1):
+                        hi_cal_traj[j] = hi_cal_traj[j + 1] if not np.isnan(hi_cal_traj[j + 1]) else 1.0
+                else:
+                    hi_cal_traj = np.full(len(cycles), np.nan)
+                    hi_cal_traj[-len(hi_cal_window):] = hi_cal_window[-len(cycles):]
+                    for j in range(len(cycles) - len(hi_cal_window) - 1, -1, -1):
+                        hi_cal_traj[j] = hi_cal_traj[j + 1] if not np.isnan(hi_cal_traj[j + 1]) else 1.0
+            else:
+                hi_cal_traj = None
             
             # True RUL trajectory (decreasing from max_rul to 0)
             # For test data, we know the true RUL at EOL
@@ -1430,6 +1470,7 @@ def run_inference_for_experiment(
                 hi=hi_traj,
                 true_rul=true_rul_traj,
                 pred_rul=pred_rul_traj,
+                hi_cal=hi_cal_traj,
             )
     
     return eol_metrics, trajectories
