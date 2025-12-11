@@ -1018,19 +1018,30 @@ def run_inference_for_experiment(
         clip_test=True,
     )
     
-    # Feature engineering (match training; enable residuals if experiment name signals it)
+    # Feature engineering (match training; enable residuals and multiscale features
+    # based on the original training config / phys_features)
     from src.config import ResidualFeatureConfig
     exp_name_lower = experiment_dir.name.lower()
-    use_residuals = "residual" in exp_name_lower or config.get("use_residuals", False)
+
+    phys_features_cfg = config.get("phys_features", {})
+    # Detect whether residual / twin features were used during training.
+    # We prefer explicit config flags over name-based heuristics.
+    use_residuals = bool(
+        phys_features_cfg.get("use_digital_twin_residuals", False)
+        or phys_features_cfg.get("use_twin_features", False)
+        or config.get("use_residuals", False)
+        or ("residual" in exp_name_lower)
+    )
+
     residual_cfg = ResidualFeatureConfig(
         enabled=use_residuals,
-        mode="per_engine",
-        baseline_len=30,
-        include_original=True,
+        mode=phys_features_cfg.get("mode", "per_engine"),
+        baseline_len=phys_features_cfg.get("twin_baseline_len", 30),
+        include_original=phys_features_cfg.get("include_original", True),
     )
     physics_config = PhysicsFeatureConfig(
         use_core=True,
-        use_extended=False,
+        use_extended=bool(phys_features_cfg.get("use_extended", False)),
         use_residuals=use_residuals,
         use_temporal_on_physics=False,
         residual=residual_cfg,
