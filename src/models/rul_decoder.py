@@ -334,7 +334,7 @@ class RULTrajectoryDecoderV3(nn.Module):
                 x = x.squeeze(-1)
             if x.shape[:2] != (B, T):
                 raise ValueError(
-                    f\"{name} must be [B,T], got {tuple(x.shape)} vs expected {(B, T)}\"
+                    f"{name} must be [B,T], got {tuple(x.shape)} vs expected {(B, T)}"
                 )
             return x
 
