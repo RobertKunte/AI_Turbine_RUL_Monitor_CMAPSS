@@ -833,6 +833,20 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         else:
             cond_feature_indices = None
 
+        # Optional: sensor feature indices for condition normalisation (v5)
+        sensor_feature_indices_for_norm = None
+        try:
+            from src.additional_features import group_feature_columns
+
+            groups = group_feature_columns(feature_cols)
+            residual_cols = set(groups.get("residual", []))
+            if residual_cols:
+                sensor_feature_indices_for_norm = [
+                    i for i, c in enumerate(feature_cols) if c in residual_cols
+                ]
+        except Exception as e:
+            print(f"[Init] Warning: could not derive sensor_feature_indices_for_norm: {e}")
+
         # Damage head parameters (from encoder_kwargs or config['model'])
         model_cfg_raw = config.get("model", {})
         use_damage_head = encoder_kwargs.get("use_damage_head", model_cfg_raw.get("use_damage_head", False))
@@ -916,12 +930,35 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             damage_use_temporal_conv=damage_use_temporal_conv,
             damage_temporal_conv_kernel_size=damage_temporal_conv_kernel_size,
             damage_temporal_conv_num_layers=damage_temporal_conv_num_layers,
+            # v4/v5: calibrated HI head and optional HI_cal fusion / condition normaliser
+            use_hi_cal_head=encoder_kwargs.get("use_hi_cal_head", False),
+            use_condition_normalizer=encoder_kwargs.get("use_condition_normalizer", False),
+            condition_normalizer_hidden_dim=encoder_kwargs.get("condition_normalizer_hidden_dim", 64),
+            use_hi_cal_fusion_for_rul=encoder_kwargs.get("use_hi_cal_fusion_for_rul", False),
         )
 
         # If we inferred Cond_* feature indices, attach them to the model so it can
         # derive cond_seq internally from the full feature sequence.
         if cond_feature_indices is not None and hasattr(model, "cond_feature_indices"):
-            model.cond_feature_indices = cond_feature_indices
+            model.cond_feature_indices = torch.as_tensor(
+                cond_feature_indices, dtype=torch.long, device=device
+            )
+
+        # Attach sensor indices for condition normalisation (v5) and
+        # initialise ConditionNormalizer once dims are known.
+        if (
+            sensor_feature_indices_for_norm is not None
+            and getattr(model, "use_condition_normalizer", False)
+            and len(sensor_feature_indices_for_norm) > 0
+        ):
+            model.sensor_feature_indices_for_norm = torch.as_tensor(
+                sensor_feature_indices_for_norm, dtype=torch.long, device=device
+            )
+            if cond_feature_indices is not None:
+                model.set_condition_normalizer_dims(
+                    cond_dim=len(cond_feature_indices),
+                    sensor_dim=len(sensor_feature_indices_for_norm),
+                )
     elif encoder_type == "transformer_state_encoder_v3":
         # State encoder V3 is trained via a dedicated routine (train_state_encoder_v3)
         # and does not use the generic EOL training loop below. We handle it

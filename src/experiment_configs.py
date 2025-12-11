@@ -1584,6 +1584,33 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v4_hi_cal_config() -> Experime
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_config() -> ExperimentConfig:
+    """
+    FD004 ms+DT Transformer-Encoder v5:
+      - cumulative DamageHead (as in v4)
+      - HI_cal_v2 head + fusion into RUL head
+      - ConditionNormalizer on selected degradation-sensitive sensors
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v4_hi_cal_config()
+
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm"
+
+    # Encoder kwargs: enable HI_cal head, HI_cal fusion and condition normaliser
+    enc = cfg.setdefault("encoder_kwargs", {})
+    enc["use_hi_cal_head"] = True
+    enc["use_hi_cal_fusion_for_rul"] = True
+    enc["use_condition_normalizer"] = True
+    enc.setdefault("condition_normalizer_hidden_dim", 64)
+
+    # Loss weights remain as in v4 by default; ensure they are present.
+    loss = cfg.setdefault("loss_params", {})
+    loss.setdefault("w_hi_cal", 0.5)
+    loss.setdefault("w_mono_hi_cal", 0.05)
+    loss.setdefault("w_slope_hi_cal", 0.1)
+
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
     """
     Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
@@ -3095,6 +3122,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3e_smooth_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v4_hi_cal":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v4_hi_cal_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3e":

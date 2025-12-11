@@ -10,6 +10,8 @@ import torch.nn.functional as F
 
 from src.models.universal_encoder_v1 import PositionalEncoding
 from src.models.damage_head import CumulativeDamageHead
+from src.models.condition_normalizer import ConditionNormalizer
+from src.models.condition_normalizer import ConditionNormalizer
 
 
 
@@ -263,6 +265,10 @@ class EOLFullTransformerEncoder(nn.Module):
         damage_temporal_conv_num_layers: int = 1,
         # NEW (v4): optional calibrated HI head (HI_cal_v2 supervision)
         use_hi_cal_head: bool = False,
+        # NEW (v5): condition normaliser + HI_cal fusion into RUL head
+        use_condition_normalizer: bool = False,
+        condition_normalizer_hidden_dim: int = 64,
+        use_hi_cal_fusion_for_rul: bool = False,
     ) -> None:
         super().__init__()
 
@@ -286,6 +292,11 @@ class EOLFullTransformerEncoder(nn.Module):
         self.dropout = dropout
         self.max_seq_len = max_seq_len
 
+        # v5 flags (kept backwards-compatible via defaults)
+        self.use_condition_normalizer: bool = bool(use_condition_normalizer)
+        self.condition_normalizer_hidden_dim: int = int(condition_normalizer_hidden_dim)
+        self.use_hi_cal_fusion_for_rul: bool = bool(use_hi_cal_fusion_for_rul)
+
         # ------------------------------------------------------------------
         # Continuous condition encoder configuration
         # ------------------------------------------------------------------
@@ -295,7 +306,7 @@ class EOLFullTransformerEncoder(nn.Module):
         self.use_cond_recon_head: bool = use_cond_recon_head
         # Indices of Cond_* features inside the full feature vector.
         # These will be set from run_experiments.py for ms+DT configs.
-        self.cond_feature_indices: Optional[list[int]] = None
+        self.cond_feature_indices: Optional[list[int] | torch.Tensor] = None
 
         # ------------------------------------------------------------------
         # Condition embeddings (Flag-API kompatibel zu EOLFullLSTMWithHealth)
@@ -366,9 +377,11 @@ class EOLFullTransformerEncoder(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
-        
+
         # Default (v1) RUL/HI heads – kept for backwards compatibility.
-        self.fc_rul = nn.Linear(d_model, 1)
+        # Optionally enlarge RUL input if we concatenate HI_cal_v2 at EOL.
+        rul_in_dim = d_model + 1 if self.use_hi_cal_fusion_for_rul else d_model
+        self.fc_rul = nn.Linear(rul_in_dim, 1)
         self.fc_health = nn.Linear(d_model, 1)
 
         # Damage-basierte HI-Variante (identische API wie EOLFullLSTMWithHealth)
@@ -392,6 +405,14 @@ class EOLFullTransformerEncoder(nn.Module):
             )
         else:
             self.hi_cal_head = None
+
+        # ------------------------------------------------------------------
+        # Optional: condition normaliser (v5) – initialised later once dims are known.
+        # ------------------------------------------------------------------
+        self.condition_normalizer: Optional[ConditionNormalizer] = None
+        # Indices for sensor features that should be condition-normalised.
+        # Must be set from the training script once feature groups are known.
+        self.sensor_feature_indices_for_norm: Optional[torch.Tensor] = None
 
         # Placeholder for optional improved RUL head (v3).
         # These attributes may be set from the outside (e.g. in run_experiments)
@@ -465,6 +486,60 @@ class EOLFullTransformerEncoder(nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
+    # ------------------------------------------------------------------
+    # v5: helper to initialise ConditionNormalizer once dims are known
+    # ------------------------------------------------------------------
+    def set_condition_normalizer_dims(self, cond_dim: int, sensor_dim: int) -> None:
+        """
+        Must be called from the training script once cond_feature_indices and
+        sensor_feature_indices_for_norm are known.
+        """
+        if not self.use_condition_normalizer:
+            return
+
+        self.condition_normalizer = ConditionNormalizer(
+            cond_dim=cond_dim,
+            sensor_dim=sensor_dim,
+            hidden_dim=self.condition_normalizer_hidden_dim,
+        )
+
+    def _apply_condition_normalization(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply condition-based normalisation to selected sensor channels.
+
+        This is a no-op unless:
+          - use_condition_normalizer is True
+          - condition_normalizer and both index tensors are set.
+        """
+        if (
+            not self.use_condition_normalizer
+            or self.condition_normalizer is None
+            or self.cond_feature_indices is None
+            or self.sensor_feature_indices_for_norm is None
+        ):
+            return x
+
+        # Ensure indices are tensors on the correct device
+        if isinstance(self.cond_feature_indices, torch.Tensor):
+            cond_idx = self.cond_feature_indices.to(x.device)
+        else:
+            cond_idx = torch.as_tensor(
+                self.cond_feature_indices, dtype=torch.long, device=x.device
+            )
+        sensor_idx = self.sensor_feature_indices_for_norm.to(x.device)
+
+        # Extract condition and sensor features
+        cond_feats = x[:, :, cond_idx]  # [B, T, C_cond]
+        sensor_feats = x[:, :, sensor_idx]  # [B, T, C_sens]
+
+        # Predict healthy baseline and form residuals
+        baseline = self.condition_normalizer(cond_feats)  # [B, T, C_sens]
+        sensor_resid = sensor_feats - baseline
+
+        x_norm = x.clone()
+        x_norm[:, :, sensor_idx] = sensor_resid
+        return x_norm
+
     def forward(
         self,
         x: torch.Tensor,
@@ -501,9 +576,11 @@ class EOLFullTransformerEncoder(nn.Module):
             )
 
         # ------------------------------------------------------------------
-        # 1. Feature-Embedding
+        # 1. Optional condition-based normalisation of selected sensor features
+        #    followed by feature embedding.
         # ------------------------------------------------------------------
-        x_proj = self.input_proj(x)  # [B, T, d_model]
+        x_for_embed = self._apply_condition_normalization(x)
+        x_proj = self.input_proj(x_for_embed)  # [B, T, d_model]
 
         # Optional continuous condition sequence (Cond_* per timestep)
         # If not provided explicitly but indices are known, derive from x.
@@ -584,7 +661,22 @@ class EOLFullTransformerEncoder(nn.Module):
             hi_latent = health_last.unsqueeze(-1) if self.rul_head.use_hi_fusion else None
             rul_pred = self.rul_head(shared, hi_latent=hi_latent)
         else:
-            rul_logit = self.fc_rul(shared)  # [B, 1]
+            # v5: optionally fuse HI_cal_v2 at EOL into the RUL head
+            if (
+                self.use_hi_cal_fusion_for_rul
+                and self.use_hi_cal_head
+                and self.hi_cal_head is not None
+            ):
+                # Use encoder sequence representation at EOL plus HI_cal_v2(EOL)
+                hi_cal_seq = self.predict_hi_cal_seq(enc_out)  # [B, T]
+                hi_cal_eol = hi_cal_seq[:, -1]                 # [B]
+                z_eol = enc_out[:, -1, :]                      # [B, d_model]
+                rul_input = torch.cat([z_eol, hi_cal_eol.unsqueeze(-1)], dim=-1)  # [B, d_model+1]
+            else:
+                # Backwards-compatible: use pooled shared features only
+                rul_input = shared  # [B, d_model]
+
+            rul_logit = self.fc_rul(rul_input)  # [B, 1]
             rul_pred = rul_logit.squeeze(-1)  # [B]
 
         # ------------------------------------------------------------------
@@ -641,8 +733,9 @@ class EOLFullTransformerEncoder(nn.Module):
                 f"Expected input_dim={self.input_dim}, but got F={feat_dim}"
             )
 
-        # Feature embedding
-        x_proj = self.input_proj(x)  # [B, T, d_model]
+        # Feature embedding (with optional condition-based normalisation)
+        x_for_embed = self._apply_condition_normalization(x)
+        x_proj = self.input_proj(x_for_embed)  # [B, T, d_model]
 
         # Optional continuous condition sequence (Cond_* per timestep)
         if cond_seq is None and self.use_cond_encoder and self.cond_encoder is not None:
@@ -755,6 +848,8 @@ class EOLFullTransformerEncoder(nn.Module):
                 z_seq,
                 cond_seq=None,
             )
+            # Ensure HI_damage stays in [0, 1] for downstream decoders
+            hi_damage_seq = torch.clamp(hi_damage_seq, 0.0, 1.0)
 
         return z_seq, hi_phys_seq, hi_damage_seq
 
