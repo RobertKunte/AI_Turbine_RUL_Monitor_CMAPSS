@@ -51,18 +51,8 @@ from src.metrics import compute_eol_errors_and_nasa
 from src.models.rul_decoder import RULTrajectoryDecoderV1
 
 
-EXPERIMENT_NAME_V3D = "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase"
 DATASET_NAME = "FD004"
-ENCODER_EXPERIMENT_DIR = (
-    Path("results") / "fd004" / EXPERIMENT_NAME_V3D
-)
-ENCODER_CHECKPOINT = (
-    ENCODER_EXPERIMENT_DIR
-    / f"eol_full_lstm_best_{EXPERIMENT_NAME_V3D}.pt"
-)
-SCALER_PATH = ENCODER_EXPERIMENT_DIR / "scaler.pkl"
-
-DECODER_RESULTS_DIR = Path("results") / "fd004" / "decoder_v1_from_encoder_v3d"
+DEFAULT_ENCODER_EXPERIMENT_V3D = "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase"
 
 
 def build_rul_seq_from_last(rul_last: torch.Tensor, T: int) -> torch.Tensor:
@@ -202,8 +192,9 @@ def make_engine_split_loaders(
     return train_loader, val_loader
 
 
-def prepare_fd004_ms_dt_v3d_data(
-    device: torch.device,
+def prepare_fd004_ms_dt_encoder_data(
+    encoder_experiment: str,
+    dataset_name: str = DATASET_NAME,
     past_len: int = 30,
 ) -> Tuple[
     torch.Tensor,
@@ -233,11 +224,12 @@ def prepare_fd004_ms_dt_v3d_data(
       - summary_cfg:       summary.json config from the encoder experiment
     """
     print("============================================================")
-    print("[decoder_v1] Preparing FD004 data (ms_dt_v2 + residual + twin)")
+    print(f"[decoder_v1] Preparing {dataset_name} data for encoder experiment '{encoder_experiment}'")
+    print("  (ms_dt_v2 + residual + twin pipeline reconstruction)")
     print("============================================================")
 
     # Load original experiment summary to reconstruct feature/physics config
-    summary_path = ENCODER_EXPERIMENT_DIR / "summary.json"
+    summary_path = Path("results") / dataset_name.lower() / encoder_experiment / "summary.json"
     if not summary_path.exists():
         raise FileNotFoundError(f"summary.json not found at {summary_path}")
 
@@ -246,7 +238,7 @@ def prepare_fd004_ms_dt_v3d_data(
 
     # Load raw CMAPSS data (same helper as core experiments)
     df_train, df_test, y_test_true = load_cmapps_subset(
-        DATASET_NAME,
+        dataset_name,
         max_rul=None,
         clip_train=False,
         clip_test=True,
@@ -255,7 +247,7 @@ def prepare_fd004_ms_dt_v3d_data(
     # ------------------------------------------------------------------
     # Physics & feature configs (mirroring run_experiments.py)
     # ------------------------------------------------------------------
-    name_lower = EXPERIMENT_NAME_V3D.lower()
+    name_lower = encoder_experiment.lower()
     is_phase4_residual = (
         (("phase4" in name_lower) or ("phase5" in name_lower)) and "residual" in name_lower
     ) or ("residual" in name_lower) or ("resid" in name_lower)
@@ -559,6 +551,8 @@ def train_rul_decoder_v1(
     device: str = "cuda",
     epochs: int = 50,
     batch_size: int = 256,
+    encoder_experiment: str = DEFAULT_ENCODER_EXPERIMENT_V3D,
+    decoder_results_subdir: str = "decoder_v1_from_encoder_v3d",
 ) -> None:
     # Resolve device
     if device == "auto":
@@ -568,7 +562,8 @@ def train_rul_decoder_v1(
 
     print(f"[decoder_v1] Using device: {device_t}")
 
-    DECODER_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    decoder_results_dir = Path("results") / DATASET_NAME.lower() / decoder_results_subdir
+    decoder_results_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
     # 1) Prepare data + load original scaler
@@ -584,16 +579,22 @@ def train_rul_decoder_v1(
         cond_ids_test,
         feature_cols,
         extra_info,
-    ) = prepare_fd004_ms_dt_v3d_data(device_t)
+    ) = prepare_fd004_ms_dt_encoder_data(
+        encoder_experiment=encoder_experiment,
+        dataset_name=DATASET_NAME,
+        past_len=past_len,
+    )
 
     # Load scaler from original encoder experiment
-    if not SCALER_PATH.exists():
-        raise FileNotFoundError(f"Scaler not found at {SCALER_PATH}")
+    encoder_experiment_dir = Path("results") / DATASET_NAME.lower() / encoder_experiment
+    scaler_path = encoder_experiment_dir / "scaler.pkl"
+    if not scaler_path.exists():
+        raise FileNotFoundError(f"Scaler not found at {scaler_path}")
 
-    with open(SCALER_PATH, "rb") as f:
+    with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
 
-    print(f"[decoder_v1] Loaded scaler from {SCALER_PATH}")
+    print(f"[decoder_v1] Loaded scaler from {scaler_path}")
 
     # Scale features using the loaded scaler (condition-wise or global)
     X_full_scaled = apply_loaded_scaler(X_full, cond_ids_full, scaler)
@@ -619,12 +620,16 @@ def train_rul_decoder_v1(
     # ------------------------------------------------------------------
     # 3) Load frozen encoder from v3d experiment
     # ------------------------------------------------------------------
-    if not ENCODER_CHECKPOINT.exists():
-        raise FileNotFoundError(f"Encoder checkpoint not found at {ENCODER_CHECKPOINT}")
+    encoder_checkpoint = (
+        encoder_experiment_dir
+        / f"eol_full_lstm_best_{encoder_experiment}.pt"
+    )
+    if not encoder_checkpoint.exists():
+        raise FileNotFoundError(f"Encoder checkpoint not found at {encoder_checkpoint}")
 
-    print(f"[decoder_v1] Loading encoder from {ENCODER_EXPERIMENT_DIR}")
+    print(f"[decoder_v1] Loading encoder from {encoder_experiment_dir}")
     encoder, encoder_cfg = load_model_from_experiment(
-        ENCODER_EXPERIMENT_DIR,
+        encoder_experiment_dir,
         device=device_t,
     )
 
@@ -784,9 +789,9 @@ def train_rul_decoder_v1(
     # ------------------------------------------------------------------
     # 7) Save decoder + summary + simple plots
     # ------------------------------------------------------------------
-    DECODER_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    decoder_results_dir.mkdir(parents=True, exist_ok=True)
 
-    decoder_ckpt_path = DECODER_RESULTS_DIR / "decoder_v1_best.pt"
+    decoder_ckpt_path = decoder_results_dir / "decoder_v1_best.pt"
     torch.save(
         {
             "state_dict": best_state,
@@ -802,9 +807,9 @@ def train_rul_decoder_v1(
 
     summary = {
         "dataset": DATASET_NAME,
-        "encoder_experiment": EXPERIMENT_NAME_V3D,
-        "results_dir_encoder": str(ENCODER_EXPERIMENT_DIR),
-        "decoder_results_dir": str(DECODER_RESULTS_DIR),
+        "encoder_experiment": encoder_experiment,
+        "results_dir_encoder": str(encoder_experiment_dir),
+        "decoder_results_dir": str(decoder_results_dir),
         "training": {
             "epochs": epochs,
             "batch_size": batch_size,
@@ -830,7 +835,7 @@ def train_rul_decoder_v1(
         },
     }
 
-    summary_path = DECODER_RESULTS_DIR / "summary_decoder_v1.json"
+    summary_path = decoder_results_dir / "summary_decoder_v1.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"[decoder_v1] Saved summary to {summary_path}")
@@ -853,7 +858,7 @@ def train_rul_decoder_v1(
             plt.title("Decoder v1: Test EOL Error Histogram")
             plt.grid(True, alpha=0.3)
             plt.tight_layout()
-            hist_path = DECODER_RESULTS_DIR / "error_hist_decoder_v1.png"
+            hist_path = decoder_results_dir / "error_hist_decoder_v1.png"
             plt.savefig(hist_path)
             plt.close()
             print(f"[decoder_v1] Saved error histogram to {hist_path}")
@@ -894,7 +899,7 @@ def train_rul_decoder_v1(
         plt.title("Decoder v1: True vs Predicted RUL (Test EOL)")
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        scatter_path = DECODER_RESULTS_DIR / "true_vs_pred_decoder_v1.png"
+        scatter_path = decoder_results_dir / "true_vs_pred_decoder_v1.png"
         plt.savefig(scatter_path)
         plt.close()
         print(f"[decoder_v1] Saved true-vs-pred scatter to {scatter_path}")

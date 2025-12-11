@@ -116,9 +116,9 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     experiment_name = config['experiment_name']
 
     # ===================================================================
-    # Special case: RUL Trajectory Decoder v1 on top of frozen encoder v3d
+    # Special case: RUL Trajectory Decoder v1 on top of frozen encoder v3d/v3e
     # ===================================================================
-    if config.get("encoder_type") == "decoder_v1_from_encoder_v3d":
+    if config.get("encoder_type") in ["decoder_v1_from_encoder_v3d", "decoder_v1_from_encoder_v3e"]:
         from src.rul_decoder_training_v1 import train_rul_decoder_v1
 
         train_cfg = config.get("training_params", {})
@@ -128,17 +128,30 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         # Map torch.device to simple string for the decoder script
         device_str = "cuda" if str(device).startswith("cuda") else "cpu"
 
-        print("\n[decoder_v1] Launching RUL Trajectory Decoder v1 training "
-              f"for experiment '{experiment_name}' on {device_str}")
+        if config.get("encoder_type") == "decoder_v1_from_encoder_v3d":
+            encoder_experiment = "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase"
+            decoder_subdir = "decoder_v1_from_encoder_v3d"
+        else:  # decoder_v1_from_encoder_v3e
+            encoder_experiment = "fd004_transformer_encoder_ms_dt_v2_damage_v3e_smooth"
+            decoder_subdir = "decoder_v1_from_encoder_v3e"
+
+        print(
+            "\n[decoder_v1] Launching RUL Trajectory Decoder v1 training "
+            f"for experiment '{experiment_name}' on {device_str}\n"
+            f"  -> encoder_experiment = {encoder_experiment}\n"
+            f"  -> decoder_results_subdir = {decoder_subdir}"
+        )
         train_rul_decoder_v1(
             device=device_str,
             epochs=epochs,
             batch_size=batch_size,
+            encoder_experiment=encoder_experiment,
+            decoder_results_subdir=decoder_subdir,
         )
 
         # After training finishes, attempt to load its summary JSON to return
         # a consistent summary dict to the caller.
-        decoder_results_dir = Path("results") / "fd004" / "decoder_v1_from_encoder_v3d"
+        decoder_results_dir = Path("results") / dataset_name.lower() / decoder_subdir
         summary_path = decoder_results_dir / "summary_decoder_v1.json"
         if summary_path.exists():
             with open(summary_path, "r") as f:

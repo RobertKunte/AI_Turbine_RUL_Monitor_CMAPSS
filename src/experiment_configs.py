@@ -1309,6 +1309,22 @@ def get_fd004_decoder_v1_from_encoder_v3d_config() -> ExperimentConfig:
     }
     return cfg
 
+
+def get_fd004_decoder_v1_from_encoder_v3e_config() -> ExperimentConfig:
+    """
+    FD004 RUL Trajectory Decoder v1 on top of a frozen encoder v3e.
+    """
+    cfg: ExperimentConfig = {
+        "experiment_name": "fd004_decoder_v1_from_encoder_v3e",
+        "dataset": "FD004",
+        "encoder_type": "decoder_v1_from_encoder_v3e",
+        "training_params": {
+            "num_epochs": 50,
+            "batch_size": 256,
+        },
+    }
+    return cfg
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_config() -> ExperimentConfig:
     """
     FD004 ms+DT Transformer-Encoder with MLP-based DamageHead and two-phase training.
@@ -2948,6 +2964,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v3e_smooth_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
+    if experiment_name == "fd004_decoder_v1_from_encoder_v3e":
+        return get_fd004_decoder_v1_from_encoder_v3e_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":
