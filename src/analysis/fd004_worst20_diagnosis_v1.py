@@ -347,6 +347,142 @@ def plot_rul_hi_trajectories(
 
 
 # ---------------------------------------------------------------------------
+# Truncation / censoring diagnostics (FD004 test is right-censored)
+# ---------------------------------------------------------------------------
+
+def plot_truncation_diagnostics(
+    df: pd.DataFrame,
+    worst_unit_ids: List[int],
+    save_path: Path,
+) -> None:
+    """
+    Truncation / censoring diagnostics for FD004 test:
+      - hist(true_rul_last) worst20 vs rest
+      - hist(num_cycles) worst20 vs rest
+      - scatter(true_rul_last vs error_last), highlight worst20
+      - scatter(num_cycles vs error_last), highlight worst20
+      - boxplot(true_rul_last) worst20 vs rest
+      - scatter(true_rul_last vs abs_error_last) + simple linear trendline
+    """
+    df = df.copy()
+    df["group"] = np.where(df["unit_id"].isin(worst_unit_ids), "worst20", "rest")
+    df["abs_error"] = df["eol_error"].abs()
+
+    worst = df[df["group"] == "worst20"]
+    rest = df[df["group"] == "rest"]
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+    axes = axes.reshape(-1)
+
+    # 1) Histogram of true RUL at last observed cycle
+    ax = axes[0]
+    ax.hist(rest["eol_rul_true"].dropna().values, bins=20, alpha=0.6, label="rest")
+    ax.hist(worst["eol_rul_true"].dropna().values, bins=20, alpha=0.8, label="worst20")
+    ax.set_title("True RUL at last observed cycle (test / right-censored)")
+    ax.set_xlabel("true_rul_last")
+    ax.set_ylabel("count")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    # 2) Histogram of num_cycles
+    ax = axes[1]
+    ax.hist(rest["num_cycles"].dropna().values, bins=20, alpha=0.6, label="rest")
+    ax.hist(worst["num_cycles"].dropna().values, bins=20, alpha=0.8, label="worst20")
+    ax.set_title("Num cycles in test trajectory (censoring length)")
+    ax.set_xlabel("num_cycles")
+    ax.set_ylabel("count")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    # 3) Scatter: true_rul_last vs error_last
+    ax = axes[2]
+    ax.scatter(rest["eol_rul_true"], rest["eol_error"], s=18, alpha=0.4, label="rest")
+    ax.scatter(worst["eol_rul_true"], worst["eol_error"], s=30, alpha=0.9, label="worst20")
+    ax.axhline(0.0, linestyle="--", linewidth=1)
+    ax.set_title("Error vs true_rul_last (pred - true)")
+    ax.set_xlabel("true_rul_last")
+    ax.set_ylabel("error_last")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    # 4) Scatter: num_cycles vs error_last
+    ax = axes[3]
+    ax.scatter(rest["num_cycles"], rest["eol_error"], s=18, alpha=0.4, label="rest")
+    ax.scatter(worst["num_cycles"], worst["eol_error"], s=30, alpha=0.9, label="worst20")
+    ax.axhline(0.0, linestyle="--", linewidth=1)
+    ax.set_title("Error vs num_cycles")
+    ax.set_xlabel("num_cycles")
+    ax.set_ylabel("error_last")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    # 5) Boxplot: true_rul_last worst vs rest
+    ax = axes[4]
+    ax.boxplot(
+        [
+            worst["eol_rul_true"].dropna().values,
+            rest["eol_rul_true"].dropna().values,
+        ],
+        labels=["worst20", "rest"],
+        showfliers=True,
+    )
+    ax.set_title("true_rul_last distribution (worst20 vs rest)")
+    ax.grid(True, alpha=0.3)
+
+    # 6) Scatter: true_rul_last vs abs_error_last (+ trendline)
+    ax = axes[5]
+    ax.scatter(rest["eol_rul_true"], rest["abs_error"], s=18, alpha=0.35, label="rest")
+    ax.scatter(worst["eol_rul_true"], worst["abs_error"], s=30, alpha=0.9, label="worst20")
+    ax.set_title("|error| vs true_rul_last")
+    ax.set_xlabel("true_rul_last")
+    ax.set_ylabel("abs_error")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    # Simple linear fit for all points (optional, robust)
+    try:
+        x = df["eol_rul_true"].to_numpy(dtype=float)
+        y = df["abs_error"].to_numpy(dtype=float)
+        msk = np.isfinite(x) & np.isfinite(y)
+        if int(msk.sum()) > 5:
+            a, b = np.polyfit(x[msk], y[msk], 1)
+            xs = np.linspace(float(np.nanmin(x[msk])), float(np.nanmax(x[msk])), 100)
+            ys = a * xs + b
+            ax.plot(xs, ys, linewidth=2, alpha=0.8, color="k")
+    except Exception:
+        pass
+
+    plt.suptitle("Truncation / Censoring Diagnostics (FD004 test)", fontsize=14, y=1.02)
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[fd004_worst20] Saved truncation diagnostics plot: {save_path}")
+
+
+def print_truncation_bucket_stats(eol_df: pd.DataFrame, worst_unit_ids: List[int]) -> None:
+    """Bucket analysis by true_rul_last (eol_rul_true) for FD004 test."""
+    df = eol_df.copy()
+    df["group"] = np.where(df["unit_id"].isin(worst_unit_ids), "worst20", "rest")
+    df["abs_error"] = df["eol_error"].abs()
+
+    bins = [-1, 25, 50, 75, 100, 10_000]
+    labels = ["0-25", "25-50", "50-75", "75-100", "100+"]
+    df["rul_last_bin"] = pd.cut(df["eol_rul_true"], bins=bins, labels=labels)
+
+    agg = df.groupby("rul_last_bin").agg(
+        n=("unit_id", "count"),
+        mean_error=("eol_error", "mean"),
+        median_error=("eol_error", "median"),
+        mean_abs_error=("abs_error", "mean"),
+        median_abs_error=("abs_error", "median"),
+        worst_frac=("group", lambda s: float((s == "worst20").mean())),
+    )
+    print("\n=== Truncation bucket stats by true_rul_last (test / right-censored) ===")
+    print(agg.to_string())
+
+
+# ---------------------------------------------------------------------------
 # 6. Per-engine summary and stats (worst vs rest)
 # ---------------------------------------------------------------------------
 
@@ -435,22 +571,22 @@ def plot_worst_vs_rest_stats(
         ax.grid(True, alpha=0.3)
 
     # 2) EOL error
-    _box(axes[1], "eol_error", "EOL error (pred - true)")
+    _box(axes[1], "eol_error", "Last-cycle error (pred - true) [test / right-censored]")
 
     # 3) num_cycles
     _box(axes[2], "num_cycles", "Num cycles per engine")
 
     # 4) HI_phys_eol
     if "hi_phys_eol" in df.columns:
-        _box(axes[3], "hi_phys_eol", "HI_phys_v3 at EOL")
+        _box(axes[3], "hi_phys_eol", "HI_phys_v3 at last observed cycle")
 
     # 5) HI_damage_eol
     if "hi_damage_eol" in df.columns:
-        _box(axes[4], "hi_damage_eol", "HI_damage at EOL")
+        _box(axes[4], "hi_damage_eol", "HI_damage at last observed cycle")
 
     # 6) HI_cal_eol
     if "hi_cal_eol" in df.columns:
-        _box(axes[5], "hi_cal_eol", "HI_cal_v2 at EOL")
+        _box(axes[5], "hi_cal_eol", "HI_cal_v2 at last observed cycle")
 
     plt.suptitle("Worst-20 vs Rest – Basic Stats", fontsize=14, y=1.02)
     plt.tight_layout()
@@ -595,6 +731,33 @@ def main() -> None:
     best_units = best_df["unit_id"].tolist()
     all_units = eol_df["unit_id"].tolist()
 
+    # ------------------------------------------------------------------
+    # Truncation / censoring diagnostics (FD004 test is right-censored)
+    # ------------------------------------------------------------------
+    plot_truncation_diagnostics(
+        df=eol_df,
+        worst_unit_ids=worst_units,
+        save_path=RESULTS_DIR / "diagnostics_truncation.png",
+    )
+    print_truncation_bucket_stats(eol_df=eol_df, worst_unit_ids=worst_units)
+
+    df_corr = eol_df.copy()
+    df_corr["abs_error"] = df_corr["eol_error"].abs()
+
+    def _corr(a: str, b: str) -> float:
+        aa = df_corr[a].to_numpy(dtype=float)
+        bb = df_corr[b].to_numpy(dtype=float)
+        m = np.isfinite(aa) & np.isfinite(bb)
+        if int(m.sum()) < 3:
+            return float("nan")
+        return float(np.corrcoef(aa[m], bb[m])[0, 1])
+
+    print("\n=== Correlations (test / right-censored) ===")
+    print(f"corr(true_rul_last, error_last)     = {_corr('eol_rul_true','eol_error'):.4f}")
+    print(f"corr(true_rul_last, abs_error_last) = {_corr('eol_rul_true','abs_error'):.4f}")
+    print(f"corr(num_cycles, error_last)        = {_corr('num_cycles','eol_error'):.4f}")
+    print(f"corr(num_cycles, abs_error_last)    = {_corr('num_cycles','abs_error'):.4f}")
+
     # 4) Feature pipeline for residuals + HI_phys
     df_test_fe, feature_cols = build_feature_pipeline_for_fd004(
         summary=summary,
@@ -626,12 +789,12 @@ def main() -> None:
     # 6) Trajectory sanity-check plots
     plot_rul_hi_trajectories(
         per_unit=per_unit_worst,
-        title=f"{RUN_NAME} – Worst 20 engines (RUL + HI)",
+        title=f"{RUN_NAME} – Worst 20 engines (RUL + HI) [test / right-censored]",
         save_path=RESULTS_DIR / "diagnostics_worst20_rul_hi.png",
     )
     plot_rul_hi_trajectories(
         per_unit=per_unit_best,
-        title=f"{RUN_NAME} – Best 20 engines (RUL + HI)",
+        title=f"{RUN_NAME} – Best 20 engines (RUL + HI) [test / right-censored]",
         save_path=RESULTS_DIR / "diagnostics_best20_rul_hi.png",
     )
 
