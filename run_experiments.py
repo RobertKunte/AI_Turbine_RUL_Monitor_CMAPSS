@@ -45,7 +45,11 @@ Phase 4 Residual Features:
 
 import argparse
 import json
+import os
+import subprocess
 import sys
+import traceback
+import shutil
 from pathlib import Path
 from typing import List, Optional
 
@@ -116,6 +120,184 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     experiment_name = config['experiment_name']
 
     # ===================================================================
+    # Phase 1 Run Registry (SQLite) – best-effort (must not break runs)
+    # ===================================================================
+    registry = None
+    run_id: Optional[str] = None
+    artifact_root_current: Optional[Path] = None
+    registry_results_dir_default = Path("results") / dataset_name.lower() / experiment_name
+
+    def _get_git_sha() -> Optional[str]:
+        try:
+            sha = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            return sha or None
+        except Exception:
+            return None
+
+    def _metrics_from_summary(summary: dict) -> dict:
+        # Keep this small and stable. Store the entire summary as metrics_json,
+        # but prefer the standard metric dicts when present.
+        if not isinstance(summary, dict):
+            return {"summary": str(summary)}
+        metrics = {}
+        # Common patterns across encoders/decoders/world models
+        if "test_metrics" in summary and isinstance(summary["test_metrics"], dict):
+            metrics["test_metrics"] = summary["test_metrics"]
+        if "val_metrics" in summary and isinstance(summary["val_metrics"], dict):
+            metrics["val_metrics"] = summary["val_metrics"]
+        if "metrics_test" in summary and isinstance(summary["metrics_test"], dict):
+            metrics["metrics_test"] = summary["metrics_test"]
+        if "metrics_val" in summary and isinstance(summary["metrics_val"], dict):
+            metrics["metrics_val"] = summary["metrics_val"]
+        # Always include a thin top-level snapshot for quick inspection
+        for k in ["experiment_name", "dataset", "encoder_type", "model_type", "best_val_rmse", "val_rmse", "test_rmse", "test_nasa_mean"]:
+            if k in summary:
+                metrics[k] = summary[k]
+        return metrics or summary
+
+    def _registry_start() -> None:
+        nonlocal registry, run_id, artifact_root_current
+        if os.environ.get("RUN_REGISTRY_DISABLE", "").strip() in {"1", "true", "True", "yes"}:
+            return
+        try:
+            from src.tools.run_registry import RunRegistry
+
+            db_path = Path(os.environ.get("RUN_REGISTRY_DB", str(Path("artifacts") / "run_registry.sqlite")))
+            registry = RunRegistry(db_path)
+            run_id = registry.start_run(
+                experiment_name=experiment_name,
+                dataset=dataset_name,
+                config=dict(config),
+                results_dir=registry_results_dir_default,
+                artifact_root=None,
+                git_sha=_get_git_sha(),
+            )
+            # Standard per-run artifact root (used by Colab sync)
+            try:
+                artifact_root_current = Path("artifacts") / "runs" / str(run_id)
+                artifact_root_current.mkdir(parents=True, exist_ok=True)
+                registry.set_artifact_root(str(run_id), artifact_root_current)
+            except Exception as e:
+                print(f"[run_registry] WARNING: could not set artifact_root: {e}")
+            print(f"[run_registry] run_id={run_id} db={db_path}")
+        except Exception as e:
+            registry = None
+            run_id = None
+            artifact_root_current = None
+            print(f"[run_registry] WARNING: disabled due to error: {e}")
+
+    def _copy_only_newer(src: Path, dst: Path) -> bool:
+        if not dst.exists():
+            return True
+        try:
+            sm = src.stat().st_mtime
+            dm = dst.stat().st_mtime
+            if sm > dm + 1e-6:
+                return True
+            if abs(sm - dm) <= 1e-6:
+                return src.stat().st_size != dst.stat().st_size
+            return False
+        except Exception:
+            return True
+
+    def _snapshot_results_to_artifacts(results_dir: Path) -> None:
+        """
+        Copy a small, useful snapshot of the run outputs into artifacts/runs/<run_id>/.
+        This avoids syncing the entire repo and keeps Colab sync predictable.
+        """
+        if artifact_root_current is None:
+            return
+        if not results_dir.exists():
+            return
+
+        dst_root = artifact_root_current / "results_snapshot"
+        dst_root.mkdir(parents=True, exist_ok=True)
+
+        patterns = [
+            "summary.json",
+            "summary_decoder_*.json",
+            "eol_metrics.json",
+            "*.png",
+            "*.pkl",
+            "*best*.pt",
+            "*.pt",
+        ]
+
+        copied = 0
+        for pat in patterns:
+            for p in results_dir.glob(pat):
+                if not p.is_file():
+                    continue
+                q = dst_root / p.name
+                if _copy_only_newer(p, q):
+                    shutil.copy2(p, q)
+                    copied += 1
+
+        if copied > 0:
+            print(f"[run_registry] Snapshotted {copied} files to {dst_root}")
+
+    def _registry_finish(summary: dict, *, results_dir: Optional[Path] = None, summary_path: Optional[Path] = None) -> None:
+        if registry is None or run_id is None:
+            return
+        try:
+            # Default summary.json path for most experiments
+            if results_dir is None:
+                results_dir = registry_results_dir_default
+            if summary_path is None:
+                candidate = results_dir / "summary.json"
+                summary_path = candidate if candidate.exists() else None
+            # Snapshot key run outputs into per-run artifact root
+            _snapshot_results_to_artifacts(results_dir)
+            registry.finish_run(
+                run_id,
+                metrics=_metrics_from_summary(summary),
+                summary_path=summary_path,
+                results_dir=results_dir,
+                artifact_root=artifact_root_current,
+                status="success",
+            )
+        except Exception as e:
+            print(f"[run_registry] WARNING: could not finish run: {e}")
+        finally:
+            try:
+                registry.close()
+            except Exception:
+                pass
+
+    def _registry_fail(exc: BaseException, *, results_dir: Optional[Path] = None, summary_path: Optional[Path] = None) -> None:
+        if registry is None or run_id is None:
+            return
+        try:
+            if results_dir is None:
+                results_dir = registry_results_dir_default
+            if summary_path is None:
+                candidate = results_dir / "summary.json"
+                summary_path = candidate if candidate.exists() else None
+            # Snapshot any files that may exist even on failure
+            _snapshot_results_to_artifacts(results_dir)
+            registry.fail_run(
+                run_id,
+                error_message=f"{type(exc).__name__}: {exc}",
+                traceback_str=traceback.format_exc(),
+                results_dir=results_dir,
+                summary_path=summary_path,
+                artifact_root=artifact_root_current,
+            )
+        except Exception as e:
+            print(f"[run_registry] WARNING: could not fail-run log: {e}")
+        finally:
+            try:
+                registry.close()
+            except Exception:
+                pass
+
+    _registry_start()
+
+    # ===================================================================
     # Special case: RUL Trajectory Decoders on top of frozen encoder v3d/v3e
     # ===================================================================
     encoder_type_cfg = config.get("encoder_type")
@@ -161,6 +343,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 "dataset": dataset_name,
                 "note": "Decoder v1 training finished, but summary_decoder_v1.json was not found.",
             }
+        _registry_finish(summary, results_dir=decoder_results_dir, summary_path=summary_path if summary_path.exists() else None)
         return summary
 
     if encoder_type_cfg == "decoder_v2":
@@ -172,6 +355,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             f"  -> encoder_experiment = {config.get('encoder_experiment', 'fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase')}\n"
         )
         summary = train_rul_decoder_v2(config, device)
+        _registry_finish(summary, results_dir=registry_results_dir_default)
         return summary
 
     if encoder_type_cfg == "decoder_v3":
@@ -183,6 +367,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             f"  -> encoder_experiment = {config.get('encoder_experiment', 'fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase')}\n"
         )
         summary = train_rul_decoder_v3(config, device)
+        _registry_finish(summary, results_dir=registry_results_dir_default)
         return summary
     
     # ===================================================================
@@ -467,6 +652,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             summary = train_state_encoder_v3(cfg_ns)
         else:
             summary = train_state_encoder_v3_physics(cfg_ns)
+        _registry_finish(summary, results_dir=results_dir)
         return summary
     
     # ===================================================================
@@ -659,6 +845,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             print(f"  Best val_loss (train_transformer_world_model_v1): {summary.get('val_loss', float('nan')):.4f}")
         print("=" * 80)
 
+        _registry_finish(summary, results_dir=results_dir)
         return summary
     
     # ===================================================================
@@ -1281,6 +1468,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     print(f"  NASA Mean: {test_metrics['nasa_pointwise']['score_mean']:.2f}")
     print("=" * 80)
     
+    _registry_finish(summary, results_dir=results_dir, summary_path=results_dir / "summary.json")
     return summary
 
 
@@ -1389,8 +1577,31 @@ def main():
             all_summaries.append(summary)
         except Exception as e:
             print(f"\n❌ Error running {config['experiment_name']}: {e}")
-            import traceback
             traceback.print_exc()
+            # Best-effort: mark the latest running registry entry as failed.
+            try:
+                if os.environ.get("RUN_REGISTRY_DISABLE", "").strip() not in {"1", "true", "True", "yes"}:
+                    from src.tools.run_registry import RunRegistry
+
+                    db_path = Path(os.environ.get("RUN_REGISTRY_DB", str(Path("artifacts") / "run_registry.sqlite")))
+                    reg = RunRegistry(db_path)
+                    try:
+                        rid = reg.find_latest_run_id(
+                            experiment_name=config.get("experiment_name", ""),
+                            dataset=config.get("dataset", ""),
+                            status="running",
+                        )
+                        if rid is not None:
+                            reg.fail_run(
+                                rid,
+                                error_message=f"{type(e).__name__}: {e}",
+                                traceback_str=traceback.format_exc(),
+                            )
+                            print(f"[run_registry] Marked run_id={rid} as failed")
+                    finally:
+                        reg.close()
+            except Exception as reg_e:
+                print(f"[run_registry] WARNING: could not mark failed run: {reg_e}")
             continue
     
     print(f"\n\n{'=' * 80}")
