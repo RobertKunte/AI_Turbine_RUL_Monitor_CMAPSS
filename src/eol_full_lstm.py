@@ -2032,18 +2032,23 @@ def train_eol_full_lstm(
                     )
                     cond_seq_avg = None
                     cond_recon = None
+                    # Robust unpacking: newer Transformer v5u may append rul_sigma.
                     if use_condition_embedding:
                         if supports_cond_recon:
-                            rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = model(
-                                X_batch, cond_ids=cond_ids_batch, return_aux=True
-                            )
+                            out = model(X_batch, cond_ids=cond_ids_batch, return_aux=True)
+                            if isinstance(out, (tuple, list)) and len(out) == 6:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _ = out
+                            else:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                         else:
                             rul_pred, health_last, health_seq = model(X_batch, cond_ids=cond_ids_batch)
                     else:
                         if supports_cond_recon:
-                            rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = model(
-                                X_batch, return_aux=True
-                            )
+                            out = model(X_batch, return_aux=True)
+                            if isinstance(out, (tuple, list)) and len(out) == 6:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _ = out
+                            else:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                         else:
                             rul_pred, health_last, health_seq = model(X_batch)
                     
@@ -2289,18 +2294,23 @@ def train_eol_full_lstm(
                     )
                     cond_seq_avg = None
                     cond_recon = None
+                    # Robust unpacking: newer Transformer v5u may append rul_sigma.
                     if use_condition_embedding:
                         if supports_cond_recon:
-                            rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = model(
-                                X_batch, cond_ids=cond_ids_batch, return_aux=True
-                            )
+                            out = model(X_batch, cond_ids=cond_ids_batch, return_aux=True)
+                            if isinstance(out, (tuple, list)) and len(out) == 6:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _ = out
+                            else:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                         else:
                             rul_pred, health_last, health_seq = model(X_batch, cond_ids=cond_ids_batch)
                     else:
                         if supports_cond_recon:
-                            rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = model(
-                                X_batch, return_aux=True
-                            )
+                            out = model(X_batch, return_aux=True)
+                            if isinstance(out, (tuple, list)) and len(out) == 6:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _ = out
+                            else:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                         else:
                             rul_pred, health_last, health_seq = model(X_batch)
                     

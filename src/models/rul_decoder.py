@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class RULTrajectoryDecoderV1(nn.Module):
