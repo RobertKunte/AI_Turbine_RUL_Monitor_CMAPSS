@@ -1587,6 +1587,10 @@ def run_inference_for_experiment(
                 hi=hi_traj,
                 true_rul=true_rul_traj,
                 pred_rul=pred_rul_traj,
+                # For Transformer encoder runs with a damage-based HI, the main
+                # HI trajectory (hi_traj) is already damage-like and monotone –
+                # expose it as hi_damage for downstream diagnostics.
+                hi_damage=hi_traj,
                 hi_cal=hi_cal_traj,
             )
     

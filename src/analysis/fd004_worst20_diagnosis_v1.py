@@ -181,6 +181,29 @@ def build_feature_pipeline_for_fd004(
         phys_features=phys_features,
     )
 
+    # For damage_v3/v4/v5-style experiments, compute HI_phys_v3 on TEST
+    # features for diagnostics (true physics-based HI trajectory).
+    run_name_lower = summary.get("experiment_name", "").lower()
+    if any(tag in run_name_lower for tag in ["damage_v3", "damage_v4", "damage_v5"]):
+        try:
+            from src.features.hi_phys_v3 import compute_hi_phys_v3_from_residuals
+
+            print("[fd004_worst20] Computing HI_phys_v3 on test data for diagnostics...")
+            hi_v3_test = compute_hi_phys_v3_from_residuals(
+                df_test_fe,
+                unit_col="UnitNumber",
+                cycle_col="TimeInCycles",
+            )
+            df_test_fe["HI_phys_v3"] = hi_v3_test
+            print(
+                f"[fd004_worst20] HI_phys_v3 (test) stats: "
+                f"min={float(np.nanmin(hi_v3_test)):.4f}, "
+                f"max={float(np.nanmax(hi_v3_test)):.4f}, "
+                f"mean={float(np.nanmean(hi_v3_test)):.4f}"
+            )
+        except Exception as e:  # pragma: no cover - diagnostics only
+            print(f"[fd004_worst20] WARNING: Could not compute HI_phys_v3 for diagnostics: {e}")
+
     return df_test_fe, feature_cols
 
 
