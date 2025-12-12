@@ -47,6 +47,7 @@ class EngineTrajectoryV2:
     time_idx: np.ndarray       # [T_engine]
     rul_true: np.ndarray       # [T_engine]
     rul_pred: np.ndarray       # [T_engine]
+    rul_sigma: Optional[np.ndarray] = None  # [T_engine] optional sigma(t) in cycles
     hi_phys: np.ndarray        # [T_engine]
     hi_cal: np.ndarray         # [T_engine]
     hi_damage: np.ndarray      # [T_engine]
@@ -156,6 +157,10 @@ def load_encoder_and_decoder_v2(
         ).to(device)
         decoder_ckpt_path = results_dir_run / "decoder_v2_best.pt"
     else:  # decoder_version == "v3"
+        model_type = str(summary.get("model_type", "decoder_v3"))
+        training_cfg = summary.get("training", {}) if isinstance(summary.get("training", {}), dict) else {}
+        use_uncertainty = ("uncertainty" in model_type.lower()) or (float(training_cfg.get("w_traj_nll", 0.0)) > 0.0)
+        sigma_floor = float(training_cfg.get("sigma_floor", 1e-3))
         decoder = RULTrajectoryDecoderV3(
             latent_dim=latent_dim,
             hi_feature_dim=4,
@@ -163,6 +168,8 @@ def load_encoder_and_decoder_v2(
             hidden_dim=summary.get("training", {}).get("decoder_hidden_dim", 128),
             num_layers=summary.get("training", {}).get("decoder_num_layers", 2),
             dropout=summary.get("training", {}).get("decoder_dropout", 0.1),
+            use_uncertainty=use_uncertainty,
+            min_sigma=sigma_floor,
         ).to(device)
         decoder_ckpt_path = results_dir_run / "decoder_v3_best.pt"
 
@@ -364,6 +371,7 @@ def build_engine_trajectories_v3(
     N = X_full.shape[0]
     rul_true_all = np.zeros(N, dtype=np.float32)
     rul_pred_all = np.zeros(N, dtype=np.float32)
+    rul_sigma_all = np.full(N, np.nan, dtype=np.float32)
     hi_phys_all = np.zeros(N, dtype=np.float32)
     hi_cal_all = np.zeros(N, dtype=np.float32)
     hi_damage_all = np.zeros(N, dtype=np.float32)
@@ -400,7 +408,7 @@ def build_engine_trajectories_v3(
             )
 
             # Decoder v3 RUL trajectory
-            rul_seq_pred, _ = decoder(
+            out = decoder(
                 z_seq=z_seq,
                 hi_phys_seq=hi_phys_seq_batch,
                 hi_cal1_seq=hi_cal1_seq_batch,
@@ -408,7 +416,14 @@ def build_engine_trajectories_v3(
                 hi_damage_seq=hi_damage_seq_use,
                 slope_feats=slope_feats,
             )
+            if isinstance(out, (tuple, list)) and len(out) == 3:
+                rul_seq_pred, rul_sigma_seq, _ = out
+            else:
+                rul_seq_pred, _ = out  # type: ignore[misc]
+                rul_sigma_seq = None
+
             eol_pred = rul_seq_pred[:, -1]
+            eol_sigma = rul_sigma_seq[:, -1] if rul_sigma_seq is not None else None
 
             # HI values at last timestep of window
             hi_phys_last = hi_phys_seq_batch[:, -1]
@@ -418,6 +433,8 @@ def build_engine_trajectories_v3(
             idx_slice = slice(start, end)
             rul_true_all[idx_slice] = y_batch.cpu().numpy()
             rul_pred_all[idx_slice] = eol_pred.cpu().numpy()
+            if eol_sigma is not None:
+                rul_sigma_all[idx_slice] = eol_sigma.cpu().numpy()
             hi_phys_all[idx_slice] = hi_phys_last.cpu().numpy()
             hi_cal_all[idx_slice] = hi_cal_last.cpu().numpy()
             hi_damage_all[idx_slice] = hi_damage_last.cpu().numpy()
@@ -442,6 +459,7 @@ def build_engine_trajectories_v3(
 
         rul_true_u = rul_true_all[idxs_sorted]
         rul_pred_u = rul_pred_all[idxs_sorted]
+        rul_sigma_u = rul_sigma_all[idxs_sorted]
         hi_phys_u = hi_phys_all[idxs_sorted]
         hi_cal_u = hi_cal_all[idxs_sorted]
         hi_damage_u = hi_damage_all[idxs_sorted]
@@ -466,6 +484,7 @@ def build_engine_trajectories_v3(
             time_idx=time_idx_u,
             rul_true=rul_true_u,
             rul_pred=rul_pred_u,
+            rul_sigma=None if np.all(~np.isfinite(rul_sigma_u)) else rul_sigma_u,
             hi_phys=hi_phys_u,
             hi_cal=hi_cal_u,
             hi_damage=hi_damage_u,
@@ -546,6 +565,12 @@ def plot_engine_group_v2(
         # Left axis: RUL true vs predicted
         ax.plot(t, traj.rul_true, "k--", label="RUL true")
         ax.plot(t, traj.rul_pred, "b-", label="RUL pred")
+        if getattr(traj, "rul_sigma", None) is not None:
+            sig = traj.rul_sigma
+            if sig is not None and np.any(np.isfinite(sig)):
+                lo = traj.rul_pred - sig
+                hi = traj.rul_pred + sig
+                ax.fill_between(t, lo, hi, color="blue", alpha=0.15, label="±1σ")
         ax.set_xlabel("window index")
         ax.set_ylabel("RUL [cycles]")
 
@@ -683,6 +708,45 @@ def plot_error_vs_life_fraction_v2(
     plt.savefig(save_path, dpi=150)
     plt.close()
     print(f"[decoder_v2] Saved error-vs-life-fraction plot to {save_path}")
+
+
+def plot_sigma_vs_abs_error_v3(
+    engine_trajs: Dict[int, EngineTrajectoryV2],
+    errors_eol: Dict[int, float],
+    save_path: Path,
+) -> None:
+    """
+    Decoder v3 uncertainty diagnostics:
+      - scatter(sigma_last vs abs_error_last) across engines (uses last-observed window index at min true RUL)
+    """
+    xs: List[float] = []
+    ys: List[float] = []
+    for uid, traj in engine_trajs.items():
+        sig = getattr(traj, "rul_sigma", None)
+        if sig is None:
+            continue
+        # choose the "last observed" window index as the minimal true RUL position
+        eol_idx = int(np.argmin(traj.rul_true))
+        s = float(sig[eol_idx]) if np.isfinite(sig[eol_idx]) else np.nan
+        if not np.isfinite(s):
+            continue
+        xs.append(s)
+        ys.append(float(abs(errors_eol.get(uid, 0.0))))
+
+    if len(xs) < 5:
+        print("[decoder_v3] Not enough sigma values; skipping sigma-vs-abs-error plot.")
+        return
+
+    fig = plt.figure(figsize=(7, 5))
+    plt.scatter(xs, ys, alpha=0.6, edgecolors="k")
+    plt.xlabel("sigma_last (cycles)")
+    plt.ylabel("|error_last| (cycles)")
+    plt.title("Decoder v3 uncertainty: |error_last| vs sigma_last (FD004 test)")
+    plt.grid(True, alpha=0.3)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[decoder_v3] Saved sigma-vs-abs-error plot to {save_path}")
 
 
 def main(args: argparse.Namespace) -> None:
@@ -868,6 +932,13 @@ def main(args: argparse.Namespace) -> None:
         all_life_frac=all_life_frac,
         all_errors_traj=all_errors_traj,
         save_path=results_dir_run / "error_vs_life_fraction_decoder_v2.png",
+    )
+
+    # Decoder v3 uncertainty: sigma diagnostics (only if available)
+    plot_sigma_vs_abs_error_v3(
+        engine_trajs=engine_trajs,
+        errors_eol=errors_eol,
+        save_path=results_dir_run / "sigma_vs_abs_error_decoder_v3.png",
     )
 
 

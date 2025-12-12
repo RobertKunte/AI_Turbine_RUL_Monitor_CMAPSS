@@ -1354,6 +1354,18 @@ def get_fd004_decoder_v3_from_encoder_v3d_config() -> ExperimentConfig:
     }
     return cfg
 
+
+def get_fd004_decoder_v3_uncertainty_from_encoder_v3d_config() -> ExperimentConfig:
+    """
+    Decoder v3 with per-timestep sigma(t) uncertainty head and weighted Gaussian NLL.
+    """
+    cfg = get_fd004_decoder_v3_from_encoder_v3d_config()
+    cfg["experiment_name"] = "fd004_decoder_v3_uncertainty_from_encoder_v3d"
+    # New loss term for trajectory uncertainty
+    cfg.setdefault("w_traj_nll", 0.5)
+    cfg.setdefault("sigma_floor", 1e-3)
+    return cfg
+
 def get_fd004_decoder_v2_from_encoder_v3d_config() -> ExperimentConfig:
     """
     FD004 RUL Trajectory Decoder v2 on top of a frozen encoder v3d.
@@ -1607,6 +1619,28 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_config() -> Exper
     loss.setdefault("w_hi_cal", 0.5)
     loss.setdefault("w_mono_hi_cal", 0.05)
     loss.setdefault("w_slope_hi_cal", 0.1)
+
+    return cfg
+
+
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_uncertainty_config() -> ExperimentConfig:
+    """
+    FD004 ms+DT Transformer-Encoder v5 + uncertainty head:
+      - same as v5_cond_norm
+      - additionally predicts sigma for RUL at last observed cycle
+      - trains with an additional Gaussian NLL term (configurable)
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_config()
+
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_uncertainty"
+
+    enc = cfg.setdefault("encoder_kwargs", {})
+    enc["use_rul_uncertainty_head"] = True
+    enc.setdefault("rul_uncertainty_min_sigma", 1e-3)
+
+    loss = cfg.setdefault("loss_params", {})
+    # Additional loss term: Gaussian NLL for EOL/last-observed RUL
+    loss.setdefault("rul_nll_weight", 0.5)
 
     return cfg
 
@@ -3124,6 +3158,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v4_hi_cal_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_uncertainty":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_uncertainty_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3e":
@@ -3132,6 +3168,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_decoder_v2_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v3_from_encoder_v3d":
         return get_fd004_decoder_v3_from_encoder_v3d_config()
+    if experiment_name == "fd004_decoder_v3_uncertainty_from_encoder_v3d":
+        return get_fd004_decoder_v3_uncertainty_from_encoder_v3d_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":

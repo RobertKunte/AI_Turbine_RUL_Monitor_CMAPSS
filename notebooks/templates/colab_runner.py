@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 
 # ============================================================
@@ -51,8 +52,99 @@ AUTO_GIT_PUSH = False
 
 
 def sh(cmd: str, *, check: bool = True) -> None:
-    print(f"\n[colab] $ {cmd}")
-    subprocess.run(cmd, shell=True, check=check)
+    """
+    Run a shell command with Colab-friendly output.
+
+    - Prefer IPython.system (same behavior as `!cmd`) when available, to get live output.
+    - Fall back to subprocess with unbuffered python for `python ...` commands.
+    """
+    cmd_run = cmd.strip()
+    if cmd_run.startswith("python "):
+        cmd_run = "python -u " + cmd_run[len("python ") :]
+
+    print(f"\n[colab] $ {cmd_run}", flush=True)
+
+    # Stream output line-by-line (closest to Colab `!` behavior).
+    # This avoids "silent runs" caused by buffering.
+    p = subprocess.Popen(
+        cmd_run,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+    )
+    assert p.stdout is not None
+    for line in p.stdout:
+        # Print exactly as produced; avoid double newlines
+        print(line, end="", flush=True)
+    rc = p.wait()
+    if check and rc != 0:
+        raise RuntimeError(f"Command failed with exit code {rc}: {cmd_run}")
+
+
+def infer_dataset_from_run_name(run_name: str) -> Optional[str]:
+    rn = run_name.strip().lower()
+    if rn.startswith("fd001"):
+        return "FD001"
+    if rn.startswith("fd002"):
+        return "FD002"
+    if rn.startswith("fd003"):
+        return "FD003"
+    if rn.startswith("fd004"):
+        return "FD004"
+    return None
+
+
+def copy_results_run_from_drive(run_name: str) -> None:
+    """
+    Preload a results folder from Drive into /content repo.
+    This is a direct copy fallback (does not depend on registry).
+    """
+    dataset = infer_dataset_from_run_name(run_name)
+    if dataset is None:
+        print(f"[colab] WARNING: Could not infer dataset from run_name='{run_name}', skipping preload.")
+        return
+
+    src = Path(DRIVE_PROJECT_ROOT) / "results" / dataset.lower() / run_name
+    dst = Path("results") / dataset.lower() / run_name
+    if not src.exists():
+        print(f"[colab] WARNING: Drive results folder not found: {src}")
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+
+    # Copy-only-newer via our sync tool (registry-free copy path)
+    # We use rsync-like semantics by copying files with cp -u (update) where possible.
+    # cp -u is widely available in Colab.
+    sh(f'mkdir -p "{dst}"', check=False)
+    sh(f'cp -u -r "{src}/"* "{dst}/"', check=False)
+    print(f"[colab] Preloaded results: {run_name} -> {dst}")
+
+
+def ensure_hi_calibrator_fd004() -> None:
+    """
+    Ensure HI_calibrator_FD004.pkl exists for runs that need HI_cal supervision (v4/v5).
+    Strategy:
+      1) Preload base encoder run results from Drive.
+      2) If calibrator still missing, fit it via src.analysis.hi_calibration CLI.
+    """
+    dataset = "FD004"
+    encoder_run = "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase"
+    cal_path = Path("results") / dataset.lower() / encoder_run / f"hi_calibrator_{dataset}.pkl"
+    if cal_path.exists():
+        return
+
+    print(f"[colab] HI_calibrator missing, attempting to preload base run: {encoder_run}")
+    copy_results_run_from_drive(encoder_run)
+
+    if cal_path.exists():
+        return
+
+    print("[colab] HI_calibrator still missing -> fitting calibrator (TRAIN-only) ...")
+    sh(f"python -m src.analysis.hi_calibration --dataset {dataset} --encoder_run {encoder_run}")
+    if not cal_path.exists():
+        raise RuntimeError(f"HI_calibrator still missing after fit attempt: {cal_path}")
 
 
 def get_git_sha(repo_dir: Path) -> str:
@@ -128,8 +220,8 @@ def main() -> None:
     # 5) Execute experiment
     print("\n[5] (Optional) Preloading input run results from Drive -> /content/results")
     for rn in PRELOAD_RESULTS_RUNS:
-        # Pull the full results directory for the referenced run_name
-        sh(f"python -m src.tools.sync_artifacts --pull --run_name {rn} --what results")
+        # Prefer direct preload (registry-free) for inputs.
+        copy_results_run_from_drive(rn)
 
     # Ensure Drive project folder exists
     sh(f"mkdir -p {DRIVE_PROJECT_ROOT}/artifacts/runs", check=False)
@@ -143,6 +235,10 @@ def main() -> None:
         print("\n" + "=" * 70)
         print(f"[Run {idx}/{len(RUN_NAMES)}] {run_name}")
         print("=" * 70)
+
+        # If the run name suggests HI_cal supervision (v4/v5), ensure calibrator exists.
+        if "damage_v4" in run_name.lower() or "damage_v5" in run_name.lower():
+            ensure_hi_calibrator_fd004()
 
         # Execute one experiment at a time for clearer logs and robust syncing
         sh(f"python run_experiments.py --experiments {run_name} --device {DEVICE}")

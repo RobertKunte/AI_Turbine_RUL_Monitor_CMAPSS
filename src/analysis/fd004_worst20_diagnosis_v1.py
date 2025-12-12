@@ -120,6 +120,8 @@ def build_eol_metrics_df(
                 "eol_rul_true": float(m.true_rul),
                 "eol_rul_pred": float(m.pred_rul),
                 "eol_error": float(m.error),
+                # Optional: predictive uncertainty (std dev in cycles) if available
+                "eol_sigma": float(getattr(m, "sigma", np.nan)) if getattr(m, "sigma", None) is not None else np.nan,
             }
         )
 
@@ -460,6 +462,73 @@ def plot_truncation_diagnostics(
     print(f"[fd004_worst20] Saved truncation diagnostics plot: {save_path}")
 
 
+def plot_uncertainty_diagnostics(
+    df: pd.DataFrame,
+    worst_unit_ids: List[int],
+    save_path: Path,
+) -> None:
+    """
+    Uncertainty diagnostics (if encoder predicts sigma at last observed cycle):
+      - scatter(sigma_last vs abs_error_last), highlight worst20
+      - scatter(sigma_last vs error_last), highlight worst20
+      - prints coverage estimates at 1σ and 2σ
+    """
+    if "eol_sigma" not in df.columns:
+        print("[fd004_worst20] No eol_sigma column found; skipping uncertainty diagnostics.")
+        return
+
+    df = df.copy()
+    df["group"] = np.where(df["unit_id"].isin(worst_unit_ids), "worst20", "rest")
+    df["abs_error"] = df["eol_error"].abs()
+    df["eol_sigma"] = pd.to_numeric(df["eol_sigma"], errors="coerce")
+
+    m = np.isfinite(df["eol_sigma"].to_numpy(dtype=float))
+    if int(m.sum()) < 5:
+        print("[fd004_worst20] Not enough finite sigma values; skipping uncertainty diagnostics.")
+        return
+
+    worst = df[df["group"] == "worst20"]
+    rest = df[df["group"] == "rest"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax = axes[0]
+    ax.scatter(rest["eol_sigma"], rest["abs_error"], s=18, alpha=0.4, label="rest")
+    ax.scatter(worst["eol_sigma"], worst["abs_error"], s=30, alpha=0.9, label="worst20")
+    ax.set_title("|error_last| vs sigma_last (encoder)")
+    ax.set_xlabel("sigma_last (cycles)")
+    ax.set_ylabel("abs_error_last (cycles)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    ax = axes[1]
+    ax.scatter(rest["eol_sigma"], rest["eol_error"], s=18, alpha=0.4, label="rest")
+    ax.scatter(worst["eol_sigma"], worst["eol_error"], s=30, alpha=0.9, label="worst20")
+    ax.axhline(0.0, linestyle="--", linewidth=1, color="k")
+    ax.set_title("error_last (pred-true) vs sigma_last (encoder)")
+    ax.set_xlabel("sigma_last (cycles)")
+    ax.set_ylabel("error_last (cycles)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    plt.suptitle("Uncertainty Diagnostics (FD004 test / right-censored)", fontsize=13, y=1.02)
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[fd004_worst20] Saved uncertainty diagnostics plot: {save_path}")
+
+    sigma = df["eol_sigma"].to_numpy(dtype=float)
+    err = df["eol_error"].to_numpy(dtype=float)
+    m2 = np.isfinite(sigma) & np.isfinite(err) & (sigma > 0)
+    if int(m2.sum()) > 5:
+        cov1 = float(np.mean(np.abs(err[m2]) <= 1.0 * sigma[m2]))
+        cov2 = float(np.mean(np.abs(err[m2]) <= 2.0 * sigma[m2]))
+        print("\n=== Encoder sigma coverage @ last observed cycle (test / right-censored) ===")
+        print(f"coverage_1sigma = {cov1:.3f}")
+        print(f"coverage_2sigma = {cov2:.3f}")
+
+
 def print_truncation_bucket_stats(eol_df: pd.DataFrame, worst_unit_ids: List[int]) -> None:
     """Bucket analysis by true_rul_last (eol_rul_true) for FD004 test."""
     df = eol_df.copy()
@@ -740,6 +809,11 @@ def main() -> None:
         save_path=RESULTS_DIR / "diagnostics_truncation.png",
     )
     print_truncation_bucket_stats(eol_df=eol_df, worst_unit_ids=worst_units)
+    plot_uncertainty_diagnostics(
+        df=eol_df,
+        worst_unit_ids=worst_units,
+        save_path=RESULTS_DIR / "diagnostics_uncertainty.png",
+    )
 
     df_corr = eol_df.copy()
     df_corr["abs_error"] = df_corr["eol_error"].abs()

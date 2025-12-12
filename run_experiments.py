@@ -1122,6 +1122,9 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             use_condition_normalizer=encoder_kwargs.get("use_condition_normalizer", False),
             condition_normalizer_hidden_dim=encoder_kwargs.get("condition_normalizer_hidden_dim", 64),
             use_hi_cal_fusion_for_rul=encoder_kwargs.get("use_hi_cal_fusion_for_rul", False),
+            # v5u: optional uncertainty head for RUL at last observed cycle
+            use_rul_uncertainty_head=encoder_kwargs.get("use_rul_uncertainty_head", False),
+            rul_uncertainty_min_sigma=encoder_kwargs.get("rul_uncertainty_min_sigma", 1e-3),
         )
 
         # If we inferred Cond_* feature indices, attach them to the model so it can
@@ -1320,6 +1323,9 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         hi_cal_mono_weight=config['loss_params'].get('w_mono_hi_cal', 0.0),
         hi_cal_slope_weight=config['loss_params'].get('w_slope_hi_cal', 0.0),
         hi_calibrator_path=config.get('hi_calibrator_path', None),
+        # v5u: Gaussian NLL for RUL using predicted sigma
+        rul_nll_weight=config['loss_params'].get('rul_nll_weight', 0.0),
+        rul_nll_min_sigma=encoder_kwargs.get("rul_uncertainty_min_sigma", 1e-3),
     )
     
     # ===================================================================

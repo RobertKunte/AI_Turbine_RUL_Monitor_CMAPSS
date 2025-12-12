@@ -1379,6 +1379,9 @@ def train_eol_full_lstm(
     hi_cal_mono_weight: float = 0.0,
     hi_cal_slope_weight: float = 0.0,
     hi_calibrator_path: str | None = None,
+    # NEW (v5u): optional Gaussian NLL for RUL at last observed cycle (requires predicted sigma)
+    rul_nll_weight: float = 0.0,
+    rul_nll_min_sigma: float = 1e-3,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Training-Loop für Full-Trajectory LSTM.
@@ -1641,20 +1644,35 @@ def train_eol_full_lstm(
                         )
                         cond_seq_avg = None
                         cond_recon = None
+                        rul_sigma = None
                         if use_condition_embedding:
                             if supports_cond_recon:
-                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = model(
-                                    X_batch, cond_ids=cond_ids_batch, return_aux=True
-                                )
+                                out = model(X_batch, cond_ids=cond_ids_batch, return_aux=True)
+                                if isinstance(out, (tuple, list)) and len(out) == 6:
+                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma = out
+                                else:
+                                    # Backwards-compatible (older models)
+                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                             else:
-                                rul_pred, health_last, health_seq = model(X_batch, cond_ids=cond_ids_batch)
+                                out = model(X_batch, cond_ids=cond_ids_batch)
+                                if isinstance(out, (tuple, list)) and len(out) == 4:
+                                    rul_pred, health_last, health_seq, rul_sigma = out
+                                else:
+                                    rul_pred, health_last, health_seq = out
                         else:
                             if supports_cond_recon:
-                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = model(
-                                    X_batch, return_aux=True
-                                )
+                                out = model(X_batch, return_aux=True)
+                                if isinstance(out, (tuple, list)) and len(out) == 6:
+                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma = out
+                                else:
+                                    # Backwards-compatible (older models)
+                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                             else:
-                                rul_pred, health_last, health_seq = model(X_batch)
+                                out = model(X_batch)
+                                if isinstance(out, (tuple, list)) and len(out) == 4:
+                                    rul_pred, health_last, health_seq, rul_sigma = out
+                                else:
+                                    rul_pred, health_last, health_seq = out
                         
                         # Construct RUL sequence for RUL-weighted monotonicity
                         # y_batch: (batch,) - RUL at last step
@@ -1707,6 +1725,20 @@ def train_eol_full_lstm(
                             )
                             smooth_weight_eff = damage_phase2_smooth_weight if damage_two_phase else 0.0
                             phase_tag = "P2-Multi" if damage_two_phase else "SinglePhase"
+
+                            # --------------------------------------------------------------
+                            # NEW (v5u): Gaussian NLL for RUL at last observed cycle
+                            # --------------------------------------------------------------
+                            if float(rul_nll_weight) > 0.0:
+                                if rul_sigma is None:
+                                    raise RuntimeError(
+                                        "rul_nll_weight > 0 but model did not return rul_sigma. "
+                                        "Enable use_rul_uncertainty_head for this run."
+                                    )
+                                sigma = torch.clamp(rul_sigma, min=float(rul_nll_min_sigma))
+                                err = (y_batch - (rul_pred.squeeze(-1) if rul_pred.dim() > 1 else rul_pred))
+                                nll = 0.5 * ((err * err) / (sigma * sigma) + 2.0 * torch.log(sigma))
+                                loss = loss + float(rul_nll_weight) * nll.mean()
                         
                         # Late monotonicity loss (RUL <= beta)
                         if USE_HI_MONOTONICITY:

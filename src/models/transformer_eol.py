@@ -269,6 +269,9 @@ class EOLFullTransformerEncoder(nn.Module):
         use_condition_normalizer: bool = False,
         condition_normalizer_hidden_dim: int = 64,
         use_hi_cal_fusion_for_rul: bool = False,
+        # NEW (v5u): optional RUL uncertainty head (predict sigma at EOL)
+        use_rul_uncertainty_head: bool = False,
+        rul_uncertainty_min_sigma: float = 1e-3,
     ) -> None:
         super().__init__()
 
@@ -296,6 +299,10 @@ class EOLFullTransformerEncoder(nn.Module):
         self.use_condition_normalizer: bool = bool(use_condition_normalizer)
         self.condition_normalizer_hidden_dim: int = int(condition_normalizer_hidden_dim)
         self.use_hi_cal_fusion_for_rul: bool = bool(use_hi_cal_fusion_for_rul)
+
+        # v5u: uncertainty head flags
+        self.use_rul_uncertainty_head: bool = bool(use_rul_uncertainty_head)
+        self.rul_uncertainty_min_sigma: float = float(rul_uncertainty_min_sigma)
 
         # ------------------------------------------------------------------
         # Continuous condition encoder configuration
@@ -382,6 +389,12 @@ class EOLFullTransformerEncoder(nn.Module):
         # Optionally enlarge RUL input if we concatenate HI_cal_v2 at EOL.
         rul_in_dim = d_model + 1 if self.use_hi_cal_fusion_for_rul else d_model
         self.fc_rul = nn.Linear(rul_in_dim, 1)
+        # v5u: predict log-sigma from same RUL input representation (optional)
+        self.fc_rul_log_sigma: Optional[nn.Linear]
+        if self.use_rul_uncertainty_head:
+            self.fc_rul_log_sigma = nn.Linear(rul_in_dim, 1)
+        else:
+            self.fc_rul_log_sigma = None
         self.fc_health = nn.Linear(d_model, 1)
 
         # Damage-basierte HI-Variante (identische API wie EOLFullLSTMWithHealth)
@@ -546,8 +559,13 @@ class EOLFullTransformerEncoder(nn.Module):
         cond_ids: Optional[torch.Tensor] = None,
         cond_seq: Optional[torch.Tensor] = None,
         return_aux: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]] | Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
     ]:
         """
         Forward-Pass.
@@ -562,12 +580,14 @@ class EOLFullTransformerEncoder(nn.Module):
                 rul_pred:    [B]       – RUL-Vorhersagen (Zyklen)
                 health_last: [B]       – HI am letzten Zeitschritt
                 health_seq:  [B, T, 1] – HI über die gesamte Sequenz
+                rul_sigma:   [B] or None – optional predictive uncertainty (std dev in cycles)
 
             If return_aux is True (V2, with condition reconstruction):
-                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon
+                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma
                 where:
                     cond_seq_avg: [B, cond_in_dim] or None
                     cond_recon:   [B, cond_in_dim] or None
+                    rul_sigma:    [B] or None
         """
         B, T, feat_dim = x.shape
         if feat_dim != self.input_dim:
@@ -657,9 +677,11 @@ class EOLFullTransformerEncoder(nn.Module):
         # ------------------------------------------------------------------
         # 5b. RUL-Head (wahlweise klassisch oder ImprovedRULHead)
         # ------------------------------------------------------------------
+        sigma_input: Optional[torch.Tensor] = None
         if self.rul_head is not None and self.rul_head_type == "improved":
             hi_latent = health_last.unsqueeze(-1) if self.rul_head.use_hi_fusion else None
             rul_pred = self.rul_head(shared, hi_latent=hi_latent)
+            sigma_input = shared
         else:
             # v5: optionally fuse HI_cal_v2 at EOL into the RUL head
             if (
@@ -678,6 +700,7 @@ class EOLFullTransformerEncoder(nn.Module):
 
             rul_logit = self.fc_rul(rul_input)  # [B, 1]
             rul_pred = rul_logit.squeeze(-1)  # [B]
+            sigma_input = rul_input
 
         # ------------------------------------------------------------------
         # 5c. Optional: condition reconstruction head (auxiliary output)
@@ -694,9 +717,20 @@ class EOLFullTransformerEncoder(nn.Module):
             cond_seq_avg = cond_seq.mean(dim=1)  # [B, cond_in_dim]
             cond_recon = self.fc_cond_recon(shared)  # [B, cond_in_dim]
 
+        # v5u: optional sigma output (append to keep backward compatibility)
+        rul_sigma: Optional[torch.Tensor] = None
+        if self.use_rul_uncertainty_head and self.fc_rul_log_sigma is not None:
+            # sigma must be strictly positive and in cycles (same unit as RUL)
+            # softplus provides stable positivity; add a small floor.
+            if sigma_input is None:
+                sigma_input = shared
+            log_sigma = self.fc_rul_log_sigma(sigma_input).squeeze(-1)  # [B]
+            rul_sigma = F.softplus(log_sigma) + float(self.rul_uncertainty_min_sigma)
+
         if return_aux:
-            return rul_pred, health_last, health_seq, cond_seq_avg, cond_recon
-        return rul_pred, health_last, health_seq
+            # Append sigma as last element to avoid shifting existing indices.
+            return rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma
+        return rul_pred, health_last, health_seq, rul_sigma
 
     # ------------------------------------------------------------------
     # Encoder-side helper for world models

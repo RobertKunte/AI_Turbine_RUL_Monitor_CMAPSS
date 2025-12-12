@@ -478,6 +478,9 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
     w_mono = float(config.get("w_mono", 0.1))
     w_smooth = float(config.get("w_smooth", 0.01))
     w_slope = float(config.get("w_slope", 0.2))
+    # NEW: optional Gaussian NLL on trajectory (requires sigma(t))
+    w_traj_nll = float(config.get("w_traj_nll", 0.0))
+    sigma_floor = float(config.get("sigma_floor", 1e-3))
 
     past_len = int(config.get("past_len", 30))
     max_rul = float(config.get("max_rul", 125.0))
@@ -635,6 +638,8 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
         hidden_dim=decoder_hidden_dim,
         num_layers=decoder_num_layers,
         dropout=decoder_dropout,
+        use_uncertainty=bool(w_traj_nll > 0.0),
+        min_sigma=sigma_floor,
     ).to(device)
 
     optimizer = torch.optim.Adam(decoder.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -701,7 +706,7 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
             )  # [B, T, S]
 
             # Forward pass
-            rul_seq_pred, degr_rate_pred = decoder(
+            out = decoder(
                 z_seq=z_seq,
                 hi_phys_seq=hi_phys_batch,
                 hi_cal1_seq=hi_cal1_batch,
@@ -709,12 +714,25 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
                 hi_damage_seq=hi_damage_seq_use,
                 slope_feats=slope_feats,
             )
+            if bool(w_traj_nll > 0.0):
+                rul_seq_pred, rul_sigma_seq, degr_rate_pred = out  # type: ignore[misc]
+            else:
+                rul_seq_pred, degr_rate_pred = out  # type: ignore[misc]
+                rul_sigma_seq = None
 
             # Loss components
             time_idx = torch.arange(T, device=device, dtype=rul_seq_true.dtype)  # [T]
             zone_weights = (time_idx + 1.0) / float(T)  # [T]
             zone_weights = zone_weights.unsqueeze(0).expand_as(rul_seq_true)  # [B, T]
             traj_loss = ((rul_seq_pred - rul_seq_true) ** 2 * zone_weights).mean()
+            traj_nll = None
+            if bool(w_traj_nll > 0.0):
+                if rul_sigma_seq is None:
+                    raise RuntimeError("w_traj_nll > 0 but decoder did not return rul_sigma_seq.")
+                sigma = torch.clamp(rul_sigma_seq, min=sigma_floor)
+                err = (rul_seq_true - rul_seq_pred)
+                nll_t = 0.5 * ((err * err) / (sigma * sigma) + 2.0 * torch.log(sigma))  # [B, T]
+                traj_nll = (nll_t * zone_weights).mean()
 
             eol_loss = F.mse_loss(rul_seq_pred[:, -1], rul_seq_true[:, -1])
 
@@ -740,6 +758,8 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
                 + w_smooth * smooth_loss
                 + w_slope * slope_loss
             )
+            if traj_nll is not None and w_traj_nll > 0.0:
+                loss = loss + w_traj_nll * traj_nll
 
             loss.backward()
             optimizer.step()
@@ -898,7 +918,7 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
     summary = {
         "experiment_name": experiment_name,
         "dataset": dataset_name,
-        "model_type": "decoder_v3",
+        "model_type": "decoder_v3_uncertainty" if w_traj_nll > 0.0 else "decoder_v3",
         "encoder_experiment": encoder_experiment,
         "decoder_results_dir": str(decoder_results_dir),
         "training": {
@@ -911,6 +931,8 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
             "w_mono": w_mono,
             "w_smooth": w_smooth,
             "w_slope": w_slope,
+            "w_traj_nll": w_traj_nll,
+            "sigma_floor": sigma_floor,
         },
         "val_metrics": {
             "rmse": val_metrics["rmse"],

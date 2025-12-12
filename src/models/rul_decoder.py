@@ -279,12 +279,17 @@ class RULTrajectoryDecoderV3(nn.Module):
         hidden_dim: int = 128,
         num_layers: int = 2,
         dropout: float = 0.1,
+        # NEW: optional uncertainty head for RUL trajectory (sigma per timestep)
+        use_uncertainty: bool = False,
+        min_sigma: float = 1e-3,
     ) -> None:
         super().__init__()
 
         self.lat = latent_dim
         self.hi_feature_dim = hi_feature_dim
         self.slope_feature_dim = slope_feature_dim
+        self.use_uncertainty: bool = bool(use_uncertainty)
+        self.min_sigma: float = float(min_sigma)
 
         input_dim = latent_dim + hi_feature_dim + slope_feature_dim
         self.input_proj = nn.Linear(input_dim, hidden_dim)
@@ -298,6 +303,8 @@ class RULTrajectoryDecoderV3(nn.Module):
 
         # Main RUL trajectory head
         self.rul_head = nn.Linear(hidden_dim, 1)
+        # Optional: log-sigma head (per timestep)
+        self.rul_log_sigma_head = nn.Linear(hidden_dim, 1) if self.use_uncertainty else None
 
         # Auxiliary degradation-rate head (per time step)
         self.degradation_head = nn.Linear(hidden_dim, 1)
@@ -310,7 +317,7 @@ class RULTrajectoryDecoderV3(nn.Module):
         hi_cal2_seq: torch.Tensor,
         hi_damage_seq: torch.Tensor,
         slope_feats: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             z_seq:         [B, T, D_z] latent encoder sequence
@@ -322,6 +329,7 @@ class RULTrajectoryDecoderV3(nn.Module):
 
         Returns:
             rul_seq_pred:  [B, T] predicted RUL trajectory
+            rul_sigma_seq: [B, T] optional predicted sigma per timestep (std dev in cycles)
             degr_rate_pred:[B, T] predicted degradation rate per timestep
         """
         if z_seq.dim() != 3:
@@ -357,6 +365,15 @@ class RULTrajectoryDecoderV3(nn.Module):
         rnn_out, _ = self.rnn(x_proj)  # [B, T, H]
 
         rul_seq_pred = self.rul_head(rnn_out).squeeze(-1)  # [B, T]
+        if self.use_uncertainty:
+            if self.rul_log_sigma_head is None:
+                raise RuntimeError("use_uncertainty=True but rul_log_sigma_head is None.")
+            log_sigma = self.rul_log_sigma_head(rnn_out).squeeze(-1)  # [B, T]
+            rul_sigma_seq = F.softplus(log_sigma) + float(self.min_sigma)  # [B, T]
+        else:
+            rul_sigma_seq = None
         degr_rate_pred = self.degradation_head(rnn_out).squeeze(-1)  # [B, T]
 
+        if self.use_uncertainty:
+            return rul_seq_pred, rul_sigma_seq, degr_rate_pred
         return rul_seq_pred, degr_rate_pred

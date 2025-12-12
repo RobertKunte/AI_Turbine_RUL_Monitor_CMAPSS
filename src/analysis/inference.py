@@ -53,6 +53,7 @@ class EngineEOLMetrics:
     pred_rul: float
     error: float  # pred - true
     nasa: float  # NASA contribution for this engine
+    sigma: Optional[float] = None  # predictive uncertainty (std dev in cycles), if available
 
 
 @dataclass
@@ -63,6 +64,7 @@ class EngineTrajectory:
     hi: np.ndarray  # shape (T,)
     true_rul: np.ndarray  # shape (T,)
     pred_rul: np.ndarray  # shape (T,)
+    rul_sigma: Optional[np.ndarray] = None  # shape (T,) - optional RUL sigma trajectory (usually constant for encoder EOL)
     hi_damage: Optional[np.ndarray] = None  # shape (T,) - optional damage-based HI trajectory
     hi_cal: Optional[np.ndarray] = None     # shape (T,) - optional calibrated HI (v4) trajectory
 
@@ -1391,6 +1393,7 @@ def run_inference_for_experiment(
             
             hi_last = None
             hi_seq = None
+            rul_sigma_pred = None
             
             if isinstance(outputs, dict):
                 # V3 output format
@@ -1403,6 +1406,13 @@ def run_inference_for_experiment(
                     _, hi_last, hi_seq = outputs
                 elif len(outputs) == 2:
                      _, hi_last = outputs
+                elif len(outputs) == 4:
+                    # Transformer v5u: (rul_pred, hi_last, hi_seq, rul_sigma)
+                    _, hi_last, hi_seq, rul_sigma_pred = outputs
+                elif len(outputs) == 6:
+                    # Transformer with return_aux=True shape, but called without return_aux here;
+                    # keep for robustness.
+                    _, hi_last, hi_seq, _, _, rul_sigma_pred = outputs
             
             # Post-process hi_seq if present
             if hi_seq is not None and torch.is_tensor(hi_seq):
@@ -1410,6 +1420,7 @@ def run_inference_for_experiment(
         else:
             hi_last = None
             hi_seq = None
+            rul_sigma_pred = None
 
         # Optional: HI_cal_v2 sequence for Transformer encoder v4
         hi_cal_seq = None
@@ -1430,6 +1441,12 @@ def run_inference_for_experiment(
                 hi_cal_seq = None
     
     rul_pred = rul_pred.cpu().numpy().flatten()
+    rul_sigma_np: Optional[np.ndarray] = None
+    try:
+        if "rul_sigma_pred" in locals() and rul_sigma_pred is not None and torch.is_tensor(rul_sigma_pred):
+            rul_sigma_np = rul_sigma_pred.detach().cpu().numpy().flatten()
+    except Exception:
+        rul_sigma_np = None
     
     # Apply RUL capping (same as evaluate_on_test_data)
     # Get max_rul from config (default 125)
@@ -1494,6 +1511,7 @@ def run_inference_for_experiment(
             pred_rul=pred_rul,
             error=error,
             nasa=nasa_contribution,
+            sigma=float(rul_sigma_np[i]) if rul_sigma_np is not None else None,
         ))
         
         # Build trajectory if requested
@@ -1580,6 +1598,10 @@ def run_inference_for_experiment(
             
             # Predicted RUL (constant for now - EOL prediction)
             pred_rul_traj = np.full(len(cycles), pred_rul) if len(cycles) > 0 else np.array([pred_rul])
+            sigma_traj: Optional[np.ndarray] = None
+            if rul_sigma_np is not None:
+                sigma_val = float(rul_sigma_np[i])
+                sigma_traj = np.full(len(cycles), sigma_val) if len(cycles) > 0 else np.array([sigma_val])
             
             trajectories[unit_id] = EngineTrajectory(
                 unit_id=unit_id,
@@ -1587,6 +1609,7 @@ def run_inference_for_experiment(
                 hi=hi_traj,
                 true_rul=true_rul_traj,
                 pred_rul=pred_rul_traj,
+                rul_sigma=sigma_traj,
                 # For Transformer encoder runs with a damage-based HI, the main
                 # HI trajectory (hi_traj) is already damage-like and monotone –
                 # expose it as hi_damage for downstream diagnostics.
