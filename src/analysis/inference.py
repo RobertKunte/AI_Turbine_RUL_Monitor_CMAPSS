@@ -710,11 +710,12 @@ def load_model_from_experiment(
         damage_temporal_conv_kernel_size = int(config.get("damage_temporal_conv_kernel_size", 3))
         damage_temporal_conv_num_layers = int(config.get("damage_temporal_conv_num_layers", 1))
 
-        # v4/v5: calibrated HI head + v5-specific flags
+        # v4/v5: calibrated HI head + v5-specific flags (+ v5u uncertainty head)
         # Prefer checkpoint structure when summary is missing these flags (backward compatible)
         keys = list(state_dict.keys())
         has_hi_cal_head = any("hi_cal_head.0.weight" in k for k in keys)
         has_cond_norm = any("condition_normalizer.net.0.weight" in k for k in keys)
+        has_rul_sigma_head = any(k.endswith("fc_rul_log_sigma.weight") for k in keys)
         fc_rul_key = next((k for k in keys if k.endswith("fc_rul.weight")), None)
         fc_rul_in = state_dict[fc_rul_key].shape[1] if fc_rul_key is not None else d_model
 
@@ -731,6 +732,10 @@ def load_model_from_experiment(
             # Checkpoint fc_rul expects a larger input (typically d_model+1), so
             # enable HI_cal fusion flag to match training-time architecture.
             use_hi_cal_fusion_for_rul = True
+
+        # v5u: detect optional RUL uncertainty head from checkpoint keys
+        use_rul_uncertainty_head = bool(config.get("use_rul_uncertainty_head", has_rul_sigma_head))
+        rul_uncertainty_min_sigma = float(config.get("rul_uncertainty_min_sigma", 1e-3))
 
         model = EOLFullTransformerEncoder(
             input_dim=input_dim,
@@ -767,6 +772,9 @@ def load_model_from_experiment(
             use_condition_normalizer=use_condition_normalizer,
             condition_normalizer_hidden_dim=condition_normalizer_hidden_dim,
             use_hi_cal_fusion_for_rul=use_hi_cal_fusion_for_rul,
+            # v5u: uncertainty head
+            use_rul_uncertainty_head=use_rul_uncertainty_head,
+            rul_uncertainty_min_sigma=rul_uncertainty_min_sigma,
         )
 
         # For v5 runs with a ConditionNormalizer, instantiate it before loading

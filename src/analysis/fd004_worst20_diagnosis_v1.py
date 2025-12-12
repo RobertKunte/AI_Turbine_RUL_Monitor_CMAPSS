@@ -44,10 +44,17 @@ from src.config import PhysicsFeatureConfig
 RUN_NAME = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm"
 DATASET = "FD004"
 
-RESULTS_DIR = Path("results") / DATASET.lower() / RUN_NAME
-SUMMARY_PATH = RESULTS_DIR / "summary.json"
-CHECKPOINT_PATH = RESULTS_DIR / f"eol_full_lstm_best_{RUN_NAME}.pt"
-SCALER_PATH = RESULTS_DIR / "scaler.pkl"
+def _resolve_run_paths(*, dataset: str, run_name: str) -> Tuple[Path, Path, Path, Path]:
+    """
+    Resolve standard result paths for a given encoder run.
+    Returns:
+        results_dir, summary_path, checkpoint_path, scaler_path
+    """
+    results_dir = Path("results") / dataset.lower() / run_name
+    summary_path = results_dir / "summary.json"
+    checkpoint_path = results_dir / f"eol_full_lstm_best_{run_name}.pt"
+    scaler_path = results_dir / "scaler.pkl"
+    return results_dir, summary_path, checkpoint_path, scaler_path
 
 
 # ---------------------------------------------------------------------------
@@ -749,21 +756,24 @@ def plot_residual_deltas(
 # 8. Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main(run_name: str = RUN_NAME, dataset: str = DATASET) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[fd004_worst20] Using device: {device}")
-    print(f"[fd004_worst20] Results dir: {RESULTS_DIR}")
+    results_dir, summary_path, _, _ = _resolve_run_paths(dataset=dataset, run_name=run_name)
+    print(f"[fd004_worst20] Run: {run_name}")
+    print(f"[fd004_worst20] Dataset: {dataset}")
+    print(f"[fd004_worst20] Results dir: {results_dir}")
 
-    if not RESULTS_DIR.exists():
-        raise FileNotFoundError(f"Results directory not found: {RESULTS_DIR}")
+    if not results_dir.exists():
+        raise FileNotFoundError(f"Results directory not found: {results_dir}")
 
     # 1) Load summary
-    summary = load_encoder_summary(SUMMARY_PATH)
+    summary = load_encoder_summary(summary_path)
 
     # 2) Build per-engine EOL metrics + trajectories
     eol_df, trajectories, df_test_raw = build_eol_metrics_df(
-        experiment_dir=RESULTS_DIR,
-        dataset_name=DATASET,
+        experiment_dir=results_dir,
+        dataset_name=dataset,
         device=device,
     )
 
@@ -806,13 +816,13 @@ def main() -> None:
     plot_truncation_diagnostics(
         df=eol_df,
         worst_unit_ids=worst_units,
-        save_path=RESULTS_DIR / "diagnostics_truncation.png",
+        save_path=results_dir / "diagnostics_truncation.png",
     )
     print_truncation_bucket_stats(eol_df=eol_df, worst_unit_ids=worst_units)
     plot_uncertainty_diagnostics(
         df=eol_df,
         worst_unit_ids=worst_units,
-        save_path=RESULTS_DIR / "diagnostics_uncertainty.png",
+        save_path=results_dir / "diagnostics_uncertainty.png",
     )
 
     df_corr = eol_df.copy()
@@ -835,7 +845,7 @@ def main() -> None:
     # 4) Feature pipeline for residuals + HI_phys
     df_test_fe, feature_cols = build_feature_pipeline_for_fd004(
         summary=summary,
-        dataset_name=DATASET,
+        dataset_name=dataset,
         max_rul=int(summary.get("max_rul", 125) or 125),
         past_len=30,
     )
@@ -863,13 +873,13 @@ def main() -> None:
     # 6) Trajectory sanity-check plots
     plot_rul_hi_trajectories(
         per_unit=per_unit_worst,
-        title=f"{RUN_NAME} – Worst 20 engines (RUL + HI) [test / right-censored]",
-        save_path=RESULTS_DIR / "diagnostics_worst20_rul_hi.png",
+        title=f"{run_name} – Worst 20 engines (RUL + HI) [test / right-censored]",
+        save_path=results_dir / "diagnostics_worst20_rul_hi.png",
     )
     plot_rul_hi_trajectories(
         per_unit=per_unit_best,
-        title=f"{RUN_NAME} – Best 20 engines (RUL + HI) [test / right-censored]",
-        save_path=RESULTS_DIR / "diagnostics_best20_rul_hi.png",
+        title=f"{run_name} – Best 20 engines (RUL + HI) [test / right-censored]",
+        save_path=results_dir / "diagnostics_best20_rul_hi.png",
     )
 
     # 7) Per-engine summary + basic stats (worst vs rest)
@@ -877,7 +887,7 @@ def main() -> None:
     plot_worst_vs_rest_stats(
         df_summary=df_summary,
         worst_unit_ids=worst_units,
-        save_path=RESULTS_DIR / "diagnostics_worst_vs_rest_stats.png",
+        save_path=results_dir / "diagnostics_worst_vs_rest_stats.png",
     )
 
     # 8) Residual analysis (worst vs rest)
@@ -896,7 +906,7 @@ def main() -> None:
         resid_deltas = plot_residual_deltas(
             resid_stats_worst=resid_stats_worst,
             resid_stats_rest=resid_stats_rest,
-            save_path=RESULTS_DIR / "diagnostics_worst20_residual_deltas.png",
+            save_path=results_dir / "diagnostics_worst20_residual_deltas.png",
             top_k=10,
         )
     else:
@@ -938,6 +948,24 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="FD004 worst-20 engine diagnosis for a trained encoder run."
+    )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=RUN_NAME,
+        help="Encoder experiment name (results/<dataset>/<run_name>/).",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=DATASET,
+        help="Dataset name (default: FD004).",
+    )
+    args = parser.parse_args()
+    main(run_name=args.run_name, dataset=args.dataset)
 
 

@@ -810,7 +810,7 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
                     hi_phys_batch, hi_cal2_batch, hi_damage_seq_use, SLOPE_WINDOW_SIZES
                 )
 
-                rul_seq_pred, _ = decoder(
+                out = decoder(
                     z_seq=z_seq,
                     hi_phys_seq=hi_phys_batch,
                     hi_cal1_seq=hi_cal1_batch,
@@ -818,6 +818,10 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
                     hi_damage_seq=hi_damage_seq_use,
                     slope_feats=slope_feats,
                 )
+                if bool(w_traj_nll > 0.0):
+                    rul_seq_pred, _, _ = out  # type: ignore[misc]
+                else:
+                    rul_seq_pred, _ = out  # type: ignore[misc]
 
                 y_true_eol_list.append(rul_seq_true[:, -1].cpu().numpy())
                 y_pred_eol_list.append(rul_seq_pred[:, -1].cpu().numpy())
@@ -883,7 +887,7 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
         y_test_true = extra_info["y_test_true"].to(device)
         rul_seq_true_test = build_rul_seq_from_last(y_test_true, T_test)
 
-        rul_pred_seq_test, _ = decoder(
+        out_test = decoder(
             z_seq=z_seq_test,
             hi_phys_seq=hi_phys_test,
             hi_cal1_seq=hi_cal1_test,
@@ -891,6 +895,10 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
             hi_damage_seq=hi_damage_test_use,
             slope_feats=slope_feats_test,
         )
+        if bool(w_traj_nll > 0.0):
+            rul_pred_seq_test, _, _ = out_test  # type: ignore[misc]
+        else:
+            rul_pred_seq_test, _ = out_test  # type: ignore[misc]
         y_true_eol_test = rul_seq_true_test[:, -1].cpu().numpy().astype(np.float32)
         y_pred_eol_test = rul_pred_seq_test[:, -1].cpu().numpy().astype(np.float32)
 
