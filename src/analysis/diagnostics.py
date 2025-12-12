@@ -809,7 +809,15 @@ def compute_hi_trajectory_sliding(
             else:
                 # EOL model returns (rul_pred, hi_last, hi_seq)
                 cond_t = torch.tensor([cond_id], dtype=torch.long).to(device)
-                rul_pred, hi_last, hi_seq = model(x, cond_ids=cond_t)
+                out = model(x, cond_ids=cond_t)
+                # Newer Transformer variants may append rul_sigma (v5u):
+                #   (rul_pred, hi_last, hi_seq, rul_sigma)
+                if isinstance(out, (tuple, list)) and len(out) >= 3:
+                    rul_pred, hi_last, hi_seq = out[0], out[1], out[2]
+                else:
+                    raise RuntimeError(
+                        f"Unexpected encoder output type/len in sliding HI: {type(out)}"
+                    )
                 # HI_last ist der letzte Zeitschritt im Fenster
                 hi_last_val = float(hi_seq[0, -1].item())
                 # RUL prediction for this window
