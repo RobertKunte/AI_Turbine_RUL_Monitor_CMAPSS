@@ -1470,7 +1470,18 @@ def train_eol_full_lstm(
                 f"HI_calibrator file not found at {cal_path}. "
                 "Fit it first via src.analysis.hi_calibration."
             )
-        hi_calibrator = load_hi_calibrator(cal_path)
+        try:
+            hi_calibrator = load_hi_calibrator(cal_path)
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to load HI_calibrator for HI_cal_v2 supervision. "
+                f"Path: {cal_path}\n"
+                "This usually means the file is corrupted/empty (e.g., interrupted write).\n"
+                "Fix: delete the calibrator file and refit it via:\n"
+                "  python -m src.analysis.hi_calibration --dataset FD004 --encoder_run <BASE_ENCODER_RUN>\n"
+                "Then re-run this experiment.\n"
+                f"Original error: {e}"
+            ) from e
     
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)

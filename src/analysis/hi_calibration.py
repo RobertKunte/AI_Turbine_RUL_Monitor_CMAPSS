@@ -132,7 +132,30 @@ def load_hi_calibrator(calibrator_path: str | Path) -> Any:
     if not calibrator_path.exists():
         raise FileNotFoundError(f"HI calibrator not found at {calibrator_path}")
 
-    return joblib.load(calibrator_path)
+    # Fail fast on corrupted / partially-written files (common on interrupted runs)
+    try:
+        # Also guard against empty files (joblib may raise EOFError)
+        if calibrator_path.stat().st_size == 0:
+            raise EOFError("calibrator file is empty (0 bytes)")
+        return joblib.load(calibrator_path)
+    except EOFError as e:
+        raise RuntimeError(
+            "HI calibrator file exists but is corrupted/empty (EOFError). "
+            f"Path: {calibrator_path}\n"
+            "Fix: delete the file and refit it via:\n"
+            "  python -m src.analysis.hi_calibration --dataset FD004 --encoder_run <BASE_ENCODER_RUN>\n"
+            "Then re-run your experiment.\n"
+            f"Original error: {e}"
+        ) from e
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to load HI calibrator via joblib. "
+            f"Path: {calibrator_path}\n"
+            "Fix: delete the file and refit it via:\n"
+            "  python -m src.analysis.hi_calibration --dataset FD004 --encoder_run <BASE_ENCODER_RUN>\n"
+            "Then re-run your experiment.\n"
+            f"Original error type: {type(e).__name__}, error: {e}"
+        ) from e
 
 
 def calibrate_hi_array(
