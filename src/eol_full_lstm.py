@@ -1496,6 +1496,11 @@ def train_eol_full_lstm(
 
     model = model.to(device)
 
+    # Quantile levels (config) – keep separate from model output tensors to avoid name collisions.
+    quantile_levels: Optional[list[float]] = None
+    if rul_quantiles is not None and len(rul_quantiles) > 0:
+        quantile_levels = [float(q) for q in rul_quantiles]
+
     # Debug: log all damage-head parameters (if any)
     log_damage_head_params(model)
     
@@ -1672,12 +1677,12 @@ def train_eol_full_lstm(
                         cond_seq_avg = None
                         cond_recon = None
                         rul_sigma = None
-                        rul_quantiles = None
+                        rul_quantiles_pred = None
                         if use_condition_embedding:
                             if supports_cond_recon:
                                 out = model(X_batch, cond_ids=cond_ids_batch, return_aux=True)
                                 if isinstance(out, (tuple, list)) and len(out) == 7:
-                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles = out
+                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles_pred = out
                                 elif isinstance(out, (tuple, list)) and len(out) == 6:
                                     # Older v5u contract: no quantiles
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma = out
@@ -1687,7 +1692,7 @@ def train_eol_full_lstm(
                             else:
                                 out = model(X_batch, cond_ids=cond_ids_batch)
                                 if isinstance(out, (tuple, list)) and len(out) == 5:
-                                    rul_pred, health_last, health_seq, rul_sigma, rul_quantiles = out
+                                    rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred = out
                                 elif isinstance(out, (tuple, list)) and len(out) == 4:
                                     # Older v5u contract: no quantiles
                                     rul_pred, health_last, health_seq, rul_sigma = out
@@ -1697,7 +1702,7 @@ def train_eol_full_lstm(
                             if supports_cond_recon:
                                 out = model(X_batch, return_aux=True)
                                 if isinstance(out, (tuple, list)) and len(out) == 7:
-                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles = out
+                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles_pred = out
                                 elif isinstance(out, (tuple, list)) and len(out) == 6:
                                     # Older v5u contract: no quantiles
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma = out
@@ -1707,7 +1712,7 @@ def train_eol_full_lstm(
                             else:
                                 out = model(X_batch)
                                 if isinstance(out, (tuple, list)) and len(out) == 5:
-                                    rul_pred, health_last, health_seq, rul_sigma, rul_quantiles = out
+                                    rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred = out
                                 elif isinstance(out, (tuple, list)) and len(out) == 4:
                                     # Older v5u contract: no quantiles
                                     rul_pred, health_last, health_seq, rul_sigma = out
@@ -1787,20 +1792,18 @@ def train_eol_full_lstm(
                             # NEW (v5q): Pinball (quantile) loss for RUL at last observed cycle
                             # --------------------------------------------------------------
                             if float(rul_quantile_weight) > 0.0:
-                                if rul_quantiles is None or len(rul_quantiles) == 0:
+                                if quantile_levels is None or len(quantile_levels) == 0:
                                     raise RuntimeError(
                                         "rul_quantile_weight > 0 but rul_quantiles is None/empty."
                                     )
-                                if rul_quantiles is None:
-                                    raise RuntimeError("Internal error: rul_quantiles None after check.")
-                                # The model outputs the quantile tensor as `rul_quantiles` (from the forward contract).
-                                if rul_quantiles is None or (not torch.is_tensor(rul_quantiles)):
+                                # The model outputs the quantile tensor as `rul_quantiles_pred`.
+                                if rul_quantiles_pred is None or (not torch.is_tensor(rul_quantiles_pred)):
                                     raise RuntimeError(
                                         "rul_quantile_weight > 0 but model did not return rul_quantiles."
                                     )
 
-                                q_pred = rul_quantiles  # [B, Q]
-                                q_list = [float(q) for q in (rul_quantiles or [])]
+                                q_pred = rul_quantiles_pred  # [B, Q]
+                                q_list = quantile_levels
                                 if q_pred.dim() != 2 or q_pred.size(1) != len(q_list):
                                     raise RuntimeError(
                                         f"Quantile dim mismatch: q_pred shape {tuple(q_pred.shape)} "
