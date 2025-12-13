@@ -1793,13 +1793,14 @@ def train_eol_full_lstm(
                                     )
                                 if rul_quantiles is None:
                                     raise RuntimeError("Internal error: rul_quantiles None after check.")
-                                if rul_quantiles_pred is None or (not torch.is_tensor(rul_quantiles_pred)):
+                                # The model outputs the quantile tensor as `rul_quantiles` (from the forward contract).
+                                if rul_quantiles is None or (not torch.is_tensor(rul_quantiles)):
                                     raise RuntimeError(
                                         "rul_quantile_weight > 0 but model did not return rul_quantiles."
                                     )
 
-                                q_pred = rul_quantiles_pred  # [B, Q]
-                                q_list = [float(q) for q in rul_quantiles]
+                                q_pred = rul_quantiles  # [B, Q]
+                                q_list = [float(q) for q in (rul_quantiles or [])]
                                 if q_pred.dim() != 2 or q_pred.size(1) != len(q_list):
                                     raise RuntimeError(
                                         f"Quantile dim mismatch: q_pred shape {tuple(q_pred.shape)} "
