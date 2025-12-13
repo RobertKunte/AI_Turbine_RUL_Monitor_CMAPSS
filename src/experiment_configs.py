@@ -1641,6 +1641,8 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_uncertainty_confi
     loss = cfg.setdefault("loss_params", {})
     # Additional loss term: Gaussian NLL for EOL/last-observed RUL
     loss.setdefault("rul_nll_weight", 0.5)
+    # Prevent NLL from shifting the mean predictor (mu) too optimistic/biased.
+    loss.setdefault("rul_nll_detach_mu", True)
 
     return cfg
 

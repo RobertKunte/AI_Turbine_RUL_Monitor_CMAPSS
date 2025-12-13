@@ -1326,6 +1326,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         # v5u: Gaussian NLL for RUL using predicted sigma
         rul_nll_weight=config['loss_params'].get('rul_nll_weight', 0.0),
         rul_nll_min_sigma=encoder_kwargs.get("rul_uncertainty_min_sigma", 1e-3),
+        rul_nll_detach_mu=bool(config["loss_params"].get("rul_nll_detach_mu", False)),
     )
     
     # ===================================================================

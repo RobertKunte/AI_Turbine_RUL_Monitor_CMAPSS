@@ -1382,6 +1382,9 @@ def train_eol_full_lstm(
     # NEW (v5u): optional Gaussian NLL for RUL at last observed cycle (requires predicted sigma)
     rul_nll_weight: float = 0.0,
     rul_nll_min_sigma: float = 1e-3,
+    # If True: do NOT let the NLL term move the mean predictor (mu/backbone).
+    # This keeps mu behavior closer to the pre-uncertainty baseline while still learning sigma.
+    rul_nll_detach_mu: bool = False,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Training-Loop für Full-Trajectory LSTM.
@@ -1736,7 +1739,10 @@ def train_eol_full_lstm(
                                         "Enable use_rul_uncertainty_head for this run."
                                     )
                                 sigma = torch.clamp(rul_sigma, min=float(rul_nll_min_sigma))
-                                err = (y_batch - (rul_pred.squeeze(-1) if rul_pred.dim() > 1 else rul_pred))
+                                mu = (rul_pred.squeeze(-1) if rul_pred.dim() > 1 else rul_pred)
+                                if bool(rul_nll_detach_mu):
+                                    mu = mu.detach()
+                                err = (y_batch - mu)
                                 nll = 0.5 * ((err * err) / (sigma * sigma) + 2.0 * torch.log(sigma))
                                 loss = loss + float(rul_nll_weight) * nll.mean()
                         
