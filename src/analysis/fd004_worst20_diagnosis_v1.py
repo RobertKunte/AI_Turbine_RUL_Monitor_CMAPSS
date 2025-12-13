@@ -114,11 +114,30 @@ def build_eol_metrics_df(
     cond_id_map = grp["ConditionID"].first().astype(int) if "ConditionID" in df_test.columns else None
     num_cycles_map = grp["TimeInCycles"].count().astype(int)
 
+    def _get_sigma(m: EngineEOLMetrics) -> float:
+        """
+        Robustly extract predicted sigma for RUL at last observed cycle from metric object.
+        Supports multiple historical attribute names.
+        """
+        for key in ["sigma_rul", "pred_sigma", "rul_sigma", "sigma", "pred_rul_sigma"]:
+            if hasattr(m, key):
+                val = getattr(m, key)
+                if val is None:
+                    continue
+                try:
+                    return float(val)
+                except Exception:
+                    continue
+        return float("nan")
+
     rows = []
     for m in eol_metrics:
         uid = int(m.unit_id)
         cond_id = int(cond_id_map.loc[uid]) if cond_id_map is not None and uid in cond_id_map.index else -1
         num_cycles = int(num_cycles_map.loc[uid]) if uid in num_cycles_map.index else 0
+        mu_last = float(m.pred_rul)
+        true_last = float(m.true_rul)
+        sigma_last = _get_sigma(m)
         rows.append(
             {
                 "unit_id": uid,
@@ -127,8 +146,13 @@ def build_eol_metrics_df(
                 "eol_rul_true": float(m.true_rul),
                 "eol_rul_pred": float(m.pred_rul),
                 "eol_error": float(m.error),
-                # Optional: predictive uncertainty (std dev in cycles) if available
-                "eol_sigma": float(getattr(m, "sigma", np.nan)) if getattr(m, "sigma", None) is not None else np.nan,
+                # Aliases for uncertainty-band plots (FD004 test is right-censored)
+                "true_rul_last": true_last,
+                "mu_last": mu_last,
+                "sigma_last": sigma_last,
+                "abs_error": float(abs(mu_last - true_last)),
+                # Backwards-compatible column name (older versions used eol_sigma)
+                "eol_sigma": sigma_last,
             }
         )
 
@@ -297,6 +321,8 @@ def plot_rul_hi_trajectories(
     title: str,
     save_path: Path,
     max_engines: int = 10,
+    sigma_map: Dict[int, float] | None = None,
+    k: float = 1.0,
 ) -> None:
     """Plot RUL + HI trajectories for up to max_engines units."""
     unit_ids = list(per_unit.keys())[:max_engines]
@@ -319,7 +345,27 @@ def plot_rul_hi_trajectories(
         # RUL
         ax2 = ax.twinx()
         ax2.plot(t, data["rul_true_seq"], "b-", label="RUL True", linewidth=2, alpha=0.8)
-        ax2.plot(t, data["rul_pred_seq"], "r--", label="RUL Pred", linewidth=2, alpha=0.8)
+        ax2.plot(t, data["rul_pred_seq"], "r--", label="RUL Pred (μ)", linewidth=2, alpha=0.8)
+        # Optional: show μ ± kσ as additional horizontal dashed lines (when sigma exists)
+        if sigma_map is not None and uid in sigma_map and np.isfinite(float(sigma_map[uid])):
+            sigma = float(sigma_map[uid])
+            mu = float(np.asarray(data["rul_pred_seq"], dtype=float)[-1])
+            ax2.plot(
+                t,
+                np.full_like(t, mu - k * sigma, dtype=float),
+                "r:",
+                linewidth=1.5,
+                alpha=0.8,
+                label=f"μ-{k}σ",
+            )
+            ax2.plot(
+                t,
+                np.full_like(t, mu + k * sigma, dtype=float),
+                "r:",
+                linewidth=1.5,
+                alpha=0.8,
+                label=f"μ+{k}σ",
+            )
         ax2.set_ylabel("RUL [cycles]", color="b")
         ax2.tick_params(axis="y", labelcolor="b")
 
@@ -480,16 +526,18 @@ def plot_uncertainty_diagnostics(
       - scatter(sigma_last vs error_last), highlight worst20
       - prints coverage estimates at 1σ and 2σ
     """
-    if "eol_sigma" not in df.columns:
-        print("[fd004_worst20] No eol_sigma column found; skipping uncertainty diagnostics.")
+    # Prefer sigma_last, fall back to legacy eol_sigma
+    sigma_col = "sigma_last" if "sigma_last" in df.columns else ("eol_sigma" if "eol_sigma" in df.columns else None)
+    if sigma_col is None:
+        print("[fd004_worst20] No sigma_last/eol_sigma column found; skipping uncertainty diagnostics.")
         return
 
     df = df.copy()
     df["group"] = np.where(df["unit_id"].isin(worst_unit_ids), "worst20", "rest")
     df["abs_error"] = df["eol_error"].abs()
-    df["eol_sigma"] = pd.to_numeric(df["eol_sigma"], errors="coerce")
+    df["sigma_last"] = pd.to_numeric(df[sigma_col], errors="coerce")
 
-    m = np.isfinite(df["eol_sigma"].to_numpy(dtype=float))
+    m = np.isfinite(df["sigma_last"].to_numpy(dtype=float))
     if int(m.sum()) < 5:
         print("[fd004_worst20] Not enough finite sigma values; skipping uncertainty diagnostics.")
         return
@@ -500,8 +548,8 @@ def plot_uncertainty_diagnostics(
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     ax = axes[0]
-    ax.scatter(rest["eol_sigma"], rest["abs_error"], s=18, alpha=0.4, label="rest")
-    ax.scatter(worst["eol_sigma"], worst["abs_error"], s=30, alpha=0.9, label="worst20")
+    ax.scatter(rest["sigma_last"], rest["abs_error"], s=18, alpha=0.4, label="rest")
+    ax.scatter(worst["sigma_last"], worst["abs_error"], s=30, alpha=0.9, label="worst20")
     ax.set_title("|error_last| vs sigma_last (encoder)")
     ax.set_xlabel("sigma_last (cycles)")
     ax.set_ylabel("abs_error_last (cycles)")
@@ -509,8 +557,8 @@ def plot_uncertainty_diagnostics(
     ax.legend()
 
     ax = axes[1]
-    ax.scatter(rest["eol_sigma"], rest["eol_error"], s=18, alpha=0.4, label="rest")
-    ax.scatter(worst["eol_sigma"], worst["eol_error"], s=30, alpha=0.9, label="worst20")
+    ax.scatter(rest["sigma_last"], rest["eol_error"], s=18, alpha=0.4, label="rest")
+    ax.scatter(worst["sigma_last"], worst["eol_error"], s=30, alpha=0.9, label="worst20")
     ax.axhline(0.0, linestyle="--", linewidth=1, color="k")
     ax.set_title("error_last (pred-true) vs sigma_last (encoder)")
     ax.set_xlabel("sigma_last (cycles)")
@@ -525,7 +573,7 @@ def plot_uncertainty_diagnostics(
     plt.close()
     print(f"[fd004_worst20] Saved uncertainty diagnostics plot: {save_path}")
 
-    sigma = df["eol_sigma"].to_numpy(dtype=float)
+    sigma = df["sigma_last"].to_numpy(dtype=float)
     err = df["eol_error"].to_numpy(dtype=float)
     m2 = np.isfinite(sigma) & np.isfinite(err) & (sigma > 0)
     if int(m2.sum()) > 5:
@@ -534,6 +582,138 @@ def plot_uncertainty_diagnostics(
         print("\n=== Encoder sigma coverage @ last observed cycle (test / right-censored) ===")
         print(f"coverage_1sigma = {cov1:.3f}")
         print(f"coverage_2sigma = {cov2:.3f}")
+
+
+def plot_rul_band_scatter(
+    df: pd.DataFrame,
+    worst_unit_ids: List[int],
+    save_path: Path,
+    k: float = 1.0,
+) -> None:
+    """
+    Scatter: true_rul_last (x) vs mu_last (y) with vertical error bars mu ± k*sigma.
+    Highlights worst20 vs rest and overlays y=x.
+    """
+    d = df.copy()
+    d["group"] = np.where(d["unit_id"].isin(worst_unit_ids), "worst20", "rest")
+    d["mu_last"] = pd.to_numeric(d.get("mu_last", d.get("eol_rul_pred", np.nan)), errors="coerce")
+    d["true_last"] = pd.to_numeric(d.get("true_rul_last", d.get("eol_rul_true", np.nan)), errors="coerce")
+    d["sigma_last"] = pd.to_numeric(d.get("sigma_last", np.nan), errors="coerce")
+
+    d_ok = d[np.isfinite(d["sigma_last"].to_numpy(dtype=float))].copy()
+    if d_ok.empty:
+        print("[fd004_worst20] No sigma_last available, skipping band scatter.")
+        return
+
+    rest = d_ok[d_ok["group"] == "rest"]
+    worst = d_ok[d_ok["group"] == "worst20"]
+
+    plt.figure(figsize=(9, 8))
+    plt.errorbar(
+        rest["true_last"],
+        rest["mu_last"],
+        yerr=k * rest["sigma_last"],
+        fmt="o",
+        markersize=4,
+        alpha=0.35,
+        capsize=2,
+        label="rest (μ ± kσ)",
+    )
+    plt.errorbar(
+        worst["true_last"],
+        worst["mu_last"],
+        yerr=k * worst["sigma_last"],
+        fmt="o",
+        markersize=6,
+        alpha=0.9,
+        capsize=2,
+        label="worst20 (μ ± kσ)",
+    )
+
+    x = d_ok["true_last"].to_numpy(dtype=float)
+    lo = float(np.nanmin(x))
+    hi = float(np.nanmax(x))
+    plt.plot([lo, hi], [lo, hi], "r--", linewidth=2, label="perfect (y=x)")
+
+    # Optional conservative points: μ - kσ
+    plt.scatter(
+        rest["true_last"],
+        (rest["mu_last"] - k * rest["sigma_last"]),
+        s=10,
+        alpha=0.25,
+        label="rest (μ-kσ)",
+    )
+    plt.scatter(
+        worst["true_last"],
+        (worst["mu_last"] - k * worst["sigma_last"]),
+        s=18,
+        alpha=0.6,
+        label="worst20 (μ-kσ)",
+    )
+
+    plt.xlabel("True RUL at last observed cycle")
+    plt.ylabel("Predicted RUL (μ) with uncertainty band")
+    plt.title(f"FD004 Test (right-censored): True vs Predicted RUL with ±{k}σ band")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[fd004_worst20] Saved RUL band scatter: {save_path}")
+
+
+def plot_rul_band_coverage(
+    df: pd.DataFrame,
+    save_path: Path,
+    k_list: List[float] = [1.0, 2.0],
+) -> None:
+    """
+    Coverage vs true_rul_last buckets for bands [μ-kσ, μ+kσ].
+    """
+    d = df.copy()
+    d["mu_last"] = pd.to_numeric(d.get("mu_last", d.get("eol_rul_pred", np.nan)), errors="coerce")
+    d["true_last"] = pd.to_numeric(d.get("true_rul_last", d.get("eol_rul_true", np.nan)), errors="coerce")
+    d["sigma_last"] = pd.to_numeric(d.get("sigma_last", np.nan), errors="coerce")
+
+    d = d[np.isfinite(d["sigma_last"].to_numpy(dtype=float))].copy()
+    if d.empty:
+        print("[fd004_worst20] No sigma_last available, skipping coverage plot.")
+        return
+
+    bins = [-1, 25, 50, 75, 100, 10_000]
+    labels = ["0-25", "25-50", "50-75", "75-100", "100+"]
+    d["bin"] = pd.cut(d["true_last"], bins=bins, labels=labels)
+
+    cov: Dict[float, pd.Series] = {}
+    for kk in k_list:
+        lower = d["mu_last"] - kk * d["sigma_last"]
+        upper = d["mu_last"] + kk * d["sigma_last"]
+        inside = (d["true_last"] >= lower) & (d["true_last"] <= upper)
+        cov[kk] = d.assign(inside=inside).groupby("bin")["inside"].mean()
+
+    plt.figure(figsize=(10, 5))
+    x = np.arange(len(labels))
+    width = 0.35 if len(k_list) > 1 else 0.6
+    for i, kk in enumerate(k_list):
+        vals = [float(cov[kk].get(lbl, np.nan)) for lbl in labels]
+        offset = (i - (len(k_list) - 1) / 2) * width
+        plt.bar(x + offset, vals, width=width, label=f"coverage (±{kk}σ)")
+
+    plt.xticks(x, labels)
+    plt.ylim(0.0, 1.0)
+    plt.ylabel("Fraction where true RUL is inside band")
+    plt.xlabel("True RUL at last observed cycle bucket")
+    plt.title("Uncertainty Coverage vs Horizon (FD004 test / right-censored)")
+    plt.grid(True, alpha=0.3, axis="y")
+    plt.legend()
+    plt.tight_layout()
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[fd004_worst20] Saved RUL band coverage: {save_path}")
 
 
 def print_truncation_bucket_stats(eol_df: pd.DataFrame, worst_unit_ids: List[int]) -> None:
@@ -810,6 +990,14 @@ def main(run_name: str = RUN_NAME, dataset: str = DATASET) -> None:
     best_units = best_df["unit_id"].tolist()
     all_units = eol_df["unit_id"].tolist()
 
+    # sigma map for per-engine band overlays
+    sigma_map: Dict[int, float] = dict(
+        zip(
+            eol_df["unit_id"].astype(int).tolist(),
+            pd.to_numeric(eol_df.get("sigma_last", np.nan), errors="coerce").astype(float).tolist(),
+        )
+    )
+
     # ------------------------------------------------------------------
     # Truncation / censoring diagnostics (FD004 test is right-censored)
     # ------------------------------------------------------------------
@@ -823,6 +1011,19 @@ def main(run_name: str = RUN_NAME, dataset: str = DATASET) -> None:
         df=eol_df,
         worst_unit_ids=worst_units,
         save_path=results_dir / "diagnostics_uncertainty.png",
+    )
+
+    # Uncertainty band visualizations (μ ± σ) for uncertainty runs
+    plot_rul_band_scatter(
+        df=eol_df,
+        worst_unit_ids=worst_units,
+        save_path=results_dir / "diagnostics_rul_band_scatter.png",
+        k=1.0,
+    )
+    plot_rul_band_coverage(
+        df=eol_df,
+        save_path=results_dir / "diagnostics_rul_band_coverage.png",
+        k_list=[1.0, 2.0],
     )
 
     df_corr = eol_df.copy()
@@ -873,13 +1074,17 @@ def main(run_name: str = RUN_NAME, dataset: str = DATASET) -> None:
     # 6) Trajectory sanity-check plots
     plot_rul_hi_trajectories(
         per_unit=per_unit_worst,
-        title=f"{run_name} – Worst 20 engines (RUL + HI) [test / right-censored]",
+        title=f"{run_name} – Worst 20 engines (RUL + HI ± σ) [test / right-censored]",
         save_path=results_dir / "diagnostics_worst20_rul_hi.png",
+        sigma_map=sigma_map,
+        k=1.0,
     )
     plot_rul_hi_trajectories(
         per_unit=per_unit_best,
-        title=f"{run_name} – Best 20 engines (RUL + HI) [test / right-censored]",
+        title=f"{run_name} – Best 20 engines (RUL + HI ± σ) [test / right-censored]",
         save_path=results_dir / "diagnostics_best20_rul_hi.png",
+        sigma_map=sigma_map,
+        k=1.0,
     )
 
     # 7) Per-engine summary + basic stats (worst vs rest)
