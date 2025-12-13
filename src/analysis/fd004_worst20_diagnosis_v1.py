@@ -132,12 +132,24 @@ def build_eol_metrics_df(
                     continue
         return float("nan")
 
+    def _get_quantiles(m: EngineEOLMetrics) -> Tuple[float, float, float]:
+        """
+        Extract (q10, q50, q90) from EngineEOLMetrics if present.
+        Returns (nan, nan, nan) if unavailable.
+        """
+        q10 = float(getattr(m, "q10", np.nan)) if getattr(m, "q10", None) is not None else float("nan")
+        q50 = float(getattr(m, "q50", np.nan)) if getattr(m, "q50", None) is not None else float("nan")
+        q90 = float(getattr(m, "q90", np.nan)) if getattr(m, "q90", None) is not None else float("nan")
+        return q10, q50, q90
+
     rows = []
     for m in eol_metrics:
         uid = int(m.unit_id)
         cond_id = int(cond_id_map.loc[uid]) if cond_id_map is not None and uid in cond_id_map.index else -1
         num_cycles = int(num_cycles_map.loc[uid]) if uid in num_cycles_map.index else 0
-        mu_last = float(m.pred_rul)
+        q10_last, q50_last, q90_last = _get_quantiles(m)
+        # Point estimate: prefer P50 when available, otherwise pred_rul
+        mu_last = float(q50_last) if np.isfinite(q50_last) else float(m.pred_rul)
         true_last = float(m.true_rul)
         sigma_last = _get_sigma(m)
         rows.append(
@@ -152,6 +164,9 @@ def build_eol_metrics_df(
                 "true_rul_last": true_last,
                 "mu_last": mu_last,
                 "sigma_last": sigma_last,
+                "q10_last": q10_last,
+                "q50_last": q50_last,
+                "q90_last": q90_last,
                 "abs_error": float(abs(mu_last - true_last)),
                 # Backwards-compatible column name (older versions used eol_sigma)
                 "eol_sigma": sigma_last,
@@ -889,6 +904,119 @@ def plot_safe_vs_mu_scatter_k123(
     print(f"[fd004_worst20] Saved safe-vs-mu scatter: {save_path}")
 
 
+def plot_quantile_band_scatter(
+    df: pd.DataFrame,
+    worst_unit_ids: List[int],
+    save_path: Path,
+) -> None:
+    """
+    Quantile band scatter:
+      x=true_rul_last, y=q50_last with vertical error bars spanning [q10_last, q90_last].
+    """
+    d = df.copy()
+    d["group"] = np.where(d["unit_id"].isin(worst_unit_ids), "worst20", "rest")
+    d["true_last"] = pd.to_numeric(d.get("true_rul_last", d.get("eol_rul_true", np.nan)), errors="coerce")
+    d["q10_last"] = pd.to_numeric(d.get("q10_last", np.nan), errors="coerce")
+    d["q50_last"] = pd.to_numeric(d.get("q50_last", np.nan), errors="coerce")
+    d["q90_last"] = pd.to_numeric(d.get("q90_last", np.nan), errors="coerce")
+
+    d_ok = d[np.isfinite(d["q10_last"]) & np.isfinite(d["q50_last"]) & np.isfinite(d["q90_last"])].copy()
+    if d_ok.empty:
+        print("[fd004_worst20] No q10/q50/q90 available, skipping quantile band scatter.")
+        return
+
+    rest = d_ok[d_ok["group"] == "rest"]
+    worst = d_ok[d_ok["group"] == "worst20"]
+
+    plt.figure(figsize=(9, 8))
+    # yerr for errorbar is symmetric; we use asymmetric via (lower, upper)
+    rest_yerr = np.vstack([(rest["q50_last"] - rest["q10_last"]).to_numpy(), (rest["q90_last"] - rest["q50_last"]).to_numpy()])
+    worst_yerr = np.vstack([(worst["q50_last"] - worst["q10_last"]).to_numpy(), (worst["q90_last"] - worst["q50_last"]).to_numpy()])
+
+    plt.errorbar(
+        rest["true_last"],
+        rest["q50_last"],
+        yerr=rest_yerr,
+        fmt="o",
+        markersize=4,
+        alpha=0.35,
+        capsize=2,
+        label="rest (P10–P90 band)",
+    )
+    plt.errorbar(
+        worst["true_last"],
+        worst["q50_last"],
+        yerr=worst_yerr,
+        fmt="o",
+        markersize=6,
+        alpha=0.9,
+        capsize=2,
+        label="worst20 (P10–P90 band)",
+    )
+
+    lo = float(np.nanmin(d_ok["true_last"].to_numpy(dtype=float)))
+    hi = float(np.nanmax(d_ok["true_last"].to_numpy(dtype=float)))
+    plt.plot([lo, hi], [lo, hi], "r--", linewidth=2, label="perfect (y=x)")
+
+    plt.xlabel("True RUL at last observed cycle")
+    plt.ylabel("Predicted RUL (P50) with P10–P90 band")
+    plt.title("FD004 Test (right-censored): True vs Predicted RUL with P10–P90 band")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[fd004_worst20] Saved quantile band scatter: {save_path}")
+
+
+def plot_quantile_coverage(
+    df: pd.DataFrame,
+    save_path: Path,
+) -> None:
+    """
+    Coverage per true_rul_last bucket for whether true ∈ [q10_last, q90_last].
+    Nominal target for [P10,P90] is 0.8.
+    """
+    d = df.copy()
+    d["true_last"] = pd.to_numeric(d.get("true_rul_last", d.get("eol_rul_true", np.nan)), errors="coerce")
+    d["q10_last"] = pd.to_numeric(d.get("q10_last", np.nan), errors="coerce")
+    d["q90_last"] = pd.to_numeric(d.get("q90_last", np.nan), errors="coerce")
+
+    d = d[np.isfinite(d["q10_last"]) & np.isfinite(d["q90_last"])].copy()
+    if d.empty:
+        print("[fd004_worst20] No q10/q90 available, skipping quantile coverage plot.")
+        return
+
+    bins = [-1, 25, 50, 75, 100, 10_000]
+    labels = ["0-25", "25-50", "50-75", "75-100", "100+"]
+    d["bin"] = pd.cut(d["true_last"], bins=bins, labels=labels)
+
+    inside = (d["true_last"] >= d["q10_last"]) & (d["true_last"] <= d["q90_last"])
+    cov = d.assign(inside=inside).groupby("bin")["inside"].mean()
+
+    vals = [float(cov.get(lbl, np.nan)) for lbl in labels]
+    x = np.arange(len(labels))
+
+    plt.figure(figsize=(10, 5))
+    plt.bar(x, vals, width=0.6, label="coverage (P10–P90)")
+    plt.axhline(0.8, linestyle="--", linewidth=2, color="k", alpha=0.7, label="nominal 0.8")
+    plt.xticks(x, labels)
+    plt.ylim(0.0, 1.0)
+    plt.ylabel("Fraction where true is inside band")
+    plt.xlabel("True RUL at last observed cycle bucket")
+    plt.title("Quantile Coverage vs Horizon (FD004 test / right-censored)")
+    plt.grid(True, alpha=0.3, axis="y")
+    plt.legend()
+    plt.tight_layout()
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[fd004_worst20] Saved quantile coverage: {save_path}")
+
+
 def print_truncation_bucket_stats(eol_df: pd.DataFrame, worst_unit_ids: List[int]) -> None:
     """Bucket analysis by true_rul_last (eol_rul_true) for FD004 test."""
     df = eol_df.copy()
@@ -1173,6 +1301,11 @@ def main(run_name: str = RUN_NAME, dataset: str = DATASET) -> None:
 
     max_rul = float(summary.get("max_rul", 125.0) or 125.0)
     sigma_any = bool(np.isfinite(pd.to_numeric(eol_df.get("sigma_last", np.nan), errors="coerce")).any())
+    quant_any = bool(
+        np.isfinite(pd.to_numeric(eol_df.get("q10_last", np.nan), errors="coerce")).any()
+        and np.isfinite(pd.to_numeric(eol_df.get("q50_last", np.nan), errors="coerce")).any()
+        and np.isfinite(pd.to_numeric(eol_df.get("q90_last", np.nan), errors="coerce")).any()
+    )
 
     # ------------------------------------------------------------------
     # Truncation / censoring diagnostics (FD004 test is right-censored)
@@ -1228,6 +1361,41 @@ def main(run_name: str = RUN_NAME, dataset: str = DATASET) -> None:
             print("[fd004_worst20] sigma_last present but no valid rows for k-sweep metrics.")
     else:
         print("[fd004_worst20] sigma_last not available -> skipping uncertainty band + k-sweep diagnostics.")
+
+    # Quantile diagnostics (P10/P50/P90) for quantile-head runs
+    if quant_any:
+        plot_quantile_band_scatter(
+            df=eol_df,
+            worst_unit_ids=worst_units,
+            save_path=results_dir / "diagnostics_quantile_band_scatter.png",
+        )
+        plot_quantile_coverage(
+            df=eol_df,
+            save_path=results_dir / "diagnostics_quantile_coverage.png",
+        )
+
+        d_q = eol_df.copy()
+        d_q["group"] = np.where(d_q["unit_id"].isin(worst_units), "worst20", "rest")
+        d_q["true_last"] = pd.to_numeric(d_q.get("true_rul_last", d_q.get("eol_rul_true", np.nan)), errors="coerce")
+        d_q["q10_last"] = pd.to_numeric(d_q.get("q10_last", np.nan), errors="coerce")
+        d_q["q90_last"] = pd.to_numeric(d_q.get("q90_last", np.nan), errors="coerce")
+        d_q = d_q[np.isfinite(d_q["q10_last"]) & np.isfinite(d_q["q90_last"]) & np.isfinite(d_q["true_last"])].copy()
+        if not d_q.empty:
+            inside = (d_q["true_last"] >= d_q["q10_last"]) & (d_q["true_last"] <= d_q["q90_last"])
+            cons = (d_q["q10_last"] <= d_q["true_last"])
+            for grp in ["all", "rest", "worst20"]:
+                g = d_q if grp == "all" else d_q[d_q["group"] == grp]
+                if g.empty:
+                    continue
+                cov = float(np.mean(inside.loc[g.index].to_numpy(dtype=bool)))
+                cons_rate = float(np.mean(cons.loc[g.index].to_numpy(dtype=bool)))
+                print(
+                    f"[fd004_worst20][quantiles] group={grp} "
+                    f"coverage(P10–P90)={cov:.3f} (nominal 0.8), "
+                    f"conservative_rate(P10<=true)={cons_rate:.3f} (nominal 0.9)"
+                )
+    else:
+        print("[fd004_worst20] q10/q50/q90 not available -> skipping quantile band diagnostics.")
 
     df_corr = eol_df.copy()
     df_corr["abs_error"] = df_corr["eol_error"].abs()

@@ -12,6 +12,12 @@ You are the **Planner/Architect** for this repo. Your job is to propose an imple
 - Call out **data leakage** risks (CMAPSS, per-engine transforms, calibrators).
 - For FD004 test, always treat “EOL” as **last observed cycle (right-censored)** in text/plots.
 - Propose edits only within the scope requested by the task. If code changes are requested later, keep a tight file list.
+- When adding new model heads/outputs (e.g., uncertainty/quantiles):
+  - **Define a stable output contract** (exact return type + ordering + optional fields) to avoid tuple-unpacking regressions.
+  - **Include the strict-load reconstruction gate**: `load_model_from_experiment` must infer new head flags from `state_dict` keys so `strict=True` loads succeed.
+  - **Be explicit about loss interactions** (what is primary vs auxiliary; weights; any detach flags to prevent mean shift).
+  - **Add structural constraints** when needed (e.g., quantile non-crossing penalty so \(q_{0.1} \le q_{0.5} \le q_{0.9}\)).
+  - **Update diagnostics gates**: new plots/tables must use FD004 censoring wording and must not break older runs (feature/scaler mismatch protections).
 
 ---
 
@@ -38,9 +44,14 @@ It must include:
 - **Step-by-step implementation tasks**
 - **Acceptance criteria / gates** (tests/metrics/plots; placeholders allowed but explicit)
 - **Notes on censoring/truncation** for FD004 if relevant
+  - If adding new outputs/heads: the prompt must specify
+    - the **forward output contract** (no variable tuple lengths),
+    - the **model loader inference** requirement (`state_dict` key detection),
+    - and any **structural constraints** (e.g., quantile crossing penalty).
 
 ### 5) Risks & mitigations
 - Must include: leakage, feature/scaler mismatch, censoring misinterpretation, metric pitfalls (Bias, NASA), and runtime/compute constraints.
+- If adding uncertainty/quantiles: also include the risk of **mean shift** and mitigation via loss weighting/detach strategy.
 
 ---
 

@@ -1125,6 +1125,9 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             # v5u: optional uncertainty head for RUL at last observed cycle
             use_rul_uncertainty_head=encoder_kwargs.get("use_rul_uncertainty_head", False),
             rul_uncertainty_min_sigma=encoder_kwargs.get("rul_uncertainty_min_sigma", 1e-3),
+            # v5q: optional quantile head for RUL at last observed cycle
+            use_rul_quantiles_head=encoder_kwargs.get("use_rul_quantiles_head", False),
+            rul_quantiles=tuple(encoder_kwargs.get("rul_quantiles", (0.1, 0.5, 0.9))),
         )
 
         # If we inferred Cond_* feature indices, attach them to the model so it can
@@ -1327,6 +1330,11 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         rul_nll_weight=config['loss_params'].get('rul_nll_weight', 0.0),
         rul_nll_min_sigma=encoder_kwargs.get("rul_uncertainty_min_sigma", 1e-3),
         rul_nll_detach_mu=bool(config["loss_params"].get("rul_nll_detach_mu", False)),
+        # v5q: quantile loss for RUL at last observed cycle
+        rul_quantile_weight=config["loss_params"].get("rul_quantile_weight", 0.0),
+        rul_quantiles=config["loss_params"].get("rul_quantiles", None),
+        rul_quantile_cross_weight=config["loss_params"].get("rul_quantile_cross_weight", 0.0),
+        rul_quantile_p50_mse_weight=config["loss_params"].get("rul_quantile_p50_mse_weight", 0.0),
     )
     
     # ===================================================================

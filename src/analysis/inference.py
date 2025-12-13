@@ -54,6 +54,9 @@ class EngineEOLMetrics:
     error: float  # pred - true
     nasa: float  # NASA contribution for this engine
     sigma: Optional[float] = None  # predictive uncertainty (std dev in cycles), if available
+    q10: Optional[float] = None
+    q50: Optional[float] = None
+    q90: Optional[float] = None
 
 
 @dataclass
@@ -710,12 +713,13 @@ def load_model_from_experiment(
         damage_temporal_conv_kernel_size = int(config.get("damage_temporal_conv_kernel_size", 3))
         damage_temporal_conv_num_layers = int(config.get("damage_temporal_conv_num_layers", 1))
 
-        # v4/v5: calibrated HI head + v5-specific flags (+ v5u uncertainty head)
+        # v4/v5: calibrated HI head + v5-specific flags (+ v5u uncertainty head + v5q quantiles head)
         # Prefer checkpoint structure when summary is missing these flags (backward compatible)
         keys = list(state_dict.keys())
         has_hi_cal_head = any("hi_cal_head.0.weight" in k for k in keys)
         has_cond_norm = any("condition_normalizer.net.0.weight" in k for k in keys)
         has_rul_sigma_head = any(k.endswith("fc_rul_log_sigma.weight") for k in keys)
+        has_rul_quantiles_head = any(k.endswith("fc_rul_quantiles.weight") for k in keys)
         fc_rul_key = next((k for k in keys if k.endswith("fc_rul.weight")), None)
         fc_rul_in = state_dict[fc_rul_key].shape[1] if fc_rul_key is not None else d_model
 
@@ -736,6 +740,24 @@ def load_model_from_experiment(
         # v5u: detect optional RUL uncertainty head from checkpoint keys
         use_rul_uncertainty_head = bool(config.get("use_rul_uncertainty_head", has_rul_sigma_head))
         rul_uncertainty_min_sigma = float(config.get("rul_uncertainty_min_sigma", 1e-3))
+
+        # v5q: detect optional quantiles head from checkpoint keys (strict-load gate)
+        use_rul_quantiles_head = bool(config.get("use_rul_quantiles_head", has_rul_quantiles_head))
+        rul_quantiles_cfg = config.get("rul_quantiles")
+        rul_quantiles_tuple: Tuple[float, ...]
+        if isinstance(rul_quantiles_cfg, (list, tuple)) and len(rul_quantiles_cfg) > 0:
+            rul_quantiles_tuple = tuple(float(q) for q in rul_quantiles_cfg)
+        elif has_rul_quantiles_head and "fc_rul_quantiles.weight" in state_dict:
+            q_dim = int(state_dict["fc_rul_quantiles.weight"].shape[0])
+            # Reasonable defaults when only Q is known
+            if q_dim == 3:
+                rul_quantiles_tuple = (0.1, 0.5, 0.9)
+            else:
+                # evenly spaced (avoid exact 0/1)
+                qs = np.linspace(0.05, 0.95, q_dim).tolist()
+                rul_quantiles_tuple = tuple(float(x) for x in qs)
+        else:
+            rul_quantiles_tuple = (0.1, 0.5, 0.9)
 
         model = EOLFullTransformerEncoder(
             input_dim=input_dim,
@@ -775,6 +797,9 @@ def load_model_from_experiment(
             # v5u: uncertainty head
             use_rul_uncertainty_head=use_rul_uncertainty_head,
             rul_uncertainty_min_sigma=rul_uncertainty_min_sigma,
+            # v5q: quantiles head
+            use_rul_quantiles_head=use_rul_quantiles_head,
+            rul_quantiles=rul_quantiles_tuple,
         )
 
         # For v5 runs with a ConditionNormalizer, instantiate it before loading
@@ -1402,6 +1427,7 @@ def run_inference_for_experiment(
             hi_last = None
             hi_seq = None
             rul_sigma_pred = None
+            rul_quantiles_pred = None
             
             if isinstance(outputs, dict):
                 # V3 output format
@@ -1417,10 +1443,17 @@ def run_inference_for_experiment(
                 elif len(outputs) == 4:
                     # Transformer v5u: (rul_pred, hi_last, hi_seq, rul_sigma)
                     _, hi_last, hi_seq, rul_sigma_pred = outputs
+                elif len(outputs) == 5:
+                    # Fixed contract (v5u/v5q): (rul_pred, hi_last, hi_seq, rul_sigma, rul_quantiles)
+                    _, hi_last, hi_seq, rul_sigma_pred, rul_quantiles_pred = outputs
                 elif len(outputs) == 6:
                     # Transformer with return_aux=True shape, but called without return_aux here;
                     # keep for robustness.
                     _, hi_last, hi_seq, _, _, rul_sigma_pred = outputs
+                elif len(outputs) == 7:
+                    # Fixed return_aux contract:
+                    # (rul_pred, hi_last, hi_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles)
+                    _, hi_last, hi_seq, _, _, rul_sigma_pred, rul_quantiles_pred = outputs
             
             # Post-process hi_seq if present
             if hi_seq is not None and torch.is_tensor(hi_seq):
@@ -1455,6 +1488,28 @@ def run_inference_for_experiment(
             rul_sigma_np = rul_sigma_pred.detach().cpu().numpy().flatten()
     except Exception:
         rul_sigma_np = None
+
+    q10_np: Optional[np.ndarray] = None
+    q50_np: Optional[np.ndarray] = None
+    q90_np: Optional[np.ndarray] = None
+    try:
+        if "rul_quantiles_pred" in locals() and rul_quantiles_pred is not None and torch.is_tensor(rul_quantiles_pred):
+            q_np = rul_quantiles_pred.detach().cpu().numpy()
+            if q_np.ndim == 2 and q_np.shape[0] == rul_pred.shape[0] and q_np.shape[1] >= 1:
+                # Use config quantiles if available, otherwise default mapping by positions.
+                q_list = config.get("rul_quantiles")
+                if not isinstance(q_list, (list, tuple)) or len(q_list) != q_np.shape[1]:
+                    q_list = [0.1, 0.5, 0.9][: q_np.shape[1]]
+                q_list = [float(x) for x in q_list]
+                idx50 = int(np.argmin(np.abs(np.asarray(q_list) - 0.5)))
+                # q10/q90 only if present
+                idx10 = int(np.argmin(np.abs(np.asarray(q_list) - 0.1))) if len(q_list) >= 1 else 0
+                idx90 = int(np.argmin(np.abs(np.asarray(q_list) - 0.9))) if len(q_list) >= 1 else 0
+                q10_np = q_np[:, idx10].astype(np.float32)
+                q50_np = q_np[:, idx50].astype(np.float32)
+                q90_np = q_np[:, idx90].astype(np.float32)
+    except Exception:
+        q10_np, q50_np, q90_np = None, None, None
     
     # Apply RUL capping (same as evaluate_on_test_data)
     # Get max_rul from config (default 125)
@@ -1520,6 +1575,9 @@ def run_inference_for_experiment(
             error=error,
             nasa=nasa_contribution,
             sigma=float(rul_sigma_np[i]) if rul_sigma_np is not None else None,
+            q10=float(q10_np[i]) if q10_np is not None else None,
+            q50=float(q50_np[i]) if q50_np is not None else None,
+            q90=float(q90_np[i]) if q90_np is not None else None,
         ))
         
         # Build trajectory if requested

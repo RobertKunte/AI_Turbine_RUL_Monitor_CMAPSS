@@ -1385,6 +1385,11 @@ def train_eol_full_lstm(
     # If True: do NOT let the NLL term move the mean predictor (mu/backbone).
     # This keeps mu behavior closer to the pre-uncertainty baseline while still learning sigma.
     rul_nll_detach_mu: bool = False,
+    # NEW (v5q): quantile loss for RUL at last observed cycle (pinball loss)
+    rul_quantile_weight: float = 0.0,
+    rul_quantiles: Optional[list[float]] = None,
+    rul_quantile_cross_weight: float = 0.0,
+    rul_quantile_p50_mse_weight: float = 0.0,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Training-Loop für Full-Trajectory LSTM.
@@ -1648,31 +1653,44 @@ def train_eol_full_lstm(
                         cond_seq_avg = None
                         cond_recon = None
                         rul_sigma = None
+                        rul_quantiles = None
                         if use_condition_embedding:
                             if supports_cond_recon:
                                 out = model(X_batch, cond_ids=cond_ids_batch, return_aux=True)
-                                if isinstance(out, (tuple, list)) and len(out) == 6:
+                                if isinstance(out, (tuple, list)) and len(out) == 7:
+                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles = out
+                                elif isinstance(out, (tuple, list)) and len(out) == 6:
+                                    # Older v5u contract: no quantiles
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma = out
                                 else:
                                     # Backwards-compatible (older models)
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                             else:
                                 out = model(X_batch, cond_ids=cond_ids_batch)
-                                if isinstance(out, (tuple, list)) and len(out) == 4:
+                                if isinstance(out, (tuple, list)) and len(out) == 5:
+                                    rul_pred, health_last, health_seq, rul_sigma, rul_quantiles = out
+                                elif isinstance(out, (tuple, list)) and len(out) == 4:
+                                    # Older v5u contract: no quantiles
                                     rul_pred, health_last, health_seq, rul_sigma = out
                                 else:
                                     rul_pred, health_last, health_seq = out
                         else:
                             if supports_cond_recon:
                                 out = model(X_batch, return_aux=True)
-                                if isinstance(out, (tuple, list)) and len(out) == 6:
+                                if isinstance(out, (tuple, list)) and len(out) == 7:
+                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles = out
+                                elif isinstance(out, (tuple, list)) and len(out) == 6:
+                                    # Older v5u contract: no quantiles
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma = out
                                 else:
                                     # Backwards-compatible (older models)
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                             else:
                                 out = model(X_batch)
-                                if isinstance(out, (tuple, list)) and len(out) == 4:
+                                if isinstance(out, (tuple, list)) and len(out) == 5:
+                                    rul_pred, health_last, health_seq, rul_sigma, rul_quantiles = out
+                                elif isinstance(out, (tuple, list)) and len(out) == 4:
+                                    # Older v5u contract: no quantiles
                                     rul_pred, health_last, health_seq, rul_sigma = out
                                 else:
                                     rul_pred, health_last, health_seq = out
@@ -1745,6 +1763,49 @@ def train_eol_full_lstm(
                                 err = (y_batch - mu)
                                 nll = 0.5 * ((err * err) / (sigma * sigma) + 2.0 * torch.log(sigma))
                                 loss = loss + float(rul_nll_weight) * nll.mean()
+
+                            # --------------------------------------------------------------
+                            # NEW (v5q): Pinball (quantile) loss for RUL at last observed cycle
+                            # --------------------------------------------------------------
+                            if float(rul_quantile_weight) > 0.0:
+                                if rul_quantiles is None or len(rul_quantiles) == 0:
+                                    raise RuntimeError(
+                                        "rul_quantile_weight > 0 but rul_quantiles is None/empty."
+                                    )
+                                if rul_quantiles is None:
+                                    raise RuntimeError("Internal error: rul_quantiles None after check.")
+                                if rul_quantiles_pred is None or (not torch.is_tensor(rul_quantiles_pred)):
+                                    raise RuntimeError(
+                                        "rul_quantile_weight > 0 but model did not return rul_quantiles."
+                                    )
+
+                                q_pred = rul_quantiles_pred  # [B, Q]
+                                q_list = [float(q) for q in rul_quantiles]
+                                if q_pred.dim() != 2 or q_pred.size(1) != len(q_list):
+                                    raise RuntimeError(
+                                        f"Quantile dim mismatch: q_pred shape {tuple(q_pred.shape)} "
+                                        f"but rul_quantiles has len={len(q_list)}"
+                                    )
+
+                                y = y_batch.view(-1, 1)  # [B,1]
+                                u = y - q_pred  # [B,Q]
+                                qs = torch.tensor(q_list, device=q_pred.device, dtype=q_pred.dtype).view(1, -1)
+                                pinball = torch.maximum(qs * u, (qs - 1.0) * u).mean()
+                                loss = loss + float(rul_quantile_weight) * pinball
+
+                                # Optional: non-crossing penalty (sorted quantiles should be non-decreasing)
+                                if float(rul_quantile_cross_weight) > 0.0 and q_pred.size(1) >= 2:
+                                    diffs = q_pred[:, :-1] - q_pred[:, 1:]  # should be <= 0
+                                    cross_pen = torch.relu(diffs).mean()
+                                    loss = loss + float(rul_quantile_cross_weight) * cross_pen
+
+                                # Optional: keep P50 close via MSE to stabilize (uses q closest to 0.5)
+                                if float(rul_quantile_p50_mse_weight) > 0.0:
+                                    q_arr = torch.tensor(q_list, device=q_pred.device, dtype=q_pred.dtype)
+                                    idx50 = int(torch.argmin(torch.abs(q_arr - 0.5)).item())
+                                    p50 = q_pred[:, idx50]
+                                    p50_mse = F.mse_loss(p50.view(-1), y_batch.view(-1))
+                                    loss = loss + float(rul_quantile_p50_mse_weight) * p50_mse
                         
                         # Late monotonicity loss (RUL <= beta)
                         if USE_HI_MONOTONICITY:
@@ -2491,9 +2552,10 @@ def train_eol_full_lstm(
                 val_targets.append(y_batch.cpu())
 
         val_loss = float(np.mean(val_losses))
-        val_targets = torch.cat(val_targets)
-        val_preds = torch.cat(val_preds)
-        val_rmse = torch.sqrt(torch.mean((val_preds - val_targets) ** 2)).item()
+        # Ensure consistent shapes to avoid accidental broadcasting (e.g. [N,1] vs [N])
+        val_targets_t = torch.cat(val_targets).view(-1)
+        val_preds_t = torch.cat(val_preds).view(-1)
+        val_rmse = torch.sqrt(torch.mean((val_preds_t - val_targets_t) ** 2)).item()
         
         # Health-specific metrics
         if use_health_head:

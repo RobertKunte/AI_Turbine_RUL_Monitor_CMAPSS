@@ -272,6 +272,9 @@ class EOLFullTransformerEncoder(nn.Module):
         # NEW (v5u): optional RUL uncertainty head (predict sigma at EOL)
         use_rul_uncertainty_head: bool = False,
         rul_uncertainty_min_sigma: float = 1e-3,
+        # NEW (v5q): optional quantile head for RUL at last observed cycle
+        use_rul_quantiles_head: bool = False,
+        rul_quantiles: Tuple[float, ...] = (0.1, 0.5, 0.9),
     ) -> None:
         super().__init__()
 
@@ -303,6 +306,10 @@ class EOLFullTransformerEncoder(nn.Module):
         # v5u: uncertainty head flags
         self.use_rul_uncertainty_head: bool = bool(use_rul_uncertainty_head)
         self.rul_uncertainty_min_sigma: float = float(rul_uncertainty_min_sigma)
+
+        # v5q: quantile head flags
+        self.use_rul_quantiles_head: bool = bool(use_rul_quantiles_head)
+        self.rul_quantiles: Tuple[float, ...] = tuple(float(q) for q in rul_quantiles)
 
         # ------------------------------------------------------------------
         # Continuous condition encoder configuration
@@ -395,6 +402,13 @@ class EOLFullTransformerEncoder(nn.Module):
             self.fc_rul_log_sigma = nn.Linear(rul_in_dim, 1)
         else:
             self.fc_rul_log_sigma = None
+        # v5q: predict quantiles from same RUL input representation (optional)
+        self.fc_rul_quantiles: Optional[nn.Linear]
+        if self.use_rul_quantiles_head:
+            q_dim = max(1, len(self.rul_quantiles))
+            self.fc_rul_quantiles = nn.Linear(rul_in_dim, q_dim)
+        else:
+            self.fc_rul_quantiles = None
         self.fc_health = nn.Linear(d_model, 1)
 
         # Damage-basierte HI-Variante (identische API wie EOLFullLSTMWithHealth)
@@ -559,10 +573,17 @@ class EOLFullTransformerEncoder(nn.Module):
         cond_ids: Optional[torch.Tensor] = None,
         cond_seq: Optional[torch.Tensor] = None,
         return_aux: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]] | Tuple[
+    ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ] | Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
@@ -576,18 +597,15 @@ class EOLFullTransformerEncoder(nn.Module):
                 use_condition_embedding=True
 
         Returns:
-            If return_aux is False (default, V1 behaviour):
-                rul_pred:    [B]       – RUL-Vorhersagen (Zyklen)
-                health_last: [B]       – HI am letzten Zeitschritt
-                health_seq:  [B, T, 1] – HI über die gesamte Sequenz
-                rul_sigma:   [B] or None – optional predictive uncertainty (std dev in cycles)
+            Output contract (fixed length):
+              - If return_aux is False:
+                  (rul_pred, health_last, health_seq, rul_sigma, rul_quantiles)
+              - If return_aux is True:
+                  (rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles)
 
-            If return_aux is True (V2, with condition reconstruction):
-                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma
-                where:
-                    cond_seq_avg: [B, cond_in_dim] or None
-                    cond_recon:   [B, cond_in_dim] or None
-                    rul_sigma:    [B] or None
+            Notes:
+              - rul_sigma is optional (v5u); None if uncertainty head disabled.
+              - rul_quantiles is optional (v5q); [B, Q] if enabled, else None.
         """
         B, T, feat_dim = x.shape
         if feat_dim != self.input_dim:
@@ -678,10 +696,12 @@ class EOLFullTransformerEncoder(nn.Module):
         # 5b. RUL-Head (wahlweise klassisch oder ImprovedRULHead)
         # ------------------------------------------------------------------
         sigma_input: Optional[torch.Tensor] = None
+        quantile_input: Optional[torch.Tensor] = None
         if self.rul_head is not None and self.rul_head_type == "improved":
             hi_latent = health_last.unsqueeze(-1) if self.rul_head.use_hi_fusion else None
             rul_pred = self.rul_head(shared, hi_latent=hi_latent)
             sigma_input = shared
+            quantile_input = shared
         else:
             # v5: optionally fuse HI_cal_v2 at EOL into the RUL head
             if (
@@ -701,6 +721,7 @@ class EOLFullTransformerEncoder(nn.Module):
             rul_logit = self.fc_rul(rul_input)  # [B, 1]
             rul_pred = rul_logit.squeeze(-1)  # [B]
             sigma_input = rul_input
+            quantile_input = rul_input
 
         # ------------------------------------------------------------------
         # 5c. Optional: condition reconstruction head (auxiliary output)
@@ -727,10 +748,31 @@ class EOLFullTransformerEncoder(nn.Module):
             log_sigma = self.fc_rul_log_sigma(sigma_input).squeeze(-1)  # [B]
             rul_sigma = F.softplus(log_sigma) + float(self.rul_uncertainty_min_sigma)
 
+        # v5q: optional quantile output
+        rul_quantiles_pred: Optional[torch.Tensor] = None
+        if self.use_rul_quantiles_head and self.fc_rul_quantiles is not None:
+            if quantile_input is None:
+                quantile_input = shared
+            q_raw = self.fc_rul_quantiles(quantile_input)  # [B, Q]
+            # Clamp to a plausible RUL range for stability (still in cycles)
+            q_raw = torch.clamp(q_raw, min=0.0, max=float(self.max_rul))
+            rul_quantiles_pred = q_raw
+            # Use the quantile closest to 0.5 as point prediction (P50)
+            qs = torch.tensor(self.rul_quantiles, device=q_raw.device, dtype=q_raw.dtype)
+            idx50 = int(torch.argmin(torch.abs(qs - 0.5)).item())
+            rul_pred = q_raw[:, idx50]
+
         if return_aux:
-            # Append sigma as last element to avoid shifting existing indices.
-            return rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma
-        return rul_pred, health_last, health_seq, rul_sigma
+            return (
+                rul_pred,
+                health_last,
+                health_seq,
+                cond_seq_avg,
+                cond_recon,
+                rul_sigma,
+                rul_quantiles_pred,
+            )
+        return rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred
 
     # ------------------------------------------------------------------
     # Encoder-side helper for world models

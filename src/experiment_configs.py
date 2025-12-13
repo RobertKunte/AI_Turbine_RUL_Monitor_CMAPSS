@@ -1647,6 +1647,35 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_uncertainty_confi
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_config() -> ExperimentConfig:
+    """
+    FD004 ms+DT Transformer-Encoder v5 (cond_norm) with RUL quantile head:
+      - Predicts RUL quantiles at last observed cycle (default P10/P50/P90)
+      - Uses P50 as point prediction
+      - Trains with pinball loss + non-crossing penalty
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_config()
+
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles"
+
+    enc = cfg.setdefault("encoder_kwargs", {})
+    enc["use_rul_quantiles_head"] = True
+    enc["rul_quantiles"] = [0.1, 0.5, 0.9]
+    # Ensure sigma head/NLL are off for this run
+    enc.setdefault("use_rul_uncertainty_head", False)
+
+    loss = cfg.setdefault("loss_params", {})
+    loss["rul_nll_weight"] = 0.0
+    loss["rul_nll_detach_mu"] = False
+    loss["rul_quantiles"] = [0.1, 0.5, 0.9]
+    loss["rul_quantile_weight"] = 0.5
+    loss["rul_quantile_cross_weight"] = 0.1
+    # Optional stabilizer (start at 0.0; increase if P50 drifts)
+    loss.setdefault("rul_quantile_p50_mse_weight", 0.0)
+
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
     """
     Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
@@ -3162,6 +3191,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_uncertainty":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_uncertainty_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3e":
