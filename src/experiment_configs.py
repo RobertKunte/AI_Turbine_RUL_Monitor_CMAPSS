@@ -1663,6 +1663,10 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_config(
     enc["rul_quantiles"] = [0.1, 0.5, 0.9]
     # Ensure sigma head/NLL are off for this run
     enc.setdefault("use_rul_uncertainty_head", False)
+    # Quantile head run should not depend on HI_cal calibrator by default.
+    # (HI_cal supervision requires a valid hi_calibrator_*.pkl which may be missing/corrupted in Colab.)
+    enc["use_hi_cal_fusion_for_rul"] = False
+    enc["use_hi_cal_head"] = False
 
     loss = cfg.setdefault("loss_params", {})
     loss["rul_nll_weight"] = 0.0
@@ -1672,6 +1676,10 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_config(
     loss["rul_quantile_cross_weight"] = 0.1
     # Optional stabilizer (start at 0.0; increase if P50 drifts)
     loss.setdefault("rul_quantile_p50_mse_weight", 0.0)
+    # Disable HI_cal supervision losses to avoid loading calibrator at training start.
+    loss["w_hi_cal"] = 0.0
+    loss["w_mono_hi_cal"] = 0.0
+    loss["w_slope_hi_cal"] = 0.0
 
     return cfg
 
