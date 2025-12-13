@@ -43,6 +43,8 @@ from src.config import PhysicsFeatureConfig
 
 RUN_NAME = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm"
 DATASET = "FD004"
+# k-sweep for uncertainty bands and conservative estimate
+K_LIST: List[float] = [1.0, 2.0, 3.0]
 
 def _resolve_run_paths(*, dataset: str, run_name: str) -> Tuple[Path, Path, Path, Path]:
     """
@@ -716,6 +718,177 @@ def plot_rul_band_coverage(
     print(f"[fd004_worst20] Saved RUL band coverage: {save_path}")
 
 
+def compute_k_sweep_metrics(
+    df: pd.DataFrame,
+    worst_unit_ids: List[int],
+    k_list: List[float],
+    max_rul: float | None = None,
+) -> pd.DataFrame:
+    """
+    Compute k-sweep metrics for:
+      - μ_last (point estimate)
+      - RUL_safe(k) = μ_last - k * σ_last
+
+    Metrics are computed for groups: worst20, rest, all.
+    FD004 test is right-censored: "last observed cycle" metrics only.
+    """
+    d = df.copy()
+    d["group"] = np.where(d["unit_id"].isin(worst_unit_ids), "worst20", "rest")
+    d["mu_last"] = pd.to_numeric(d.get("mu_last", d.get("eol_rul_pred", np.nan)), errors="coerce")
+    d["true_last"] = pd.to_numeric(d.get("true_rul_last", d.get("eol_rul_true", np.nan)), errors="coerce")
+    d["sigma_last"] = pd.to_numeric(d.get("sigma_last", np.nan), errors="coerce")
+
+    d = d[np.isfinite(d["sigma_last"].to_numpy(dtype=float))].copy()
+    if d.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, object]] = []
+    for grp in ["worst20", "rest", "all"]:
+        dg = d if grp == "all" else d[d["group"] == grp]
+        if dg.empty:
+            continue
+
+        mu = dg["mu_last"].to_numpy(dtype=float)
+        tru = dg["true_last"].to_numpy(dtype=float)
+        sig = dg["sigma_last"].to_numpy(dtype=float)
+
+        err_mu = mu - tru
+        mae_mu = float(np.mean(np.abs(err_mu)))
+        bias_mu = float(np.mean(err_mu))
+
+        for k in k_list:
+            safe = mu - float(k) * sig
+            # Keep safe in a plausible RUL range for evaluation (avoids negative RUL artifacts)
+            safe = np.maximum(safe, 0.0)
+            if max_rul is not None and np.isfinite(max_rul):
+                safe = np.minimum(safe, float(max_rul))
+
+            err_safe = safe - tru
+            mae_safe = float(np.mean(np.abs(err_safe)))
+            bias_safe = float(np.mean(err_safe))
+
+            conservative_rate = float(np.mean(safe <= tru))
+
+            lower = mu - float(k) * sig
+            upper = mu + float(k) * sig
+            coverage = float(np.mean((tru >= lower) & (tru <= upper)))
+
+            rows.append(
+                {
+                    "group": grp,
+                    "k": float(k),
+                    "coverage": coverage,
+                    "conservative_rate": conservative_rate,
+                    "mae_mu": mae_mu,
+                    "bias_mu": bias_mu,
+                    "mae_safe": mae_safe,
+                    "bias_safe": bias_safe,
+                    "n": int(len(dg)),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def plot_k_sweep_summary(df_k: pd.DataFrame, save_path: Path) -> None:
+    """Plot coverage and conservative_rate vs k for groups all/rest/worst20."""
+    if df_k.empty:
+        print("[fd004_worst20] No k-sweep metrics available.")
+        return
+
+    plt.figure(figsize=(11, 5))
+
+    # left: coverage
+    plt.subplot(1, 2, 1)
+    for grp in ["all", "rest", "worst20"]:
+        g = df_k[df_k["group"] == grp].sort_values("k")
+        if g.empty:
+            continue
+        plt.plot(g["k"], g["coverage"], marker="o", label=grp)
+    plt.ylim(0.0, 1.0)
+    plt.xlabel("k")
+    plt.ylabel("Coverage: true ∈ [μ−kσ, μ+kσ]")
+    plt.title("Coverage vs k (FD004 test / right-censored)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+
+    # right: conservative rate
+    plt.subplot(1, 2, 2)
+    for grp in ["all", "rest", "worst20"]:
+        g = df_k[df_k["group"] == grp].sort_values("k")
+        if g.empty:
+            continue
+        plt.plot(g["k"], g["conservative_rate"], marker="o", label=grp)
+    plt.ylim(0.0, 1.0)
+    plt.xlabel("k")
+    plt.ylabel("Conservative rate: (μ−kσ) ≤ true")
+    plt.title("Conservatism vs k (FD004 test / right-censored)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[fd004_worst20] Saved k-sweep summary: {save_path}")
+
+
+def plot_safe_vs_mu_scatter_k123(
+    df: pd.DataFrame,
+    worst_unit_ids: List[int],
+    save_path: Path,
+    k_list: List[float],
+    max_rul: float | None = None,
+) -> None:
+    """
+    3-panel scatter (k=1/2/3): x=true_last, y=μ and y=μ−kσ (safe), worst20 highlighted.
+    """
+    d = df.copy()
+    d["group"] = np.where(d["unit_id"].isin(worst_unit_ids), "worst20", "rest")
+    d["mu_last"] = pd.to_numeric(d.get("mu_last", d.get("eol_rul_pred", np.nan)), errors="coerce")
+    d["true_last"] = pd.to_numeric(d.get("true_rul_last", d.get("eol_rul_true", np.nan)), errors="coerce")
+    d["sigma_last"] = pd.to_numeric(d.get("sigma_last", np.nan), errors="coerce")
+    d = d[np.isfinite(d["sigma_last"].to_numpy(dtype=float))].copy()
+    if d.empty:
+        print("[fd004_worst20] No sigma_last available, skipping safe scatter.")
+        return
+
+    fig, axes = plt.subplots(1, len(k_list), figsize=(6 * len(k_list), 5))
+    if len(k_list) == 1:
+        axes = [axes]
+
+    lo = float(np.nanmin(d["true_last"].to_numpy(dtype=float)))
+    hi = float(np.nanmax(d["true_last"].to_numpy(dtype=float)))
+
+    for ax, k in zip(axes, k_list):
+        safe = d["mu_last"] - float(k) * d["sigma_last"]
+        safe = np.maximum(safe.to_numpy(dtype=float), 0.0)
+        if max_rul is not None and np.isfinite(max_rul):
+            safe = np.minimum(safe, float(max_rul))
+
+        rest = d[d["group"] == "rest"]
+        worst = d[d["group"] == "worst20"]
+
+        ax.scatter(rest["true_last"], rest["mu_last"], s=14, alpha=0.25, label="rest μ")
+        ax.scatter(rest["true_last"], safe[rest.index], s=14, alpha=0.25, label=f"rest μ-{k}σ")
+
+        ax.scatter(worst["true_last"], worst["mu_last"], s=35, alpha=0.9, label="worst20 μ")
+        ax.scatter(worst["true_last"], safe[worst.index], s=35, alpha=0.9, label=f"worst20 μ-{k}σ")
+
+        ax.plot([lo, hi], [lo, hi], "r--", linewidth=2, label="y=x")
+        ax.set_xlabel("True RUL at last observed cycle")
+        ax.set_ylabel("Predicted RUL")
+        ax.set_title(f"μ vs μ-{k}σ (safe)\n(FD004 test / right-censored)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"[fd004_worst20] Saved safe-vs-mu scatter: {save_path}")
+
+
 def print_truncation_bucket_stats(eol_df: pd.DataFrame, worst_unit_ids: List[int]) -> None:
     """Bucket analysis by true_rul_last (eol_rul_true) for FD004 test."""
     df = eol_df.copy()
@@ -998,6 +1171,9 @@ def main(run_name: str = RUN_NAME, dataset: str = DATASET) -> None:
         )
     )
 
+    max_rul = float(summary.get("max_rul", 125.0) or 125.0)
+    sigma_any = bool(np.isfinite(pd.to_numeric(eol_df.get("sigma_last", np.nan), errors="coerce")).any())
+
     # ------------------------------------------------------------------
     # Truncation / censoring diagnostics (FD004 test is right-censored)
     # ------------------------------------------------------------------
@@ -1014,17 +1190,44 @@ def main(run_name: str = RUN_NAME, dataset: str = DATASET) -> None:
     )
 
     # Uncertainty band visualizations (μ ± σ) for uncertainty runs
-    plot_rul_band_scatter(
-        df=eol_df,
-        worst_unit_ids=worst_units,
-        save_path=results_dir / "diagnostics_rul_band_scatter.png",
-        k=1.0,
-    )
-    plot_rul_band_coverage(
-        df=eol_df,
-        save_path=results_dir / "diagnostics_rul_band_coverage.png",
-        k_list=[1.0, 2.0],
-    )
+    if sigma_any:
+        plot_rul_band_scatter(
+            df=eol_df,
+            worst_unit_ids=worst_units,
+            save_path=results_dir / "diagnostics_rul_band_scatter.png",
+            k=1.0,
+        )
+        plot_rul_band_coverage(
+            df=eol_df,
+            save_path=results_dir / "diagnostics_rul_band_coverage.png",
+            k_list=[1.0, 2.0],
+        )
+
+        # k-sweep: conservative RUL_safe(k) = μ - kσ for k in {1,2,3}
+        df_k = compute_k_sweep_metrics(
+            df=eol_df,
+            worst_unit_ids=worst_units,
+            k_list=K_LIST,
+            max_rul=max_rul,
+        )
+        if not df_k.empty:
+            print("\n=== k-sweep metrics (overall/rest/worst20) ===")
+            print(df_k.sort_values(["group", "k"]).to_string(index=False))
+            plot_k_sweep_summary(
+                df_k=df_k,
+                save_path=results_dir / "diagnostics_k_sweep_summary.png",
+            )
+            plot_safe_vs_mu_scatter_k123(
+                df=eol_df,
+                worst_unit_ids=worst_units,
+                save_path=results_dir / "diagnostics_safe_vs_mu_scatter_k123.png",
+                k_list=K_LIST,
+                max_rul=max_rul,
+            )
+        else:
+            print("[fd004_worst20] sigma_last present but no valid rows for k-sweep metrics.")
+    else:
+        print("[fd004_worst20] sigma_last not available -> skipping uncertainty band + k-sweep diagnostics.")
 
     df_corr = eol_df.copy()
     df_corr["abs_error"] = df_corr["eol_error"].abs()
