@@ -1453,9 +1453,17 @@ def train_eol_full_lstm(
     if damage_phase2_damage_weight is None:
         damage_phase2_damage_weight = damage_hi_weight
 
-    # Optional HI_cal_v2 calibrator (v4)
+    # Optional HI_cal_v2 calibrator (v4/v5).
+    # Load ONLY if HI_cal supervision is actually enabled (model has HI_cal head)
+    # and any HI_cal loss weight is > 0. This avoids hard failures for runs that
+    # do not use the calibrator (e.g. quantile-only runs) even if config is mis-set.
     hi_calibrator = None
-    if hi_cal_weight > 0.0 or hi_cal_mono_weight > 0.0 or hi_cal_slope_weight > 0.0:
+    use_hi_cal_supervision = (
+        isinstance(model, EOLFullTransformerEncoder)
+        and bool(getattr(model, "use_hi_cal_head", False))
+        and getattr(model, "hi_cal_head", None) is not None
+    )
+    if use_hi_cal_supervision and (hi_cal_weight > 0.0 or hi_cal_mono_weight > 0.0 or hi_cal_slope_weight > 0.0):
         if hi_calibrator_path is None:
             raise ValueError(
                 "HI_cal-related weights > 0 but hi_calibrator_path is None. "
