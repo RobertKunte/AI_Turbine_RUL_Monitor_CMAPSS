@@ -2099,11 +2099,15 @@ def train_eol_full_lstm(
                     )
                     cond_seq_avg = None
                     cond_recon = None
-                    # Robust unpacking: newer Transformer v5u may append rul_sigma.
+                    # Robust unpacking: newer Transformer variants may append rul_sigma and/or rul_quantiles.
                     if use_condition_embedding:
                         if supports_cond_recon:
                             out = model(X_batch, cond_ids=cond_ids_batch, return_aux=True)
-                            if isinstance(out, (tuple, list)) and len(out) == 6:
+                            if isinstance(out, (tuple, list)) and len(out) == 7:
+                                # Fixed return_aux contract: (..., rul_sigma, rul_quantiles)
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 6:
+                                # Older v5u contract: (..., rul_sigma)
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _ = out
                             else:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
@@ -2112,7 +2116,9 @@ def train_eol_full_lstm(
                     else:
                         if supports_cond_recon:
                             out = model(X_batch, return_aux=True)
-                            if isinstance(out, (tuple, list)) and len(out) == 6:
+                            if isinstance(out, (tuple, list)) and len(out) == 7:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 6:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _ = out
                             else:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
