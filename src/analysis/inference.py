@@ -1727,6 +1727,7 @@ def run_inference_for_experiment(
     # Build EOL metrics per engine
     # EOL metrics and NASA are computed on per-engine, last-cycle values
     # using the same RUL capping as evaluate_on_test_data
+    hi_cal_warned = False
     for i, unit_id in enumerate(unit_ids_split.numpy()):
         unit_id = int(unit_id)
         true_rul_raw = true_rul_dict.get(unit_id, 0.0)
@@ -1803,25 +1804,40 @@ def run_inference_for_experiment(
                 hi_traj = np.full(len(cycles), 0.5)
 
             # HI_cal_v2 trajectory (if available)
-            hi_cal_traj: Optional[np.ndarray]
+            hi_cal_traj: Optional[np.ndarray] = None
             if hi_cal_seq is not None:
-                hi_cal_window = hi_cal_seq[i].cpu().numpy() if torch.is_tensor(hi_cal_seq) else hi_cal_seq[i]
-                if len(cycles) >= past_len:
-                    hi_cal_traj = np.full(len(cycles), np.nan)
-                    target_len = past_len
-                    source_len = len(hi_cal_window)
-                    copy_len = min(target_len, source_len)
-                    if copy_len > 0:
-                        hi_cal_traj[-copy_len:] = hi_cal_window[:copy_len]
-                    for j in range(len(cycles) - past_len - 1, -1, -1):
-                        hi_cal_traj[j] = hi_cal_traj[j + 1] if not np.isnan(hi_cal_traj[j + 1]) else 1.0
-                else:
-                    hi_cal_traj = np.full(len(cycles), np.nan)
-                    hi_cal_traj[-len(hi_cal_window):] = hi_cal_window[-len(cycles):]
-                    for j in range(len(cycles) - len(hi_cal_window) - 1, -1, -1):
-                        hi_cal_traj[j] = hi_cal_traj[j + 1] if not np.isnan(hi_cal_traj[j + 1]) else 1.0
-            else:
-                hi_cal_traj = None
+                try:
+                    if torch.is_tensor(hi_cal_seq):
+                        if hi_cal_seq.dim() != 2:
+                            raise RuntimeError(f"hi_cal_seq expected [B,T] but got shape {tuple(hi_cal_seq.shape)}")
+                        if i >= int(hi_cal_seq.shape[0]):
+                            raise IndexError(f"hi_cal_seq has B={int(hi_cal_seq.shape[0])}, but i={i}")
+                        hi_cal_window = hi_cal_seq[i].detach().cpu().numpy()
+                    else:
+                        if i >= len(hi_cal_seq):
+                            raise IndexError(f"hi_cal_seq has len={len(hi_cal_seq)}, but i={i}")
+                        hi_cal_window = np.asarray(hi_cal_seq[i])
+
+                    hi_cal_window = np.asarray(hi_cal_window, dtype=np.float32).reshape(-1)
+                    if len(cycles) >= past_len:
+                        hi_cal_traj = np.full(len(cycles), np.nan)
+                        copy_len = min(int(past_len), int(len(hi_cal_window)))
+                        if copy_len > 0:
+                            hi_cal_traj[-copy_len:] = hi_cal_window[:copy_len]
+                        for j in range(len(cycles) - past_len - 1, -1, -1):
+                            hi_cal_traj[j] = hi_cal_traj[j + 1] if not np.isnan(hi_cal_traj[j + 1]) else 1.0
+                    else:
+                        hi_cal_traj = np.full(len(cycles), np.nan)
+                        copy_len = min(int(len(cycles)), int(len(hi_cal_window)))
+                        if copy_len > 0:
+                            hi_cal_traj[-copy_len:] = hi_cal_window[-copy_len:]
+                        for j in range(len(cycles) - len(hi_cal_window) - 1, -1, -1):
+                            hi_cal_traj[j] = hi_cal_traj[j + 1] if not np.isnan(hi_cal_traj[j + 1]) else 1.0
+                except Exception as e:
+                    hi_cal_traj = None
+                    if not hi_cal_warned:
+                        print(f"[WARNING] Failed to build hi_cal_traj (disabling HI_cal in trajectories): {e}")
+                        hi_cal_warned = True
             
             # True RUL trajectory (decreasing from max_rul to 0)
             # For test data, we know the true RUL at EOL
