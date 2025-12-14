@@ -1768,6 +1768,47 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_censoring_aware_c
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_censoring_config() -> ExperimentConfig:
+    """
+    FD004 v5 (cond_norm) with multiview censoring samples:
+      - keeps full regular sliding-window training intact
+      - adds auxiliary censored-view samples (K cutpoints per engine, M windows per cut)
+      - mixes regular/aux streams via aux_sample_ratio
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_censoring"
+
+    train = cfg.setdefault("training_params", {})
+    train["use_multiview_censoring"] = True
+    train.setdefault("num_truncations_per_engine", 5)      # K
+    train.setdefault("num_windows_per_truncation", 8)      # M
+    train.setdefault("trunc_ratio_min", 0.4)
+    train.setdefault("trunc_ratio_max", 1.0)
+    train.setdefault("trunc_p_full", 0.25)
+    train.setdefault("aux_sample_ratio", 0.3)
+    train.setdefault("run_seed", train.get("random_seed", 42))
+
+    # Keep two-phase damage warmup as in v3d/v5 base
+    train.setdefault("damage_two_phase", True)
+    train.setdefault("damage_warmup_epochs", 10)
+
+    # Enable bucket head (optional) and keep ranking loss enabled but applied only to aux samples
+    enc = cfg.setdefault("encoder_kwargs", {})
+    enc.setdefault("use_bucket_head", True)
+    enc.setdefault("rul_bucket_edges", [25.0, 50.0, 75.0, 100.0, 125.0])
+
+    loss = cfg.setdefault("loss_params", {})
+    loss.setdefault("use_ranking_loss", True)
+    loss.setdefault("lambda_rank", 0.1)
+    loss.setdefault("rank_margin", 1.0)
+    loss.setdefault("use_bucket_head", True)
+    loss.setdefault("lambda_bucket", 0.1)
+    loss.setdefault("rul_bucket_edges", [25.0, 50.0, 75.0, 100.0, 125.0])
+    loss.setdefault("damage_hi_weight", 5.0)
+
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
     """
     Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
@@ -3291,6 +3332,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_hi_cal_tuned_p50mse_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_censoring_aware":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_censoring_aware_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_censoring":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_censoring_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3e":

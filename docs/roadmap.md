@@ -68,6 +68,19 @@ This file is the living backlog. Each item includes **Goal**, **Artifacts**, **A
   - Diagnostics plot generated and uses FD004 wording (“last observed cycle (right-censored)”).
 - **Owner role**: **Planner** (ADR + plan), **Implementer** (dataset + loss + head), **Reviewer** (leakage + censoring realism), **Experimenter** (runs + archive)
 
+### 6) Multiview censoring-aware training (aux stream + mixing ratio) — **In Progress**
+- **Goal**: Keep full sliding-window training intact, but add an auxiliary stream of “censored views” (one engine, many observation horizons) mixed into training with a bounded ratio.
+- **Artifacts**:
+  - `docs/decisions/ADR-0006-multiview-censoring-samples.md`
+  - Plots:
+    - `results/fd004/<run>/cut_ratio_hist_train.png`
+    - `results/fd004/<run>/true_vs_pred_by_cut_ratio.png`
+- **Acceptance criteria**:
+  - Baseline behavior unchanged when `use_multiview_censoring=False`.
+  - Mixed sampling works under `DataLoader(num_workers>0)` (deterministic hashing; no worker RNG issues).
+  - Regular vs aux sample fractions printed per epoch and match `aux_sample_ratio` approximately.
+- **Owner role**: **Planner**, **Implementer**, **Reviewer**, **Experimenter**
+
 ---
 
 ## Next (2–6 weeks)

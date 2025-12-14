@@ -893,6 +893,12 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         trunc_p_full=float(config["training_params"].get("trunc_p_full", 0.25)),
         trunc_r_min=float(config["training_params"].get("trunc_r_min", 0.4)),
         trunc_r_max=float(config["training_params"].get("trunc_r_max", 1.0)),
+        use_multiview_censoring=bool(config["training_params"].get("use_multiview_censoring", False)),
+        num_windows_per_truncation=int(config["training_params"].get("num_windows_per_truncation", 8)),
+        trunc_ratio_min=float(config["training_params"].get("trunc_ratio_min", 0.4)),
+        trunc_ratio_max=float(config["training_params"].get("trunc_ratio_max", 1.0)),
+        aux_sample_ratio=float(config["training_params"].get("aux_sample_ratio", 0.3)),
+        run_seed=int(config["training_params"].get("run_seed", config["training_params"].get("random_seed", 42))),
     )
     
     # ===================================================================

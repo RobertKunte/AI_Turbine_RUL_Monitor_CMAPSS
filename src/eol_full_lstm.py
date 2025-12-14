@@ -363,6 +363,176 @@ class CensoringAwareTruncationDataset:
         return tuple(items)
 
 
+class MultiviewCensoringMixedDataset:
+    """
+    Combined dataset:
+      - Regular samples: original sliding-window dataset (unchanged)
+      - Aux samples: "censored views" generated on-the-fly by selecting
+        K truncation cutpoints per engine and M windows per cutpoint.
+
+    Indexing:
+      - idx < n_regular -> regular sample
+      - else -> aux sample with logical index (engine_id, trunc_slot, window_slot)
+
+    Returned batch fields (tuple, minimal invasiveness):
+      - base fields: (X, y, unit_id, cond_id, [health_phys_seq?])
+      - + metadata: is_censored_view (int64 0/1), cut_ratio (float32),
+                    cut_idx (int64, cycles), t_end (int64, cycles index)
+
+    Notes:
+      - This preserves the full regular sample list.
+      - The aux stream is intended to be mixed via a sampler (see create_full_dataloaders).
+    """
+
+    def __init__(
+        self,
+        base: SequenceDatasetWithUnits,
+        *,
+        num_truncations_per_engine: int = 5,
+        num_windows_per_truncation: int = 8,
+        trunc_ratio_min: float = 0.4,
+        trunc_ratio_max: float = 1.0,
+        p_full: float = 0.25,
+        run_seed: int = 42,
+    ) -> None:
+        import hashlib
+
+        self.base = base
+        self.K = int(num_truncations_per_engine)
+        self.M = int(num_windows_per_truncation)
+        self.trunc_ratio_min = float(trunc_ratio_min)
+        self.trunc_ratio_max = float(trunc_ratio_max)
+        self.p_full = float(p_full)
+        self.run_seed = int(run_seed)
+        self._hashlib = hashlib
+
+        if self.K < 1 or self.M < 1:
+            raise ValueError("num_truncations_per_engine and num_windows_per_truncation must be >= 1")
+        if not (0.0 < self.trunc_ratio_min <= self.trunc_ratio_max <= 1.0):
+            raise ValueError("Require 0 < trunc_ratio_min <= trunc_ratio_max <= 1")
+        if not (0.0 <= self.p_full <= 1.0):
+            raise ValueError("p_full must be in [0,1]")
+
+        self.epoch: int = 0  # optional; used only if training loop sets it
+
+        # Engine grouping (by window samples)
+        unit_ids = self.base.unit_ids
+        self.engine_ids = torch.unique(unit_ids).sort().values
+        self.engine_to_indices: dict[int, torch.Tensor] = {}
+        self.engine_num_windows: dict[int, int] = {}
+        for uid in self.engine_ids.tolist():
+            idxs = torch.nonzero(unit_ids == uid, as_tuple=False).view(-1)
+            self.engine_to_indices[int(uid)] = idxs
+            self.engine_num_windows[int(uid)] = int(idxs.numel())
+
+        self.n_regular = int(len(self.base))
+        self.n_aux = int(len(self.engine_ids) * self.K * self.M)
+
+        # past_len derived from X tensor
+        self.past_len = int(self.base.X.shape[1])
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return int(self.n_regular + self.n_aux)
+
+    def _stable_u64(self, *parts: int) -> int:
+        """
+        Stable hash -> uint64 using md5 over 64-bit little-endian ints.
+        """
+        m = self._hashlib.md5()
+        for p in parts:
+            v = int(p) & 0xFFFFFFFFFFFFFFFF
+            m.update(v.to_bytes(8, "little", signed=False))
+        return int.from_bytes(m.digest()[:8], "little", signed=False)
+
+    def _rand01(self, seed_u64: int) -> float:
+        # Convert uint64 -> float in [0,1)
+        return float((seed_u64 & ((1 << 53) - 1)) / float(1 << 53))
+
+    def __getitem__(self, idx: int):
+        # Regular sample
+        if int(idx) < self.n_regular:
+            base_items = list(self.base[int(idx)])
+            # Determine unit_id / engine window length for metadata
+            unit_id = int(base_items[2].item()) if torch.is_tensor(base_items[2]) else int(base_items[2])
+            L_win = int(self.engine_num_windows.get(unit_id, 1))
+            L_cycles = int(L_win + self.past_len - 1)
+            # Approximate t_end in cycles index from window position within engine
+            # (only used for diagnostics; exact cycle number is not required here)
+            # Compute window slot position within this engine's window list
+            # NOTE: O(L) search; acceptable because used only for regular stream metadata.
+            pos = 0
+            try:
+                idxs = self.engine_to_indices[unit_id]
+                # find local position
+                loc = (idxs == int(idx)).nonzero(as_tuple=False)
+                if loc.numel() > 0:
+                    pos = int(loc.view(-1)[0].item())
+            except Exception:
+                pos = 0
+            t_end = int(pos + (self.past_len - 1))
+            is_cens = torch.tensor(0, dtype=torch.int64)
+            cut_ratio = torch.tensor(1.0, dtype=torch.float32)
+            cut_idx = torch.tensor(L_cycles, dtype=torch.int64)
+            t_end_t = torch.tensor(t_end, dtype=torch.int64)
+            base_items.extend([is_cens, cut_ratio, cut_idx, t_end_t])
+            return tuple(base_items)
+
+        # Aux sample
+        aux_i = int(idx) - self.n_regular
+        engine_count = int(len(self.engine_ids))
+        # aux_i -> (engine_idx, trunc_slot, window_slot)
+        per_engine = self.K * self.M
+        engine_idx = aux_i // per_engine
+        rem = aux_i % per_engine
+        trunc_slot = rem // self.M
+        window_slot = rem % self.M
+
+        engine_id = int(self.engine_ids[int(engine_idx)].item())
+        idxs = self.engine_to_indices[engine_id]
+        L_win = int(idxs.numel())
+        L_cycles = int(L_win + self.past_len - 1)
+
+        # Worker-safe epoch variability (optional):
+        # include dataset epoch (if set) and torch.initial_seed() (worker-specific).
+        worker_seed = int(torch.initial_seed()) & 0xFFFFFFFFFFFFFFFF
+        seed0 = self._stable_u64(self.run_seed, self.epoch, engine_id, trunc_slot, window_slot, worker_seed)
+
+        u = self._rand01(seed0)
+        if u < self.p_full:
+            cut_cycles = L_cycles
+        else:
+            seed_r = self._stable_u64(seed0, 1)
+            r = self.trunc_ratio_min + (self.trunc_ratio_max - self.trunc_ratio_min) * self._rand01(seed_r)
+            cut_cycles = int(round(r * L_cycles))
+
+        # Ensure cut_cycles >= past_len+1
+        cut_cycles = max(self.past_len + 1, min(L_cycles, cut_cycles))
+        cut_ratio = float(cut_cycles) / float(max(1, L_cycles))
+
+        # Number of windows available within truncated view:
+        # windows exist for t_end in [past_len-1, cut_cycles-1] => count = cut_cycles - past_len + 1
+        cut_win = int(cut_cycles - self.past_len + 1)
+        cut_win = max(1, min(L_win, cut_win))
+
+        # Sample a window end uniformly among available windows in truncated view
+        seed_w = self._stable_u64(seed0, 2)
+        j = int(self._rand01(seed_w) * cut_win)
+        j = max(0, min(cut_win - 1, j))
+
+        base_idx = int(idxs[j].item())
+        base_items = list(self.base[base_idx])
+
+        is_cens_t = torch.tensor(1, dtype=torch.int64)
+        cut_ratio_t = torch.tensor(cut_ratio, dtype=torch.float32)
+        cut_idx_t = torch.tensor(int(cut_cycles), dtype=torch.int64)
+        t_end_t = torch.tensor(int(j + (self.past_len - 1)), dtype=torch.int64)
+        base_items.extend([is_cens_t, cut_ratio_t, cut_idx_t, t_end_t])
+        return tuple(base_items)
+
+
 def build_test_sequences_from_df(
     df_test: pd.DataFrame,
     feature_cols: list[str],
@@ -671,6 +841,13 @@ def create_full_dataloaders(
     trunc_p_full: float = 0.25,
     trunc_r_min: float = 0.4,
     trunc_r_max: float = 1.0,
+    # NEW: multiview censoring samples (aux stream) + mixing ratio
+    use_multiview_censoring: bool = False,
+    num_windows_per_truncation: int = 8,
+    trunc_ratio_min: float = 0.4,
+    trunc_ratio_max: float = 1.0,
+    aux_sample_ratio: float = 0.3,
+    run_seed: int = 42,
 ) -> Tuple[DataLoader, DataLoader, StandardScaler | Dict[int, StandardScaler], torch.Tensor, torch.Tensor]:
     """
     Erstellt Train- und Validation-Dataloader mit engine-basiertem Split.
@@ -830,7 +1007,39 @@ def create_full_dataloaders(
         cond_ids_train,
         health_phys_seq=health_phys_seq_train,
     )
-    if censoring_aware_training:
+    # -------------------------------------------------------------------
+    # Training dataset selection:
+    #   - legacy censoring_aware_training (replaces stream)
+    #   - NEW multiview censoring (adds aux stream, keeps regular)
+    # -------------------------------------------------------------------
+    train_sampler = None
+    if use_multiview_censoring:
+        train_dataset = MultiviewCensoringMixedDataset(
+            base=train_base_dataset,
+            num_truncations_per_engine=num_truncations_per_engine,
+            num_windows_per_truncation=num_windows_per_truncation,
+            trunc_ratio_min=trunc_ratio_min,
+            trunc_ratio_max=trunc_ratio_max,
+            p_full=trunc_p_full,
+            run_seed=run_seed,
+        )
+        # Sample a fixed number per epoch (≈ regular count) to keep compute comparable.
+        n_reg = int(train_dataset.n_regular)
+        p_aux = float(aux_sample_ratio)
+        p_aux = max(0.0, min(0.95, p_aux))
+        # Weights: regular indices weight ~ (1-p_aux), aux indices weight ~ p_aux
+        w_reg = (1.0 - p_aux) / max(1, n_reg)
+        w_aux = p_aux / max(1, int(train_dataset.n_aux))
+        weights = torch.full((len(train_dataset),), w_aux, dtype=torch.double)
+        weights[:n_reg] = w_reg
+        # WeightedRandomSampler draws indices on the main process (worker-safe).
+        train_sampler = torch.utils.data.WeightedRandomSampler(
+            weights=weights,
+            num_samples=n_reg,
+            replacement=True,
+        )
+        train_shuffle = False
+    elif censoring_aware_training:
         # Deterministic truncation sampling; keep shuffle=False so batches naturally contain
         # multiple truncations from the same engine (rank loss becomes effective).
         train_dataset = CensoringAwareTruncationDataset(
@@ -846,7 +1055,12 @@ def create_full_dataloaders(
         train_shuffle = True
     val_dataset = SequenceDatasetWithUnits(X_val_scaled, y_val, val_unit_ids_samples, cond_ids_val, health_phys_seq=health_phys_seq_val)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=train_shuffle)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=train_shuffle if train_sampler is None else False,
+        sampler=train_sampler,
+    )
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     print("============================================================")
@@ -860,6 +1074,17 @@ def create_full_dataloaders(
             f"Censoring-aware training: num_truncations_per_engine={num_truncations_per_engine}, "
             f"p_full={trunc_p_full}, r_range=[{trunc_r_min},{trunc_r_max}]"
         )
+    if use_multiview_censoring:
+        print(
+            "Multiview censoring: "
+            f"K={num_truncations_per_engine}, M={num_windows_per_truncation}, "
+            f"ratio=[{trunc_ratio_min},{trunc_ratio_max}], p_full={trunc_p_full}, "
+            f"aux_sample_ratio={aux_sample_ratio}"
+        )
+        try:
+            print(f"  Regular windows: {getattr(train_dataset, 'n_regular', 'NA')}, Aux space: {getattr(train_dataset, 'n_aux', 'NA')}")
+        except Exception:
+            pass
     print(f"Feature scaling: {scaling_info}")
     if use_condition_wise_scaling and isinstance(scaler, dict):
         print(f"  Conditions: {sorted(scaler.keys())}")
@@ -1593,6 +1818,22 @@ def train_eol_full_lstm(
     )
     from src.loss import health_smoothness_loss
 
+    def _save_cut_ratio_hist(cut_ratios: list[float], save_path: Path) -> None:
+        if not cut_ratios:
+            return
+        import numpy as _np
+        import matplotlib.pyplot as _plt
+
+        x = _np.asarray(cut_ratios, dtype=_np.float32)
+        _plt.figure(figsize=(7, 4))
+        _plt.hist(x, bins=30, range=(0.35, 1.0), alpha=0.8, color="tab:blue")
+        _plt.xlabel("cut_ratio (aux censored views)")
+        _plt.ylabel("count")
+        _plt.title("cut_ratio distribution (train, sampled aux stream)")
+        _plt.tight_layout()
+        _plt.savefig(save_path, dpi=200)
+        _plt.close()
+
     def _pairwise_rank_hinge_loss(
         preds: torch.Tensor,
         unit_ids: torch.Tensor,
@@ -1841,10 +2082,28 @@ def train_eol_full_lstm(
             health_phys_seq_batch = None
             unit_ids_batch = None
             trunc_ratio_batch = None
-            if len(batch) == 8:
-                # (X, y, unit, cond, health_phys, trunc_ratio, cut_win, L_win)
-                X_batch, y_batch, unit_ids_batch, cond_ids_batch, health_phys_seq_batch, trunc_ratio_batch, _, _ = batch
+            is_censored_batch = None
+            if len(batch) == 9:
+                # Multiview with health_phys_seq:
+                # (X, y, unit, cond, health_phys, is_cens, cut_ratio, cut_idx, t_end)
+                X_batch, y_batch, unit_ids_batch, cond_ids_batch, health_phys_seq_batch, is_censored_batch, trunc_ratio_batch, _, _ = batch
                 cond_ids_batch = cond_ids_batch.to(device)
+            elif len(batch) == 8:
+                # Ambiguous 8-tuple:
+                # - CensoringAwareTruncationDataset with health_phys:
+                #   (X, y, unit, cond, health_phys, trunc_ratio, cut_win, L_win)
+                # - Multiview without health_phys:
+                #   (X, y, unit, cond, is_cens, cut_ratio, cut_idx, t_end)
+                X_batch, y_batch, unit_ids_batch, cond_ids_batch, a4, a5, a6, a7 = batch
+                cond_ids_batch = cond_ids_batch.to(device)
+                if torch.is_tensor(a4) and a4.dim() == 2:
+                    # health_phys_seq_batch: [B, past_len]
+                    health_phys_seq_batch = a4
+                    trunc_ratio_batch = a5
+                else:
+                    # is_censored_batch: [B]
+                    is_censored_batch = a4
+                    trunc_ratio_batch = a5
             elif len(batch) == 7:
                 # (X, y, unit, cond, trunc_ratio, cut_win, L_win)
                 X_batch, y_batch, unit_ids_batch, cond_ids_batch, trunc_ratio_batch, _, _ = batch
@@ -1869,6 +2128,8 @@ def train_eol_full_lstm(
             unit_ids_batch = unit_ids_batch.to(device)
             if trunc_ratio_batch is not None:
                 trunc_ratio_batch = trunc_ratio_batch.to(device)
+            if is_censored_batch is not None:
+                is_censored_batch = is_censored_batch.to(device)
             
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
@@ -2069,11 +2330,29 @@ def train_eol_full_lstm(
                                 and unit_ids_batch is not None
                             ):
                                 mu_pred = (rul_pred.squeeze(-1) if rul_pred.dim() > 1 else rul_pred)
+                                # If multiview metadata is present, apply ranking only on censored/aux samples
+                                # (regular sliding windows have cut_ratio ~ 1.0 and would otherwise dominate pairs).
+                                if is_censored_batch is not None:
+                                    m = (is_censored_batch.view(-1) > 0)
+                                    if int(m.sum().item()) >= 2:
+                                        mu_pred_use = mu_pred[m]
+                                        uid_use = unit_ids_batch[m]
+                                        tr_use = trunc_ratio_batch[m]
+                                    else:
+                                        mu_pred_use = None
+                                        uid_use = None
+                                        tr_use = None
+                                else:
+                                    mu_pred_use = mu_pred
+                                    uid_use = unit_ids_batch
+                                    tr_use = trunc_ratio_batch
+
+                                if mu_pred_use is not None:
                                 rank_loss = _pairwise_rank_hinge_loss(
-                                    preds=mu_pred,
-                                    unit_ids=unit_ids_batch,
-                                    trunc_ratio=trunc_ratio_batch,
-                                    margin=float(rank_margin),
+                                        preds=mu_pred_use,
+                                        unit_ids=uid_use,
+                                        trunc_ratio=tr_use,
+                                        margin=float(rank_margin),
                                 )
                                 loss = loss + float(lambda_rank) * rank_loss
                                 if train_component_losses is not None:
@@ -2096,6 +2375,21 @@ def train_eol_full_lstm(
                                 loss = loss + float(lambda_bucket) * bucket_loss
                                 if train_component_losses is not None:
                                     train_component_losses.setdefault("bucket_loss", []).append(float(bucket_loss.item()))
+
+                        # Track multiview sampling stats (aux fraction + cut_ratio dist)
+                        if is_censored_batch is not None and trunc_ratio_batch is not None:
+                            try:
+                                if epoch == 1:
+                                    # store a capped number to keep memory low
+                                    if "cut_ratio_samples_epoch1" not in locals():
+                                        cut_ratio_samples_epoch1 = []
+                                    m_aux = (is_censored_batch.view(-1) > 0)
+                                    if int(m_aux.sum().item()) > 0:
+                                        vals = trunc_ratio_batch.view(-1)[m_aux].detach().float().cpu().numpy().tolist()
+                                        if len(cut_ratio_samples_epoch1) < 20000:
+                                            cut_ratio_samples_epoch1.extend(vals[: max(0, 20000 - len(cut_ratio_samples_epoch1))])
+                            except Exception:
+                                pass
                         
                         # Late monotonicity loss (RUL <= beta)
                         if USE_HI_MONOTONICITY:
@@ -2999,6 +3293,14 @@ def train_eol_full_lstm(
             if cond_recon_weight > 0.0:
                 print(f"  Cond Recon (weighted):     {train_cond_loss:.4f}")
             print(f"  Total Loss:                {train_loss:.4f}")
+
+        # Multiview diagnostic plot: cut_ratio histogram (epoch 1)
+        try:
+            if "cut_ratio_samples_epoch1" in locals() and epoch == 1:
+                save_path = Path(results_dir) / "cut_ratio_hist_train.png"
+                _save_cut_ratio_hist(cut_ratio_samples_epoch1, save_path=save_path)
+        except Exception as e:
+            print(f"[WARNING] Failed to write cut_ratio_hist_train.png: {e}")
         
         # ====================================================================
         # DEBUG: Sanity-Check des Damage-Heads (einmal pro 5 Epochen)
