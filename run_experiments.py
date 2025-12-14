@@ -1133,6 +1133,9 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             # v5q: optional quantile head for RUL at last observed cycle
             use_rul_quantiles_head=encoder_kwargs.get("use_rul_quantiles_head", False),
             rul_quantiles=tuple(encoder_kwargs.get("rul_quantiles", (0.1, 0.5, 0.9))),
+            # Censoring-aware: optional bucket head for RUL
+            use_bucket_head=encoder_kwargs.get("use_bucket_head", False),
+            rul_bucket_edges=tuple(encoder_kwargs.get("rul_bucket_edges", (25.0, 50.0, 75.0, 100.0, 125.0))),
         )
 
         # If we inferred Cond_* feature indices, attach them to the model so it can
