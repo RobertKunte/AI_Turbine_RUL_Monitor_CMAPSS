@@ -1684,6 +1684,24 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_config(
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_tuned_p50mse_config() -> ExperimentConfig:
+    """
+    Tuned quantiles run aiming to preserve P50 RMSE while learning quantiles:
+      - smaller quantile loss weight (auxiliary)
+      - explicit P50 MSE stabilizer
+    Keeps HI_cal disabled to avoid calibrator dependency in Colab.
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_tuned_p50mse"
+
+    loss = cfg.setdefault("loss_params", {})
+    loss["rul_quantile_weight"] = 0.1
+    loss["rul_quantile_cross_weight"] = 0.1
+    loss["rul_quantile_p50_mse_weight"] = 1.0
+
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
     """
     Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
@@ -3201,6 +3219,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_uncertainty_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_tuned_p50mse":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_tuned_p50mse_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3e":
