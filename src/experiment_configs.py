@@ -1702,6 +1702,31 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_tuned_p
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_hi_cal_tuned_p50mse_config() -> ExperimentConfig:
+    """
+    Quantiles run that is closer to the "v5 cond_norm + HI_cal" family:
+      - enables HI_cal head + HI_cal fusion for RUL head
+      - enables HI_cal supervision losses (requires valid hi_calibrator_*.pkl)
+      - keeps quantile head active, but treats quantile loss as auxiliary
+      - stabilizes P50 with an explicit MSE term
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_tuned_p50mse_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_hi_cal_tuned_p50mse"
+
+    # Re-enable HI_cal features in the encoder
+    enc = cfg.setdefault("encoder_kwargs", {})
+    enc["use_hi_cal_head"] = True
+    enc["use_hi_cal_fusion_for_rul"] = True
+
+    # Re-enable HI_cal supervision losses (weights chosen to match v4/v5 defaults)
+    loss = cfg.setdefault("loss_params", {})
+    loss["w_hi_cal"] = float(loss.get("w_hi_cal", 0.5))
+    loss["w_mono_hi_cal"] = float(loss.get("w_mono_hi_cal", 0.05))
+    loss["w_slope_hi_cal"] = float(loss.get("w_slope_hi_cal", 0.1))
+
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
     """
     Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
@@ -3221,6 +3246,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_tuned_p50mse":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_tuned_p50mse_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_hi_cal_tuned_p50mse":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_hi_cal_tuned_p50mse_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3e":

@@ -133,18 +133,45 @@ def ensure_hi_calibrator_fd004() -> None:
     encoder_run = "fd004_transformer_encoder_ms_dt_v2_damage_v3d_delta_two_phase"
     cal_path = Path("results") / dataset.lower() / encoder_run / f"hi_calibrator_{dataset}.pkl"
     if cal_path.exists():
-        return
+        # Robustness: detect corrupted/partial calibrator (EOFError etc.) and refit.
+        try:
+            from src.analysis.hi_calibration import load_hi_calibrator
+
+            _ = load_hi_calibrator(cal_path)
+            return
+        except Exception as e:
+            print(f"[colab] HI_calibrator exists but failed to load ({type(e).__name__}: {e})")
+            print("[colab] Deleting corrupted calibrator and refitting ...")
+            try:
+                cal_path.unlink()
+            except Exception:
+                pass
 
     print(f"[colab] HI_calibrator missing, attempting to preload base run: {encoder_run}")
     copy_results_run_from_drive(encoder_run)
 
     if cal_path.exists():
-        return
+        try:
+            from src.analysis.hi_calibration import load_hi_calibrator
+
+            _ = load_hi_calibrator(cal_path)
+            return
+        except Exception as e:
+            print(f"[colab] Preloaded HI_calibrator but failed to load ({type(e).__name__}: {e})")
+            print("[colab] Deleting corrupted calibrator and refitting ...")
+            try:
+                cal_path.unlink()
+            except Exception:
+                pass
 
     print("[colab] HI_calibrator still missing -> fitting calibrator (TRAIN-only) ...")
     sh(f"python -m src.analysis.hi_calibration --dataset {dataset} --encoder_run {encoder_run}")
     if not cal_path.exists():
         raise RuntimeError(f"HI_calibrator still missing after fit attempt: {cal_path}")
+    # Verify it loads
+    from src.analysis.hi_calibration import load_hi_calibrator
+
+    _ = load_hi_calibrator(cal_path)
 
 
 def get_git_sha(repo_dir: Path) -> str:
