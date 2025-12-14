@@ -888,6 +888,11 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         shuffle_engines=config['training_params']['shuffle_engines'],
         random_seed=config['training_params']['random_seed'],
         use_condition_wise_scaling=True,
+        censoring_aware_training=bool(config["training_params"].get("censoring_aware_training", False)),
+        num_truncations_per_engine=int(config["training_params"].get("num_truncations_per_engine", 5)),
+        trunc_p_full=float(config["training_params"].get("trunc_p_full", 0.25)),
+        trunc_r_min=float(config["training_params"].get("trunc_r_min", 0.4)),
+        trunc_r_max=float(config["training_params"].get("trunc_r_max", 1.0)),
     )
     
     # ===================================================================
@@ -1335,6 +1340,14 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         rul_quantiles=config["loss_params"].get("rul_quantiles", None),
         rul_quantile_cross_weight=config["loss_params"].get("rul_quantile_cross_weight", 0.0),
         rul_quantile_p50_mse_weight=config["loss_params"].get("rul_quantile_p50_mse_weight", 0.0),
+        # Censoring-aware: ranking loss on mu
+        use_ranking_loss=bool(config.get("loss_params", {}).get("use_ranking_loss", True)),
+        lambda_rank=float(config.get("loss_params", {}).get("lambda_rank", 0.1)),
+        rank_margin=float(config.get("loss_params", {}).get("rank_margin", 1.0)),
+        # Censoring-aware: bucket head loss
+        use_bucket_head=bool(config.get("loss_params", {}).get("use_bucket_head", True)),
+        lambda_bucket=float(config.get("loss_params", {}).get("lambda_bucket", 0.1)),
+        rul_bucket_edges=config.get("loss_params", {}).get("rul_bucket_edges", None),
     )
     
     # ===================================================================

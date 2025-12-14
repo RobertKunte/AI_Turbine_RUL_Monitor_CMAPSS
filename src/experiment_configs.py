@@ -1727,6 +1727,47 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_hi_cal_
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_censoring_aware_config() -> ExperimentConfig:
+    """
+    FD004 Transformer-Encoder v5 (cond_norm) with censoring-aware training:
+      - dynamic truncation sampling (K truncations per engine per epoch)
+      - pairwise ranking hinge loss on mu
+      - auxiliary bucket head (classification)
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_censoring_aware"
+
+    training = cfg.setdefault("training_params", {})
+    training["censoring_aware_training"] = True
+    training.setdefault("num_truncations_per_engine", 5)
+    training.setdefault("trunc_p_full", 0.25)
+    training.setdefault("trunc_r_min", 0.4)
+    training.setdefault("trunc_r_max", 1.0)
+    # Ensure we actually run the intended two-phase damage warmup (v3d/v4/v5 base),
+    # even if a caller overrides/strips training_params.
+    training.setdefault("damage_two_phase", True)
+    training.setdefault("damage_warmup_epochs", 10)
+
+    # Enable bucket head in the encoder
+    enc = cfg.setdefault("encoder_kwargs", {})
+    enc["use_bucket_head"] = True
+    enc.setdefault("rul_bucket_edges", [25.0, 50.0, 75.0, 100.0, 125.0])
+
+    # Loss params
+    loss = cfg.setdefault("loss_params", {})
+    loss.setdefault("use_ranking_loss", True)
+    loss.setdefault("lambda_rank", 0.1)
+    loss.setdefault("rank_margin", 1.0)
+
+    loss.setdefault("use_bucket_head", True)
+    loss.setdefault("lambda_bucket", 0.1)
+    loss.setdefault("rul_bucket_edges", [25.0, 50.0, 75.0, 100.0, 125.0])
+    # Ensure damage HI supervision is enabled (required for meaningful Phase-1 warmup).
+    loss.setdefault("damage_hi_weight", 5.0)
+
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
     """
     Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
@@ -3248,6 +3289,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_tuned_p50mse_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_hi_cal_tuned_p50mse":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_quantiles_hi_cal_tuned_p50mse_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_censoring_aware":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_censoring_aware_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3e":

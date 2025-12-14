@@ -55,6 +55,19 @@ This file is the living backlog. Each item includes **Goal**, **Artifacts**, **A
   - Clear summary printed (copied files count + bytes)
 - **Owner role**: **Planner**, **Implementer**, **Experimenter**, **Reviewer**
 
+### 5) Censoring-aware training (dynamic truncation + ranking loss + RUL buckets) — **In Progress**
+- **Goal**: Make training robust to right-censoring severity by sampling multiple truncations per engine per epoch, and stabilize point predictions via ranking loss + bucket head.
+- **Artifacts**:
+  - `docs/decisions/ADR-0005-censoring-aware-training.md`
+  - New run(s): `results/fd004/<run>/summary.json` with censoring-aware params recorded
+  - Plot: `results/fd004/<run>/true_vs_pred_by_truncation.png`
+- **Acceptance criteria**:
+  - Truncation sampling is deterministic across DataLoader workers (same seed → same cut).
+  - No tuple-unpacking regressions: older runs still load/infer/diagnose.
+  - Metrics reported: RMSE/MAE/Bias/R² + NASA (val/test).
+  - Diagnostics plot generated and uses FD004 wording (“last observed cycle (right-censored)”).
+- **Owner role**: **Planner** (ADR + plan), **Implementer** (dataset + loss + head), **Reviewer** (leakage + censoring realism), **Experimenter** (runs + archive)
+
 ---
 
 ## Next (2–6 weeks)

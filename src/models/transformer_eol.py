@@ -275,6 +275,9 @@ class EOLFullTransformerEncoder(nn.Module):
         # NEW (v5q): optional quantile head for RUL at last observed cycle
         use_rul_quantiles_head: bool = False,
         rul_quantiles: Tuple[float, ...] = (0.1, 0.5, 0.9),
+        # NEW (censoring-aware): auxiliary RUL bucket head
+        use_bucket_head: bool = False,
+        rul_bucket_edges: Tuple[float, ...] = (25.0, 50.0, 75.0, 100.0, 125.0),
     ) -> None:
         super().__init__()
 
@@ -310,6 +313,10 @@ class EOLFullTransformerEncoder(nn.Module):
         # v5q: quantile head flags
         self.use_rul_quantiles_head: bool = bool(use_rul_quantiles_head)
         self.rul_quantiles: Tuple[float, ...] = tuple(float(q) for q in rul_quantiles)
+
+        # Censoring-aware: bucket head flags
+        self.use_bucket_head: bool = bool(use_bucket_head)
+        self.rul_bucket_edges: Tuple[float, ...] = tuple(float(x) for x in rul_bucket_edges)
 
         # ------------------------------------------------------------------
         # Continuous condition encoder configuration
@@ -409,6 +416,13 @@ class EOLFullTransformerEncoder(nn.Module):
             self.fc_rul_quantiles = nn.Linear(rul_in_dim, q_dim)
         else:
             self.fc_rul_quantiles = None
+        # Censoring-aware: bucket logits from same RUL input representation (optional)
+        self.fc_rul_bucket: Optional[nn.Linear]
+        if self.use_bucket_head:
+            num_buckets = max(2, len(self.rul_bucket_edges) + 1)
+            self.fc_rul_bucket = nn.Linear(rul_in_dim, num_buckets)
+        else:
+            self.fc_rul_bucket = None
         self.fc_health = nn.Linear(d_model, 1)
 
         # Damage-basierte HI-Variante (identische API wie EOLFullLSTMWithHealth)
@@ -762,6 +776,12 @@ class EOLFullTransformerEncoder(nn.Module):
             idx50 = int(torch.argmin(torch.abs(qs - 0.5)).item())
             rul_pred = q_raw[:, idx50]
 
+        # Censoring-aware: optional bucket logits
+        rul_bucket_logits: Optional[torch.Tensor] = None
+        if self.use_bucket_head and self.fc_rul_bucket is not None:
+            bucket_input = quantile_input if quantile_input is not None else shared
+            rul_bucket_logits = self.fc_rul_bucket(bucket_input)  # [B, num_buckets]
+
         if return_aux:
             return (
                 rul_pred,
@@ -771,8 +791,9 @@ class EOLFullTransformerEncoder(nn.Module):
                 cond_recon,
                 rul_sigma,
                 rul_quantiles_pred,
+                rul_bucket_logits,
             )
-        return rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred
+        return rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred, rul_bucket_logits
 
     # ------------------------------------------------------------------
     # Encoder-side helper for world models

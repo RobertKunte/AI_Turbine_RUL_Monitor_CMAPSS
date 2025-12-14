@@ -268,6 +268,12 @@ def main() -> None:
             ensure_hi_calibrator_fd004()
 
         # Execute one experiment at a time for clearer logs and robust syncing
+        # Preflight: ensure the experiment name exists in this repo checkout.
+        # If this fails, you likely cloned an older git sha that doesn't include the config.
+        sh(
+            "python -c \"from src.experiment_configs import get_experiment_by_name; "
+            f"get_experiment_by_name('{run_name}'); print('OK: experiment exists')\""
+        )
         sh(f"python run_experiments.py --experiments {run_name} --device {DEVICE}")
 
         # Registry visibility
@@ -276,7 +282,17 @@ def main() -> None:
 
         # Sync this run (resolve latest run_id for this run_name via registry)
         print("\n[Sync] push results + artifacts for this run_name")
-        sh(f"python -m src.tools.sync_artifacts --push --run_name {run_name} --what both")
+        try:
+            sh(f"python -m src.tools.sync_artifacts --push --run_name {run_name} --what both")
+        except Exception as e:
+            print(f"[colab] WARNING: registry-based sync failed: {e}")
+            print("[colab] Falling back to results-only copy by folder name (registry-free).")
+            dataset = infer_dataset_from_run_name(run_name) or "FD004"
+            src = Path("results") / dataset.lower() / run_name
+            dst = Path(DRIVE_PROJECT_ROOT) / "results" / dataset.lower() / run_name
+            sh(f'mkdir -p "{dst}"', check=False)
+            sh(f'cp -u -r "{src}/"* "{dst}/"', check=False)
+            print(f"[colab] Fallback pushed results: {src} -> {dst}")
 
     # Optional diagnostics hook (commented):
     # sh(f\"python run_diagnostics.py --experiments {RUN_NAME}\")

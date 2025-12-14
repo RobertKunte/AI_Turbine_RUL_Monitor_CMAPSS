@@ -490,7 +490,12 @@ def _print_runs_table(runs: Sequence[RunRow]) -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="SQLite run registry (Phase 1)")
-    parser.add_argument("--db", type=str, default=str(_default_db_path()), help="Path to sqlite DB file")
+    parser.add_argument(
+        "--db",
+        type=str,
+        default=os.environ.get("RUN_REGISTRY_DB", str(_default_db_path())),
+        help="Path to sqlite DB file (default: $RUN_REGISTRY_DB or artifacts/run_registry.sqlite)",
+    )
     parser.add_argument("--list", type=int, default=20, help="List latest N runs")
     parser.add_argument("--dataset", type=str, default=None, help="Filter by dataset (e.g., FD004)")
     parser.add_argument("--experiment", type=str, default=None, help="Filter by experiment_name")

@@ -720,6 +720,7 @@ def load_model_from_experiment(
         has_cond_norm = any("condition_normalizer.net.0.weight" in k for k in keys)
         has_rul_sigma_head = any(k.endswith("fc_rul_log_sigma.weight") for k in keys)
         has_rul_quantiles_head = any(k.endswith("fc_rul_quantiles.weight") for k in keys)
+        has_rul_bucket_head = any(k.endswith("fc_rul_bucket.weight") for k in keys)
         fc_rul_key = next((k for k in keys if k.endswith("fc_rul.weight")), None)
         fc_rul_in = state_dict[fc_rul_key].shape[1] if fc_rul_key is not None else d_model
 
@@ -758,6 +759,14 @@ def load_model_from_experiment(
                 rul_quantiles_tuple = tuple(float(x) for x in qs)
         else:
             rul_quantiles_tuple = (0.1, 0.5, 0.9)
+
+        # Censoring-aware: detect optional bucket head
+        use_bucket_head = bool(config.get("use_bucket_head", has_rul_bucket_head))
+        bucket_edges_cfg = config.get("rul_bucket_edges")
+        if isinstance(bucket_edges_cfg, (list, tuple)) and len(bucket_edges_cfg) > 0:
+            rul_bucket_edges_tuple: Tuple[float, ...] = tuple(float(x) for x in bucket_edges_cfg)
+        else:
+            rul_bucket_edges_tuple = (25.0, 50.0, 75.0, 100.0, 125.0)
 
         model = EOLFullTransformerEncoder(
             input_dim=input_dim,
@@ -800,6 +809,9 @@ def load_model_from_experiment(
             # v5q: quantiles head
             use_rul_quantiles_head=use_rul_quantiles_head,
             rul_quantiles=rul_quantiles_tuple,
+            # Censoring-aware: bucket head
+            use_bucket_head=use_bucket_head,
+            rul_bucket_edges=rul_bucket_edges_tuple,
         )
 
         # For v5 runs with a ConditionNormalizer, instantiate it before loading
@@ -1012,6 +1024,150 @@ def rebuild_scaler_from_training_data(
         scaler.fit(X_train)
         print(f"[INFO] Rebuilt global scaler on {len(X_train)} training samples")
         return scaler
+
+
+def _plot_true_vs_pred_by_truncation(
+    *,
+    experiment_dir: Path,
+    model: nn.Module,
+    df_train: pd.DataFrame,
+    feature_cols: list[str],
+    scaler: StandardScaler | Dict[int, StandardScaler],
+    device: torch.device | str,
+    past_len: int,
+    max_rul: float,
+    sample_per_bucket: int = 1500,
+) -> None:
+    """
+    Diagnostic scatter: true vs pred, colored by truncation ratio bucket.
+
+    Uses TRAIN data (has per-cycle RUL) because FD004 TEST is right-censored and
+    does not provide per-cycle true RUL for arbitrary truncation points.
+
+    Output:
+      - true_vs_pred_by_truncation.png in experiment_dir
+    """
+    try:
+        from src.eol_full_lstm import build_full_eol_sequences_from_df
+    except Exception as e:
+        print(f"[WARNING] Could not import build_full_eol_sequences_from_df: {e}")
+        return
+
+    # Build full sliding-window samples from TRAIN (true per-cycle RUL available)
+    X_all, y_all, unit_ids_all, cond_ids_all, _ = build_full_eol_sequences_from_df(
+        df=df_train,
+        feature_cols=feature_cols,
+        past_len=int(past_len),
+        max_rul=int(max_rul),
+        unit_col="UnitNumber",
+        cycle_col="TimeInCycles",
+        rul_col="RUL",
+        cond_col="ConditionID",
+    )
+
+    # Compute truncation ratio per sample from position within each engine's window timeline.
+    unit_np = unit_ids_all.detach().cpu().numpy().astype(int)
+    pos_in_engine: Dict[int, int] = {}
+    total_in_engine: Dict[int, int] = {}
+    # First pass: totals
+    for uid in unit_np:
+        total_in_engine[uid] = total_in_engine.get(uid, 0) + 1
+    # Second pass: positions (1..L)
+    trunc_ratio = np.zeros(len(unit_np), dtype=np.float32)
+    for i, uid in enumerate(unit_np):
+        pos_in_engine[uid] = pos_in_engine.get(uid, 0) + 1
+        L = max(1, total_in_engine.get(uid, 1))
+        trunc_ratio[i] = float(pos_in_engine[uid]) / float(L)
+
+    # Truncation buckets for coloring
+    buckets = [
+        (0.4, 0.6),
+        (0.6, 0.8),
+        (0.8, 1.01),
+    ]
+    bucket_names = ["0.4–0.6", "0.6–0.8", "0.8–1.0"]
+    bucket_colors = ["tab:blue", "tab:orange", "tab:green"]
+
+    # Sample indices per bucket (deterministic)
+    rng = np.random.default_rng(42)
+    idx_sampled: list[int] = []
+    bucket_id_sampled: list[int] = []
+    for b_idx, (lo, hi) in enumerate(buckets):
+        cand = np.where((trunc_ratio >= lo) & (trunc_ratio < hi))[0]
+        if cand.size == 0:
+            continue
+        take = min(int(sample_per_bucket), int(cand.size))
+        chosen = rng.choice(cand, size=take, replace=False)
+        idx_sampled.extend(chosen.tolist())
+        bucket_id_sampled.extend([b_idx] * take)
+
+    if not idx_sampled:
+        print("[WARNING] No samples found for truncation buckets; skipping true_vs_pred_by_truncation plot.")
+        return
+
+    # Extract and scale samples
+    X_sel = X_all[idx_sampled].cpu()
+    y_sel = y_all[idx_sampled].cpu().numpy().astype(np.float32)
+    cond_sel = cond_ids_all[idx_sampled].cpu()
+
+    # Apply scaling (mirror run_inference scaling logic)
+    if isinstance(scaler, dict):
+        X_scaled_list = []
+        for i in range(len(X_sel)):
+            cond_id = int(cond_sel[i].item())
+            x_sample = X_sel[i].numpy()
+            if cond_id in scaler:
+                x_scaled = scaler[cond_id].transform(x_sample)
+            else:
+                first_scaler = list(scaler.values())[0]
+                x_scaled = first_scaler.transform(x_sample)
+            X_scaled_list.append(torch.from_numpy(x_scaled))
+        X_sel_scaled = torch.stack(X_scaled_list)
+    else:
+        X_flat = X_sel.numpy().reshape(-1, X_sel.shape[-1])
+        X_scaled_flat = scaler.transform(X_flat)
+        X_sel_scaled = torch.from_numpy(X_scaled_flat.reshape(X_sel.shape))
+
+    # Predict in batches
+    model.eval()
+    y_pred_list: list[np.ndarray] = []
+    bs = 512
+    with torch.no_grad():
+        for start in range(0, len(X_sel_scaled), bs):
+            xb = X_sel_scaled[start : start + bs].to(device)
+            cb = cond_sel[start : start + bs].to(device)
+            # Use the same RUL decoding as in inference for consistency
+            pred = forward_rul_only(model, xb, cond_ids=cb)
+            y_pred_list.append(pred.detach().cpu().numpy().reshape(-1))
+    y_pred = np.concatenate(y_pred_list, axis=0).astype(np.float32)
+
+    # Plot
+    import matplotlib.pyplot as plt
+
+    save_path = experiment_dir / "true_vs_pred_by_truncation.png"
+    plt.figure(figsize=(8, 7))
+    for b_idx, name in enumerate(bucket_names):
+        mask = np.asarray(bucket_id_sampled, dtype=int) == b_idx
+        if not np.any(mask):
+            continue
+        plt.scatter(
+            y_sel[mask],
+            y_pred[mask],
+            s=8,
+            alpha=0.5,
+            label=f"trunc_ratio {name}",
+            c=bucket_colors[b_idx],
+        )
+    lim = float(max(max_rul, np.nanmax(y_sel) if y_sel.size else max_rul))
+    plt.plot([0, lim], [0, lim], "k--", linewidth=1)
+    plt.xlabel("True RUL at last observed window (TRAIN)")
+    plt.ylabel("Predicted RUL (mu / P50)")
+    plt.title("True vs Pred by truncation ratio bucket (TRAIN; simulated right-censoring)")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+    print(f"[INFO] Wrote {save_path}")
 
 
 def run_inference_for_experiment(
@@ -1447,13 +1603,16 @@ def run_inference_for_experiment(
                     # Fixed contract (v5u/v5q): (rul_pred, hi_last, hi_seq, rul_sigma, rul_quantiles)
                     _, hi_last, hi_seq, rul_sigma_pred, rul_quantiles_pred = outputs
                 elif len(outputs) == 6:
-                    # Transformer with return_aux=True shape, but called without return_aux here;
-                    # keep for robustness.
-                    _, hi_last, hi_seq, _, _, rul_sigma_pred = outputs
+                    # Fixed contract (v5u/v5q + bucket): (rul_pred, hi_last, hi_seq, rul_sigma, rul_quantiles, bucket_logits)
+                    _, hi_last, hi_seq, rul_sigma_pred, rul_quantiles_pred, _ = outputs
                 elif len(outputs) == 7:
                     # Fixed return_aux contract:
                     # (rul_pred, hi_last, hi_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles)
                     _, hi_last, hi_seq, _, _, rul_sigma_pred, rul_quantiles_pred = outputs
+                elif len(outputs) == 8:
+                    # Fixed return_aux + bucket:
+                    # (rul_pred, hi_last, hi_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles, bucket_logits)
+                    _, hi_last, hi_seq, _, _, rul_sigma_pred, rul_quantiles_pred, _ = outputs
             
             # Post-process hi_seq if present
             if hi_seq is not None and torch.is_tensor(hi_seq):
@@ -1462,6 +1621,23 @@ def run_inference_for_experiment(
             hi_last = None
             hi_seq = None
             rul_sigma_pred = None
+
+    # Optional: truncation diagnostic plot (TRAIN-only; requires per-cycle RUL labels)
+    try:
+        training_cfg = config.get("training_params", {})
+        if bool(training_cfg.get("censoring_aware_training", False)):
+            _plot_true_vs_pred_by_truncation(
+                experiment_dir=experiment_dir,
+                model=model,
+                df_train=df_train,
+                feature_cols=feature_cols,
+                scaler=scaler,
+                device=device,
+                past_len=int(past_len),
+                max_rul=float(config.get("max_rul", 125.0)),
+            )
+    except Exception as e:
+        print(f"[WARNING] Failed to generate truncation scatter diagnostic: {e}")
 
         # Optional: HI_cal_v2 sequence for Transformer encoder v4
         hi_cal_seq = None

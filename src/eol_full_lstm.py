@@ -251,6 +251,118 @@ class SequenceDatasetWithUnits:
         return tuple(items)
 
 
+class CensoringAwareTruncationDataset:
+    """
+    Censoring-aware view over an existing per-window dataset.
+
+    This dataset does NOT create new windows. Instead, it groups existing sliding-window
+    samples by engine (unit_id) and, for each engine, exposes K (=num_truncations_per_engine)
+    deterministic "truncation slots" per epoch.
+
+    Each slot selects one window end-position (cut) within that engine's window timeline:
+      - with prob p_full: choose the last available window (cut=L)
+      - else choose cut = int(r * L), r ~ Uniform(r_min, r_max)
+
+    The returned sample corresponds to the *last observed window* for that truncation cut,
+    i.e. a right-censored view. The target y is already the RUL at that cutpoint because
+    the base dataset is built from per-cycle RUL labels.
+
+    Determinism:
+      - index -> (engine_idx, trunc_slot)
+      - seed derived from (epoch, engine_id, trunc_slot) using a stable integer mix
+      - call set_epoch(epoch) at each epoch start (works with non-persistent workers)
+    """
+
+    def __init__(
+        self,
+        base: SequenceDatasetWithUnits,
+        num_truncations_per_engine: int = 5,
+        p_full: float = 0.25,
+        r_min: float = 0.4,
+        r_max: float = 1.0,
+    ) -> None:
+        self.base = base
+        self.num_truncations_per_engine = int(num_truncations_per_engine)
+        self.p_full = float(p_full)
+        self.r_min = float(r_min)
+        self.r_max = float(r_max)
+        if self.num_truncations_per_engine < 1:
+            raise ValueError("num_truncations_per_engine must be >= 1")
+        if not (0.0 <= self.p_full <= 1.0):
+            raise ValueError("p_full must be in [0, 1]")
+        if not (0.0 < self.r_min <= self.r_max <= 1.0):
+            raise ValueError("Require 0 < r_min <= r_max <= 1")
+
+        # Epoch influences deterministic truncation selection.
+        self.epoch: int = 0
+
+        # Group indices by engine in time order.
+        unit_ids = self.base.unit_ids
+        unique_units = torch.unique(unit_ids)
+        # Keep a stable ordering for reproducibility.
+        self.engine_ids = unique_units.sort().values
+
+        self.engine_to_indices: dict[int, torch.Tensor] = {}
+        for uid in self.engine_ids.tolist():
+            idxs = torch.nonzero(unit_ids == uid, as_tuple=False).view(-1)
+            # idxs are already in time order because build_full_eol_sequences appends in time order.
+            self.engine_to_indices[int(uid)] = idxs
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return int(len(self.engine_ids) * self.num_truncations_per_engine)
+
+    @staticmethod
+    def _mix_seed(epoch: int, engine_id: int, slot: int) -> int:
+        # Stable 32-bit integer mix (avoid Python's hash randomization).
+        x = (epoch + 1) * 1000003
+        x ^= (engine_id + 11) * 1009
+        x ^= (slot + 101) * 9176
+        x &= 0xFFFFFFFF
+        return int(x)
+
+    def __getitem__(self, idx: int):
+        k = self.num_truncations_per_engine
+        engine_idx = int(idx) // k
+        slot = int(idx) % k
+
+        engine_id = int(self.engine_ids[engine_idx].item())
+        idxs = self.engine_to_indices[engine_id]
+        L = int(idxs.numel())  # number of windows for this engine
+        if L < 1:
+            raise RuntimeError(f"Engine {engine_id} has no windows (L=0) in base dataset.")
+
+        seed = self._mix_seed(self.epoch, engine_id, slot)
+        g = torch.Generator()
+        g.manual_seed(seed)
+
+        u = float(torch.rand((), generator=g).item())
+        if u < self.p_full:
+            cut_win = L
+        else:
+            r = self.r_min + (self.r_max - self.r_min) * float(torch.rand((), generator=g).item())
+            cut_win = int(r * L)
+
+        # Ensure a valid cut. In cycle space: cut >= past_len + 1.
+        # In window space, that corresponds to at least the 2nd window when available.
+        min_cut_win = 2 if L >= 2 else 1
+        cut_win = max(min_cut_win, min(L, cut_win))
+
+        base_idx = int(idxs[cut_win - 1].item())
+
+        # Fetch from base dataset
+        items = list(self.base[base_idx])
+
+        # Append truncation metadata for ranking/diagnostics:
+        trunc_ratio = float(cut_win) / float(L)
+        items.append(torch.tensor(trunc_ratio, dtype=torch.float32))
+        items.append(torch.tensor(cut_win, dtype=torch.int64))
+        items.append(torch.tensor(L, dtype=torch.int64))
+        return tuple(items)
+
+
 def build_test_sequences_from_df(
     df_test: pd.DataFrame,
     feature_cols: list[str],
@@ -553,6 +665,12 @@ def create_full_dataloaders(
     shuffle_engines: bool = True,
     random_seed: int = 42,
     use_condition_wise_scaling: bool = True,
+    # NEW: censoring-aware training dataset wrapper (optional)
+    censoring_aware_training: bool = False,
+    num_truncations_per_engine: int = 5,
+    trunc_p_full: float = 0.25,
+    trunc_r_min: float = 0.4,
+    trunc_r_max: float = 1.0,
 ) -> Tuple[DataLoader, DataLoader, StandardScaler | Dict[int, StandardScaler], torch.Tensor, torch.Tensor]:
     """
     Erstellt Train- und Validation-Dataloader mit engine-basiertem Split.
@@ -705,10 +823,30 @@ def create_full_dataloaders(
     train_unit_ids_samples = unit_ids[train_mask]
     val_unit_ids_samples = unit_ids[val_mask]
 
-    train_dataset = SequenceDatasetWithUnits(X_train_scaled, y_train, train_unit_ids_samples, cond_ids_train, health_phys_seq=health_phys_seq_train)
+    train_base_dataset = SequenceDatasetWithUnits(
+        X_train_scaled,
+        y_train,
+        train_unit_ids_samples,
+        cond_ids_train,
+        health_phys_seq=health_phys_seq_train,
+    )
+    if censoring_aware_training:
+        # Deterministic truncation sampling; keep shuffle=False so batches naturally contain
+        # multiple truncations from the same engine (rank loss becomes effective).
+        train_dataset = CensoringAwareTruncationDataset(
+            base=train_base_dataset,
+            num_truncations_per_engine=num_truncations_per_engine,
+            p_full=trunc_p_full,
+            r_min=trunc_r_min,
+            r_max=trunc_r_max,
+        )
+        train_shuffle = False
+    else:
+        train_dataset = train_base_dataset
+        train_shuffle = True
     val_dataset = SequenceDatasetWithUnits(X_val_scaled, y_val, val_unit_ids_samples, cond_ids_val, health_phys_seq=health_phys_seq_val)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=train_shuffle)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     print("============================================================")
@@ -717,6 +855,11 @@ def create_full_dataloaders(
     print(f"Total units: {n_units}")
     print(f"Train units: {n_train_units}, Val units: {n_val_units}")
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    if censoring_aware_training:
+        print(
+            f"Censoring-aware training: num_truncations_per_engine={num_truncations_per_engine}, "
+            f"p_full={trunc_p_full}, r_range=[{trunc_r_min},{trunc_r_max}]"
+        )
     print(f"Feature scaling: {scaling_info}")
     if use_condition_wise_scaling and isinstance(scaler, dict):
         print(f"  Conditions: {sorted(scaler.keys())}")
@@ -1390,6 +1533,14 @@ def train_eol_full_lstm(
     rul_quantiles: Optional[list[float]] = None,
     rul_quantile_cross_weight: float = 0.0,
     rul_quantile_p50_mse_weight: float = 0.0,
+    # NEW: bucket head auxiliary loss (classification)
+    use_bucket_head: bool = True,
+    lambda_bucket: float = 0.1,
+    rul_bucket_edges: Optional[list[float]] = None,
+    # NEW: censoring-aware training stabilizers
+    use_ranking_loss: bool = True,
+    lambda_rank: float = 0.1,
+    rank_margin: float = 1.0,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Training-Loop für Full-Trajectory LSTM.
@@ -1441,6 +1592,49 @@ def train_eol_full_lstm(
         HI_GLOBAL_MONO_WEIGHT,
     )
     from src.loss import health_smoothness_loss
+
+    def _pairwise_rank_hinge_loss(
+        preds: torch.Tensor,
+        unit_ids: torch.Tensor,
+        trunc_ratio: torch.Tensor,
+        margin: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Pairwise ranking loss within each engine group.
+
+        Enforce: if trunc_ratio(t1) < trunc_ratio(t2) (earlier cut -> higher true RUL),
+        then preds(t1) should be larger than preds(t2) by at least `margin`.
+
+        Uses adjacent pairs after sorting by trunc_ratio for stability.
+        """
+        if preds.numel() <= 1:
+            return torch.zeros((), device=preds.device, dtype=preds.dtype)
+        loss_terms = []
+        for uid in torch.unique(unit_ids):
+            mask = unit_ids == uid
+            if int(mask.sum().item()) < 2:
+                continue
+            pr = preds[mask]
+            tr = trunc_ratio[mask]
+            order = torch.argsort(tr, dim=0)  # early -> late
+            pr_s = pr[order]
+            # adjacent differences
+            d = pr_s[:-1] - pr_s[1:]
+            loss_terms.append(torch.relu(float(margin) - d).mean())
+        if not loss_terms:
+            return torch.zeros((), device=preds.device, dtype=preds.dtype)
+        return torch.stack(loss_terms).mean()
+
+    def _rul_to_bucket_label(y: torch.Tensor, edges: list[float]) -> torch.Tensor:
+        """
+        Map RUL (cycles) to bucket label in [0, num_buckets-1].
+        Buckets defined by edges, e.g. [25,50,75,100,125] -> 6 buckets.
+        """
+        if y.dim() != 1:
+            y = y.view(-1)
+        b = torch.tensor(edges, device=y.device, dtype=y.dtype).view(1, -1)  # [1,E]
+        # label = count of edges where y >= edge
+        return torch.sum(y.view(-1, 1) >= b, dim=1).to(torch.int64)
     from src.models.transformer_eol import EOLFullTransformerEncoder
     
     # Use provided weights or fall back to config defaults
@@ -1612,6 +1806,13 @@ def train_eol_full_lstm(
     first_damage_debug_done = False
 
     for epoch in range(1, num_epochs + 1):
+        # If the training dataset is censoring-aware, set epoch so truncations vary deterministically.
+        try:
+            if hasattr(train_loader, "dataset") and hasattr(train_loader.dataset, "set_epoch"):
+                train_loader.dataset.set_epoch(epoch)
+        except Exception:
+            # Never break training because of epoch-setting logic.
+            pass
         # Training
         model.train()
         train_losses = []
@@ -1638,13 +1839,23 @@ def train_eol_full_lstm(
             # - 3 elements: X, y, unit_ids
             # - 2 elements: X, y (fallback)
             health_phys_seq_batch = None
-            if len(batch) == 5:
-                X_batch, y_batch, _, cond_ids_batch, health_phys_seq_batch = batch
+            unit_ids_batch = None
+            trunc_ratio_batch = None
+            if len(batch) == 8:
+                # (X, y, unit, cond, health_phys, trunc_ratio, cut_win, L_win)
+                X_batch, y_batch, unit_ids_batch, cond_ids_batch, health_phys_seq_batch, trunc_ratio_batch, _, _ = batch
+                cond_ids_batch = cond_ids_batch.to(device)
+            elif len(batch) == 7:
+                # (X, y, unit, cond, trunc_ratio, cut_win, L_win)
+                X_batch, y_batch, unit_ids_batch, cond_ids_batch, trunc_ratio_batch, _, _ = batch
+                cond_ids_batch = cond_ids_batch.to(device)
+            elif len(batch) == 5:
+                X_batch, y_batch, unit_ids_batch, cond_ids_batch, health_phys_seq_batch = batch
             elif len(batch) == 4:  # SequenceDatasetWithUnits with cond_ids
-                X_batch, y_batch, _, cond_ids_batch = batch
+                X_batch, y_batch, unit_ids_batch, cond_ids_batch = batch
                 cond_ids_batch = cond_ids_batch.to(device)
             elif len(batch) == 3:  # SequenceDatasetWithUnits without cond_ids (backward compat)
-                X_batch, y_batch, _ = batch
+                X_batch, y_batch, unit_ids_batch = batch
                 cond_ids_batch = torch.zeros(len(y_batch), dtype=torch.int64, device=device)
             else:  # Fallback für TensorDataset
                 X_batch, y_batch = batch
@@ -1653,6 +1864,11 @@ def train_eol_full_lstm(
             # Move health_phys_seq to device if present
             if health_phys_seq_batch is not None:
                 health_phys_seq_batch = health_phys_seq_batch.to(device)
+            if unit_ids_batch is None:
+                unit_ids_batch = torch.zeros(len(y_batch), dtype=torch.int64)
+            unit_ids_batch = unit_ids_batch.to(device)
+            if trunc_ratio_batch is not None:
+                trunc_ratio_batch = trunc_ratio_batch.to(device)
             
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
@@ -1678,10 +1894,14 @@ def train_eol_full_lstm(
                         cond_recon = None
                         rul_sigma = None
                         rul_quantiles_pred = None
+                        rul_bucket_logits = None
                         if use_condition_embedding:
                             if supports_cond_recon:
                                 out = model(X_batch, cond_ids=cond_ids_batch, return_aux=True)
-                                if isinstance(out, (tuple, list)) and len(out) == 7:
+                                if isinstance(out, (tuple, list)) and len(out) == 8:
+                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles_pred, rul_bucket_logits = out
+                                elif isinstance(out, (tuple, list)) and len(out) == 7:
+                                    # Older v5q contract: no bucket
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles_pred = out
                                 elif isinstance(out, (tuple, list)) and len(out) == 6:
                                     # Older v5u contract: no quantiles
@@ -1691,7 +1911,10 @@ def train_eol_full_lstm(
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                             else:
                                 out = model(X_batch, cond_ids=cond_ids_batch)
-                                if isinstance(out, (tuple, list)) and len(out) == 5:
+                                if isinstance(out, (tuple, list)) and len(out) == 6:
+                                    rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred, rul_bucket_logits = out
+                                elif isinstance(out, (tuple, list)) and len(out) == 5:
+                                    # Older v5q contract: no bucket
                                     rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred = out
                                 elif isinstance(out, (tuple, list)) and len(out) == 4:
                                     # Older v5u contract: no quantiles
@@ -1701,7 +1924,10 @@ def train_eol_full_lstm(
                         else:
                             if supports_cond_recon:
                                 out = model(X_batch, return_aux=True)
-                                if isinstance(out, (tuple, list)) and len(out) == 7:
+                                if isinstance(out, (tuple, list)) and len(out) == 8:
+                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles_pred, rul_bucket_logits = out
+                                elif isinstance(out, (tuple, list)) and len(out) == 7:
+                                    # Older v5q contract: no bucket
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles_pred = out
                                 elif isinstance(out, (tuple, list)) and len(out) == 6:
                                     # Older v5u contract: no quantiles
@@ -1711,7 +1937,10 @@ def train_eol_full_lstm(
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                             else:
                                 out = model(X_batch)
-                                if isinstance(out, (tuple, list)) and len(out) == 5:
+                                if isinstance(out, (tuple, list)) and len(out) == 6:
+                                    rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred, rul_bucket_logits = out
+                                elif isinstance(out, (tuple, list)) and len(out) == 5:
+                                    # Older v5q contract: no bucket
                                     rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred = out
                                 elif isinstance(out, (tuple, list)) and len(out) == 4:
                                     # Older v5u contract: no quantiles
@@ -1829,6 +2058,44 @@ def train_eol_full_lstm(
                                     p50 = q_pred[:, idx50]
                                     p50_mse = F.mse_loss(p50.view(-1), y_batch.view(-1))
                                     loss = loss + float(rul_quantile_p50_mse_weight) * p50_mse
+
+                            # --------------------------------------------------------------
+                            # NEW: Pairwise ranking loss across truncations of the same engine
+                            # --------------------------------------------------------------
+                            if (
+                                bool(use_ranking_loss)
+                                and float(lambda_rank) > 0.0
+                                and trunc_ratio_batch is not None
+                                and unit_ids_batch is not None
+                            ):
+                                mu_pred = (rul_pred.squeeze(-1) if rul_pred.dim() > 1 else rul_pred)
+                                rank_loss = _pairwise_rank_hinge_loss(
+                                    preds=mu_pred,
+                                    unit_ids=unit_ids_batch,
+                                    trunc_ratio=trunc_ratio_batch,
+                                    margin=float(rank_margin),
+                                )
+                                loss = loss + float(lambda_rank) * rank_loss
+                                if train_component_losses is not None:
+                                    train_component_losses.setdefault("rank_loss", []).append(float(rank_loss.item()))
+
+                            # --------------------------------------------------------------
+                            # NEW: RUL bucket head (auxiliary classification)
+                            # --------------------------------------------------------------
+                            if bool(use_bucket_head) and float(lambda_bucket) > 0.0:
+                                edges = rul_bucket_edges if rul_bucket_edges is not None else [
+                                    25.0, 50.0, 75.0, 100.0, float(max_rul)
+                                ]
+                                if rul_bucket_logits is None:
+                                    raise RuntimeError(
+                                        "use_bucket_head=True but model did not return bucket logits. "
+                                        "Enable use_bucket_head in encoder_kwargs."
+                                    )
+                                y_bucket = _rul_to_bucket_label(y_batch.view(-1), edges)
+                                bucket_loss = F.cross_entropy(rul_bucket_logits, y_bucket)
+                                loss = loss + float(lambda_bucket) * bucket_loss
+                                if train_component_losses is not None:
+                                    train_component_losses.setdefault("bucket_loss", []).append(float(bucket_loss.item()))
                         
                         # Late monotonicity loss (RUL <= beta)
                         if USE_HI_MONOTONICITY:
@@ -2669,7 +2936,8 @@ def train_eol_full_lstm(
                 phase_tag = "SinglePhase"
                 damage_weight_eff_epoch = damage_hi_weight
 
-            print(f"\n[DEBUG Loss-Balance] Epoch {epoch+1} ({phase_tag}):")
+            # NOTE: epoch is 1-based in this loop; do not print epoch+1 (confusing).
+            print(f"\n[DEBUG Loss-Balance] Epoch {epoch} ({phase_tag}):")
             print(f"  RUL Loss (scaled):        {train_rul_loss:.4f}")
             print(f"  HI Loss (standard):       {train_health_loss:.4f}")
             if damage_hi_weight > 0.0:
