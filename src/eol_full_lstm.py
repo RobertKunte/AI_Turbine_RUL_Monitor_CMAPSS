@@ -2348,15 +2348,15 @@ def train_eol_full_lstm(
                                     tr_use = trunc_ratio_batch
 
                                 if mu_pred_use is not None:
-                                rank_loss = _pairwise_rank_hinge_loss(
+                                    rank_loss = _pairwise_rank_hinge_loss(
                                         preds=mu_pred_use,
                                         unit_ids=uid_use,
                                         trunc_ratio=tr_use,
                                         margin=float(rank_margin),
-                                )
-                                loss = loss + float(lambda_rank) * rank_loss
-                                if train_component_losses is not None:
-                                    train_component_losses.setdefault("rank_loss", []).append(float(rank_loss.item()))
+                                    )
+                                    loss = loss + float(lambda_rank) * rank_loss
+                                    if train_component_losses is not None:
+                                        train_component_losses.setdefault("rank_loss", []).append(float(rank_loss.item()))
 
                             # --------------------------------------------------------------
                             # NEW: RUL bucket head (auxiliary classification)
