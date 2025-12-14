@@ -2393,8 +2393,12 @@ def train_eol_full_lstm(
                     if use_condition_embedding:
                         if supports_cond_recon:
                             out = model(X_batch, cond_ids=cond_ids_batch, return_aux=True)
-                            if isinstance(out, (tuple, list)) and len(out) == 7:
-                                # Fixed return_aux contract: (..., rul_sigma, rul_quantiles)
+                            if isinstance(out, (tuple, list)) and len(out) == 8:
+                                # Fixed return_aux + bucket:
+                                # (rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles, bucket_logits)
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 7:
+                                # Fixed return_aux (no bucket): (..., rul_sigma, rul_quantiles)
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _ = out
                             elif isinstance(out, (tuple, list)) and len(out) == 6:
                                 # Older v5u contract: (..., rul_sigma)
@@ -2402,18 +2406,36 @@ def train_eol_full_lstm(
                             else:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                         else:
-                            rul_pred, health_last, health_seq = model(X_batch, cond_ids=cond_ids_batch)
+                            out = model(X_batch, cond_ids=cond_ids_batch)
+                            if isinstance(out, (tuple, list)) and len(out) == 6:
+                                rul_pred, health_last, health_seq, _, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 5:
+                                rul_pred, health_last, health_seq, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 4:
+                                rul_pred, health_last, health_seq, _ = out
+                            else:
+                                rul_pred, health_last, health_seq = out
                     else:
                         if supports_cond_recon:
                             out = model(X_batch, return_aux=True)
-                            if isinstance(out, (tuple, list)) and len(out) == 7:
+                            if isinstance(out, (tuple, list)) and len(out) == 8:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 7:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _ = out
                             elif isinstance(out, (tuple, list)) and len(out) == 6:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _ = out
                             else:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                         else:
-                            rul_pred, health_last, health_seq = model(X_batch)
+                            out = model(X_batch)
+                            if isinstance(out, (tuple, list)) and len(out) == 6:
+                                rul_pred, health_last, health_seq, _, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 5:
+                                rul_pred, health_last, health_seq, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 4:
+                                rul_pred, health_last, health_seq, _ = out
+                            else:
+                                rul_pred, health_last, health_seq = out
                     
                     # Construct RUL sequence for RUL-weighted monotonicity
                     # y_batch: (batch,) - RUL at last step
@@ -2661,25 +2683,45 @@ def train_eol_full_lstm(
                     if use_condition_embedding:
                         if supports_cond_recon:
                             out = model(X_batch, cond_ids=cond_ids_batch, return_aux=True)
-                            if isinstance(out, (tuple, list)) and len(out) == 7:
+                            if isinstance(out, (tuple, list)) and len(out) == 8:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 7:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _ = out
                             elif isinstance(out, (tuple, list)) and len(out) == 6:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _ = out
                             else:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                         else:
-                            rul_pred, health_last, health_seq = model(X_batch, cond_ids=cond_ids_batch)
+                            out = model(X_batch, cond_ids=cond_ids_batch)
+                            if isinstance(out, (tuple, list)) and len(out) == 6:
+                                rul_pred, health_last, health_seq, _, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 5:
+                                rul_pred, health_last, health_seq, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 4:
+                                rul_pred, health_last, health_seq, _ = out
+                            else:
+                                rul_pred, health_last, health_seq = out
                     else:
                         if supports_cond_recon:
                             out = model(X_batch, return_aux=True)
-                            if isinstance(out, (tuple, list)) and len(out) == 7:
+                            if isinstance(out, (tuple, list)) and len(out) == 8:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 7:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _ = out
                             elif isinstance(out, (tuple, list)) and len(out) == 6:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _ = out
                             else:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                         else:
-                            rul_pred, health_last, health_seq = model(X_batch)
+                            out = model(X_batch)
+                            if isinstance(out, (tuple, list)) and len(out) == 6:
+                                rul_pred, health_last, health_seq, _, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 5:
+                                rul_pred, health_last, health_seq, _, _ = out
+                            elif isinstance(out, (tuple, list)) and len(out) == 4:
+                                rul_pred, health_last, health_seq, _ = out
+                            else:
+                                rul_pred, health_last, health_seq = out
                     
                     # Construct RUL sequence for RUL-weighted monotonicity
                     rul_last = y_batch.view(-1, 1)  # (batch, 1)
