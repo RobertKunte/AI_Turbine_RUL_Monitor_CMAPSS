@@ -1639,23 +1639,23 @@ def run_inference_for_experiment(
     except Exception as e:
         print(f"[WARNING] Failed to generate truncation scatter diagnostic: {e}")
 
-        # Optional: HI_cal_v2 sequence for Transformer encoder v4
-        hi_cal_seq = None
-        if (
-            return_hi_trajectories
-            and isinstance(model, EOLFullTransformerEncoder)
-            and getattr(model, "use_hi_cal_head", False)
-        ):
-            try:
-                enc_seq, _ = model.encode(
-                    X_split,
-                    cond_ids=cond_ids_tensor,
-                    return_seq=True,
-                )
-                hi_cal_seq = model.predict_hi_cal_seq(enc_seq)  # [B, T]
-            except Exception as e:  # pragma: no cover - defensive logging
-                print(f"[WARNING] Failed to compute HI_cal_v2 sequence for diagnostics: {e}")
-                hi_cal_seq = None
+    # Optional: HI_cal_v2 sequence for Transformer encoder v4/v5 (must always be defined)
+    hi_cal_seq = None
+    if (
+        return_hi_trajectories
+        and isinstance(model, EOLFullTransformerEncoder)
+        and getattr(model, "use_hi_cal_head", False)
+    ):
+        try:
+            enc_seq, _ = model.encode(
+                X_split,
+                cond_ids=cond_ids_tensor,
+                return_seq=True,
+            )
+            hi_cal_seq = model.predict_hi_cal_seq(enc_seq)  # [B, T]
+        except Exception as e:  # pragma: no cover - defensive logging
+            print(f"[WARNING] Failed to compute HI_cal_v2 sequence for diagnostics: {e}")
+            hi_cal_seq = None
     
     rul_pred = rul_pred.cpu().numpy().flatten()
     rul_sigma_np: Optional[np.ndarray] = None
