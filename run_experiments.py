@@ -1349,6 +1349,12 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         rul_quantiles=config["loss_params"].get("rul_quantiles", None),
         rul_quantile_cross_weight=config["loss_params"].get("rul_quantile_cross_weight", 0.0),
         rul_quantile_p50_mse_weight=config["loss_params"].get("rul_quantile_p50_mse_weight", 0.0),
+        # Quantile usability: upper-tail risk penalty + optional bias calibration
+        rul_risk_weight=float(config["loss_params"].get("lambda_risk", config["loss_params"].get("rul_risk_weight", 0.0))),
+        rul_risk_margin=float(config["loss_params"].get("risk_margin", config["loss_params"].get("rul_risk_margin", 0.0))),
+        rul_q50_bias_weight=float(config["loss_params"].get("lambda_q50_bias", config["loss_params"].get("rul_q50_bias_weight", 0.0))),
+        rul_bias_calibration_mode=str(config["loss_params"].get("bias_calibration_mode", config["loss_params"].get("rul_bias_calibration_mode", "off"))),
+        rul_bias_ema_beta=float(config["loss_params"].get("bias_ema_beta", config["loss_params"].get("rul_bias_ema_beta", 0.98))),
         # Censoring-aware: ranking loss on mu
         use_ranking_loss=bool(config.get("loss_params", {}).get("use_ranking_loss", True)),
         lambda_rank=float(config.get("loss_params", {}).get("lambda_rank", 0.1)),

@@ -129,7 +129,27 @@ def forward_rul_only(model: nn.Module, X: torch.Tensor, cond_ids: Optional[torch
             out = model(X)
     
     if isinstance(out, (tuple, list)):
-        rul_pred = out[0]  # First element is always RUL
+        # Default: first element is point prediction (mu).
+        # For quantile runs, prefer q50 as point prediction to match uncertainty-aware reporting.
+        rul_pred = out[0]
+        try:
+            # Non-aux contract: (rul_pred, hi_last, hi_seq, rul_sigma, rul_quantiles, ...)
+            if len(out) >= 5 and out[4] is not None and torch.is_tensor(out[4]) and out[4].dim() == 2:
+                q = out[4]  # [B,Q]
+                qs = getattr(model, "rul_quantiles", (0.1, 0.5, 0.9))
+                qs_t = torch.tensor(list(qs), device=q.device, dtype=q.dtype)
+                idx50 = int(torch.argmin(torch.abs(qs_t - 0.5)).item())
+                rul_pred = q[:, idx50]
+            # Aux contract: (..., rul_quantiles at index 6)
+            elif len(out) >= 7 and out[6] is not None and torch.is_tensor(out[6]) and out[6].dim() == 2:
+                q = out[6]
+                qs = getattr(model, "rul_quantiles", (0.1, 0.5, 0.9))
+                qs_t = torch.tensor(list(qs), device=q.device, dtype=q.dtype)
+                idx50 = int(torch.argmin(torch.abs(qs_t - 0.5)).item())
+                rul_pred = q[:, idx50]
+        except Exception:
+            # Never break inference due to quantile selection logic.
+            pass
     elif isinstance(out, dict):
         # Handle dict outputs (e.g. WorldModelUniversalV3)
         if "eol" in out:

@@ -771,10 +771,8 @@ class EOLFullTransformerEncoder(nn.Module):
             # Clamp to a plausible RUL range for stability (still in cycles)
             q_raw = torch.clamp(q_raw, min=0.0, max=float(self.max_rul))
             rul_quantiles_pred = q_raw
-            # Use the quantile closest to 0.5 as point prediction (P50)
-            qs = torch.tensor(self.rul_quantiles, device=q_raw.device, dtype=q_raw.dtype)
-            idx50 = int(torch.argmin(torch.abs(qs - 0.5)).item())
-            rul_pred = q_raw[:, idx50]
+            # Important: keep the primary point head (mu) intact.
+            # Point prediction selection (e.g., using q50) is handled in evaluation/inference helpers.
 
         # Censoring-aware: optional bucket logits
         rul_bucket_logits: Optional[torch.Tensor] = None

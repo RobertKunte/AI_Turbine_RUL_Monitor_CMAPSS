@@ -1758,6 +1758,12 @@ def train_eol_full_lstm(
     rul_quantiles: Optional[list[float]] = None,
     rul_quantile_cross_weight: float = 0.0,
     rul_quantile_p50_mse_weight: float = 0.0,
+    # NEW: quantile usability (risk + bias calibration)
+    rul_risk_weight: float = 0.0,
+    rul_risk_margin: float = 0.0,
+    rul_q50_bias_weight: float = 0.0,
+    rul_bias_calibration_mode: str = "off",  # off | batch_abs | ema
+    rul_bias_ema_beta: float = 0.98,
     # NEW: bucket head auxiliary loss (classification)
     use_bucket_head: bool = True,
     lambda_bucket: float = 0.1,
@@ -1817,6 +1823,10 @@ def train_eol_full_lstm(
         HI_GLOBAL_MONO_WEIGHT,
     )
     from src.loss import health_smoothness_loss
+    from src.losses.quantile import pinball_loss, non_crossing_penalty
+
+    # Optional EMA bias state (trainer-side, not in dataset/model)
+    ema_bias: Optional[torch.Tensor] = None
 
     def _save_cut_ratio_hist(cut_ratios: list[float], save_path: Path) -> None:
         if not cut_ratios:
@@ -2300,17 +2310,17 @@ def train_eol_full_lstm(
                                         f"but rul_quantiles has len={len(q_list)}"
                                     )
 
-                                y = y_batch.view(-1, 1)  # [B,1]
-                                u = y - q_pred  # [B,Q]
-                                qs = torch.tensor(q_list, device=q_pred.device, dtype=q_pred.dtype).view(1, -1)
-                                pinball = torch.maximum(qs * u, (qs - 1.0) * u).mean()
-                                loss = loss + float(rul_quantile_weight) * pinball
+                                pin = pinball_loss(y_true=y_batch, y_pred_q=q_pred, quantiles=q_list)
+                                loss = loss + float(rul_quantile_weight) * pin
+                                if train_component_losses is not None:
+                                    train_component_losses.setdefault("quantile_loss", []).append(float(pin.item()))
 
                                 # Optional: non-crossing penalty (sorted quantiles should be non-decreasing)
                                 if float(rul_quantile_cross_weight) > 0.0 and q_pred.size(1) >= 2:
-                                    diffs = q_pred[:, :-1] - q_pred[:, 1:]  # should be <= 0
-                                    cross_pen = torch.relu(diffs).mean()
+                                    cross_pen = non_crossing_penalty(q_pred)
                                     loss = loss + float(rul_quantile_cross_weight) * cross_pen
+                                    if train_component_losses is not None:
+                                        train_component_losses.setdefault("quantile_cross_pen", []).append(float(cross_pen.item()))
 
                                 # Optional: keep P50 close via MSE to stabilize (uses q closest to 0.5)
                                 if float(rul_quantile_p50_mse_weight) > 0.0:
@@ -2319,6 +2329,46 @@ def train_eol_full_lstm(
                                     p50 = q_pred[:, idx50]
                                     p50_mse = F.mse_loss(p50.view(-1), y_batch.view(-1))
                                     loss = loss + float(rul_quantile_p50_mse_weight) * p50_mse
+                                    if train_component_losses is not None:
+                                        train_component_losses.setdefault("q50_mse", []).append(float(p50_mse.item()))
+
+                                # NEW: Upper-tail risk penalty (punish optimistic outliers)
+                                if float(rul_risk_weight) > 0.0:
+                                    idx_upper = int(torch.argmax(q_arr).item())
+                                    q_upper = q_pred[:, idx_upper]
+                                    risk_violation = q_upper - y_batch.view(-1) - float(rul_risk_margin)
+                                    risk_loss = torch.relu(risk_violation).mean()
+                                    loss = loss + float(rul_risk_weight) * risk_loss
+                                    if train_component_losses is not None:
+                                        train_component_losses.setdefault("risk_loss", []).append(float(risk_loss.item()))
+                                        train_component_losses.setdefault(
+                                            "optimistic_violation_rate",
+                                            [],
+                                        ).append(float((risk_violation > 0.0).float().mean().item()))
+                                        train_component_losses.setdefault(
+                                            "optimistic_violation_rate_10",
+                                            [],
+                                        ).append(float((risk_violation > 10.0).float().mean().item()))
+
+                                # NEW: optional q50 bias calibration loss
+                                if float(rul_q50_bias_weight) > 0.0 and str(rul_bias_calibration_mode).lower() != "off":
+                                    bias_batch = (p50 - y_batch.view(-1)).mean()
+                                    mode = str(rul_bias_calibration_mode).lower()
+                                    if mode == "batch_abs":
+                                        bias_term = torch.abs(bias_batch)
+                                    elif mode == "ema":
+                                        if ema_bias is None:
+                                            ema_bias = torch.zeros((), device=bias_batch.device, dtype=bias_batch.dtype)
+                                        beta = float(rul_bias_ema_beta)
+                                        beta = max(0.0, min(0.999, beta))
+                                        ema_bias = beta * ema_bias + (1.0 - beta) * bias_batch.detach()
+                                        bias_term = torch.abs(ema_bias)
+                                    else:
+                                        bias_term = torch.abs(bias_batch)
+                                    loss = loss + float(rul_q50_bias_weight) * bias_term
+                                    if train_component_losses is not None:
+                                        train_component_losses.setdefault("q50_bias_batch", []).append(float(bias_batch.item()))
+                                        train_component_losses.setdefault("q50_bias_term", []).append(float(bias_term.item()))
 
                             # --------------------------------------------------------------
                             # NEW: Pairwise ranking loss across truncations of the same engine

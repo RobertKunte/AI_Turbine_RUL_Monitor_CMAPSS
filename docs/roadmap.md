@@ -81,6 +81,21 @@ This file is the living backlog. Each item includes **Goal**, **Artifacts**, **A
   - Regular vs aux sample fractions printed per epoch and match `aux_sample_ratio` approximately.
 - **Owner role**: **Planner**, **Implementer**, **Reviewer**, **Experimenter**
 
+### 7) Quantile usability: risk (upper-tail) penalty + optional bias calibration — **In Progress**
+- **Goal**: Reduce dangerous optimistic outliers first (tail risk), then address systematic bias, using quantiles (q10/q50/q90) + risk penalty + optional q50 bias-calibration loss.
+- **Artifacts**:
+  - `docs/decisions/ADR-0007-quantile-risk-penalty-and-bias-calibration.md`
+  - Plots under `results/fd004/<run>/`:
+    - `true_vs_pred_rul_q50.png`
+    - `true_vs_pred_rul_safe_q10.png`
+    - `risk_violation_hist_q_upper_minus_true.png`
+  - CSV: `top_optimistic_cases_q_upper_minus_true.csv`
+- **Acceptance criteria**:
+  - Backward compatible when quantile head is off.
+  - Risk diagnostics are generated and tail statistics are printed.
+  - No regressions in model loading (strict=True) or feature/scaler checks.
+- **Owner role**: **Planner**, **Implementer**, **Reviewer**, **Experimenter**
+
 ---
 
 ## Next (2–6 weeks)

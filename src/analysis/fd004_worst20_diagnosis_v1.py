@@ -1017,6 +1017,81 @@ def plot_quantile_coverage(
     print(f"[fd004_worst20] Saved quantile coverage: {save_path}")
 
 
+def plot_true_vs_pred_scatter_simple(
+    *,
+    x_true: np.ndarray,
+    y_pred: np.ndarray,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    save_path: Path,
+) -> None:
+    """Simple true-vs-pred scatter (one point per engine)."""
+    import matplotlib.pyplot as plt
+
+    m = np.isfinite(x_true) & np.isfinite(y_pred)
+    if not np.any(m):
+        print(f"[fd004_worst20] No finite points for {save_path.name} -> skipping.")
+        return
+
+    lo = float(np.nanmin(np.concatenate([x_true[m], y_pred[m]])))
+    hi = float(np.nanmax(np.concatenate([x_true[m], y_pred[m]])))
+    lo = max(0.0, lo)
+
+    plt.figure(figsize=(7, 6))
+    plt.scatter(x_true[m], y_pred[m], s=14, alpha=0.35)
+    plt.plot([lo, hi], [lo, hi], "r--", linewidth=2, label="y=x")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=250, bbox_inches="tight")
+    plt.close()
+    print(f"[fd004_worst20] Saved scatter: {save_path}")
+
+
+def plot_risk_violation_hist(
+    *,
+    df: pd.DataFrame,
+    q_upper_col: str,
+    true_col: str,
+    save_path: Path,
+    margin: float = 0.0,
+) -> None:
+    """Histogram of (q_upper - true - margin) to inspect optimistic tail risk."""
+    import matplotlib.pyplot as plt
+
+    d = df.copy()
+    q = pd.to_numeric(d.get(q_upper_col, np.nan), errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(d.get(true_col, np.nan), errors="coerce").to_numpy(dtype=float)
+    v = q - y - float(margin)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        print(f"[fd004_worst20] No finite risk values for {save_path.name} -> skipping.")
+        return
+
+    gt0 = float(np.mean(v > 0.0))
+    gt10 = float(np.mean(v > 10.0))
+    print(f"[fd004_worst20] Risk violation rates (q_upper-true-margin): >0={gt0:.3f}, >10={gt10:.3f}")
+
+    plt.figure(figsize=(7, 4))
+    plt.hist(v, bins=50, alpha=0.85, color="tab:red")
+    plt.axvline(0.0, color="k", linestyle="--", linewidth=2, label="0")
+    plt.xlabel(f"{q_upper_col} - {true_col} - margin")
+    plt.ylabel("count")
+    plt.title("Upper-tail optimism (risk) histogram\n(FD004 test / last observed cycle)")
+    plt.grid(True, alpha=0.25)
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=250, bbox_inches="tight")
+    plt.close()
+    print(f"[fd004_worst20] Saved risk histogram: {save_path}")
+
+
 def print_truncation_bucket_stats(eol_df: pd.DataFrame, worst_unit_ids: List[int]) -> None:
     """Bucket analysis by true_rul_last (eol_rul_true) for FD004 test."""
     df = eol_df.copy()
@@ -1378,7 +1453,59 @@ def main(run_name: str = RUN_NAME, dataset: str = DATASET) -> None:
         d_q["group"] = np.where(d_q["unit_id"].isin(worst_units), "worst20", "rest")
         d_q["true_last"] = pd.to_numeric(d_q.get("true_rul_last", d_q.get("eol_rul_true", np.nan)), errors="coerce")
         d_q["q10_last"] = pd.to_numeric(d_q.get("q10_last", np.nan), errors="coerce")
+        d_q["q50_last"] = pd.to_numeric(d_q.get("q50_last", np.nan), errors="coerce")
         d_q["q90_last"] = pd.to_numeric(d_q.get("q90_last", np.nan), errors="coerce")
+
+        # Additional scatters: q50 point + safe=q10
+        plot_true_vs_pred_scatter_simple(
+            x_true=d_q["true_last"].to_numpy(dtype=float),
+            y_pred=d_q["q50_last"].to_numpy(dtype=float),
+            title="True vs Pred (q50)\n(FD004 test / last observed cycle)",
+            xlabel="True RUL at last observed cycle",
+            ylabel="Predicted RUL (q50)",
+            save_path=results_dir / "true_vs_pred_rul_q50.png",
+        )
+        plot_true_vs_pred_scatter_simple(
+            x_true=d_q["true_last"].to_numpy(dtype=float),
+            y_pred=d_q["q10_last"].to_numpy(dtype=float),
+            title="True vs Pred (safe=q10)\n(FD004 test / last observed cycle)",
+            xlabel="True RUL at last observed cycle",
+            ylabel="Predicted RUL (safe q10)",
+            save_path=results_dir / "true_vs_pred_rul_safe_q10.png",
+        )
+
+        # Risk histogram + outlier CSV (optimistic tail)
+        plot_risk_violation_hist(
+            df=eol_df,
+            q_upper_col="q90_last",
+            true_col="true_rul_last",
+            save_path=results_dir / "risk_violation_hist_q_upper_minus_true.png",
+            margin=0.0,
+        )
+        try:
+            out = eol_df.copy()
+            out["q90_minus_true"] = (
+                pd.to_numeric(out.get("q90_last", np.nan), errors="coerce")
+                - pd.to_numeric(out.get("true_rul_last", np.nan), errors="coerce")
+            )
+            out = out[np.isfinite(out["q90_minus_true"])].sort_values("q90_minus_true", ascending=False).head(30)
+            cols = [
+                "unit_id",
+                "true_rul_last",
+                "eol_rul_pred",
+                "q10_last",
+                "q50_last",
+                "q90_last",
+                "q90_minus_true",
+                "cond_id",
+                "num_cycles",
+            ]
+            cols = [c for c in cols if c in out.columns]
+            csv_path = results_dir / "top_optimistic_cases_q_upper_minus_true.csv"
+            out[cols].to_csv(csv_path, index=False)
+            print(f"[fd004_worst20] Wrote optimistic outlier CSV: {csv_path}")
+        except Exception as e:
+            print(f"[fd004_worst20] WARNING: failed to write outlier CSV: {e}")
         d_q = d_q[np.isfinite(d_q["q10_last"]) & np.isfinite(d_q["q90_last"]) & np.isfinite(d_q["true_last"])].copy()
         if not d_q.empty:
             inside = (d_q["true_last"] >= d_q["q10_last"]) & (d_q["true_last"] <= d_q["q90_last"])

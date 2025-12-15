@@ -1809,6 +1809,35 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_censori
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_quantiles_risk_config() -> ExperimentConfig:
+    """
+    FD004 v5 (cond_norm) + multiview censoring + quantile head with risk/bias penalties.
+    Focus: reduce optimistic tail risk (q_upper > true) and then systematic bias.
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_censoring_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_quantiles_risk"
+
+    enc = cfg.setdefault("encoder_kwargs", {})
+    enc["use_rul_quantiles_head"] = True
+    enc["rul_quantiles"] = [0.1, 0.5, 0.9]
+
+    loss = cfg.setdefault("loss_params", {})
+    # Base quantile loss (pinball)
+    loss["rul_quantiles"] = [0.1, 0.5, 0.9]
+    loss["rul_quantile_weight"] = 1.0
+    loss.setdefault("rul_quantile_cross_weight", 0.1)
+    loss.setdefault("rul_quantile_p50_mse_weight", 0.0)
+
+    # NEW: risk + bias calibration (advisor naming)
+    loss["lambda_risk"] = 0.2
+    loss["risk_margin"] = 0.0
+    loss["lambda_q50_bias"] = 0.05
+    loss["bias_calibration_mode"] = "batch_abs"  # off|batch_abs|ema
+    loss["bias_ema_beta"] = 0.98
+
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
     """
     Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
@@ -3334,6 +3363,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_censoring_aware_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_censoring":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_censoring_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_quantiles_risk":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_quantiles_risk_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3e":
