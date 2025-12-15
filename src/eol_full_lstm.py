@@ -3560,8 +3560,8 @@ def train_eol_full_lstm(
                 f"train_loss: {train_loss:.4f}, val_loss: {val_loss:.4f}, "
                 f"val_RMSE: {val_rmse:.4f}, lr: {current_lr:.2e}"
             )
-        if val_loss < best_val_loss:
-            print(f"  --> New best val_loss: {val_loss:.4f}")
+        # Note: "best" is tracked via monitor_metric (scheduler + early stopping).
+        # Do not reference legacy best_val_loss here; it may not exist when monitor_metric != val_loss.
 
         # Early Stopping
         if epochs_no_improve >= patience:
@@ -3575,7 +3575,10 @@ def train_eol_full_lstm(
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         model.to(device)
-        print(f"[EOL-Full-LSTM] Loaded best model from epoch {best_epoch} with val_loss={best_val_loss:.4f}")
+        print(
+            f"[EOL-Full-LSTM] Loaded best model from epoch {best_epoch} "
+            f"with {monitor_metric}={best_monitor:.4f}"
+        )
 
     # Plot training curves
     plot_training_curves(history, results_dir / f"training_curves_{run_name}.png")
@@ -3583,7 +3586,7 @@ def train_eol_full_lstm(
     print("============================================================")
     print("[train_eol_full_lstm] Training Complete")
     print("============================================================")
-    print(f"Best val_loss: {best_val_loss:.4f} (at epoch {best_epoch})")
+    print(f"Best {monitor_metric}: {best_monitor:.4f} (at epoch {best_epoch})")
     print("============================================================")
 
     return model, history

@@ -183,6 +183,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     def _do_copy(label: str, src: Path, dst: Path) -> None:
         dst.mkdir(parents=True, exist_ok=True)
+        if not src.exists():
+            # Be permissive: in fresh Colab sessions the registry may point to a run_id
+            # whose local artifacts folder is not present. Do not fail the sync in that case.
+            print(f"[sync_artifacts] WARNING: source does not exist, skipping {label}: {src}")
+            return
         r = _copy_tree_only_newer(src, dst)
         results.append((label, src, dst, r))
 
