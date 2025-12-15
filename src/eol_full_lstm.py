@@ -1983,8 +1983,8 @@ def train_eol_full_lstm(
     # Mixed Precision Training (FP16) für weniger GPU-Memory
     use_amp = use_mixed_precision and torch.cuda.is_available()
     if use_amp:
-        from torch.cuda.amp import GradScaler
-        scaler = GradScaler()
+        # torch.cuda.amp.GradScaler is deprecated; use torch.amp.GradScaler
+        scaler = torch.amp.GradScaler("cuda")
         print("[train_eol_full_lstm] Mixed Precision Training (FP16) enabled - saves ~50% GPU memory")
     else:
         scaler = None
@@ -2310,6 +2310,11 @@ def train_eol_full_lstm(
                                         f"but rul_quantiles has len={len(q_list)}"
                                     )
 
+                                # Pre-compute common quantile indices (used by multiple optional terms below)
+                                q_arr = torch.tensor(q_list, device=q_pred.device, dtype=q_pred.dtype)  # [Q]
+                                idx50 = int(torch.argmin(torch.abs(q_arr - 0.5)).item())
+                                p50 = q_pred[:, idx50]
+
                                 pin = pinball_loss(y_true=y_batch, y_pred_q=q_pred, quantiles=q_list)
                                 loss = loss + float(rul_quantile_weight) * pin
                                 if train_component_losses is not None:
@@ -2324,9 +2329,6 @@ def train_eol_full_lstm(
 
                                 # Optional: keep P50 close via MSE to stabilize (uses q closest to 0.5)
                                 if float(rul_quantile_p50_mse_weight) > 0.0:
-                                    q_arr = torch.tensor(q_list, device=q_pred.device, dtype=q_pred.dtype)
-                                    idx50 = int(torch.argmin(torch.abs(q_arr - 0.5)).item())
-                                    p50 = q_pred[:, idx50]
                                     p50_mse = F.mse_loss(p50.view(-1), y_batch.view(-1))
                                     loss = loss + float(rul_quantile_p50_mse_weight) * p50_mse
                                     if train_component_losses is not None:
