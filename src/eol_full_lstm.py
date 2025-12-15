@@ -1772,6 +1772,9 @@ def train_eol_full_lstm(
     use_bucket_head: bool = False,
     lambda_bucket: float = 0.1,
     rul_bucket_edges: Optional[list[float]] = None,
+    # NEW: choose which validation metric drives LR scheduling + early stopping.
+    # Default remains val_loss for full backward compatibility.
+    monitor_metric: str = "val_loss",  # val_loss | val_rmse | val_rul_loss_unscaled | val_rul_loss
     # NEW: censoring-aware training stabilizers
     use_ranking_loss: bool = True,
     lambda_rank: float = 0.1,
@@ -1999,7 +2002,8 @@ def train_eol_full_lstm(
     if damage_phase2_smooth_weight is None:
         damage_phase2_smooth_weight = 0.03
 
-    best_val_loss = float("inf")
+    monitor_metric = str(monitor_metric or "val_loss").strip().lower()
+    best_monitor = float("inf")
     best_epoch = -1
     epochs_no_improve = 0
     best_model_state = None
@@ -2009,6 +2013,8 @@ def train_eol_full_lstm(
         "val_loss": [],
         "val_rmse": [],
         "lr": [],
+        "monitor_metric": monitor_metric,
+        "monitor_value": [],
     }
     
     # Add health-specific logging if in multi-task mode
@@ -3297,6 +3303,21 @@ def train_eol_full_lstm(
         history["val_loss"].append(val_loss)
         history["val_rmse"].append(val_rmse)
         history["lr"].append(current_lr)
+
+        # Select monitor value (minimized) for scheduler + early stopping
+        if monitor_metric == "val_loss":
+            monitor_value = float(val_loss)
+        elif monitor_metric == "val_rmse":
+            monitor_value = float(val_rmse)
+        elif monitor_metric == "val_rul_loss_unscaled":
+            monitor_value = float(val_rul_loss_unscaled) if use_health_head else float(val_loss)
+        elif monitor_metric == "val_rul_loss":
+            monitor_value = float(val_rul_loss) if use_health_head else float(val_loss)
+        else:
+            print(f"[train_eol_full_lstm] WARNING: unknown monitor_metric='{monitor_metric}', falling back to val_loss")
+            monitor_metric = "val_loss"
+            monitor_value = float(val_loss)
+        history["monitor_value"].append(float(monitor_value))
         
         if use_health_head:
             history["train_rul_loss_unscaled"].append(train_rul_loss_unscaled)
@@ -3463,12 +3484,12 @@ def train_eol_full_lstm(
                 # Silent fail to avoid breaking training
                 pass
 
-        # Scheduler
-        scheduler.step(val_loss)
+        # Scheduler (minimizes monitor_value)
+        scheduler.step(monitor_value)
 
         # Best Model Tracking & Early Stopping
-        if val_loss < best_val_loss - 1e-6:
-            best_val_loss = val_loss
+        if monitor_value < best_monitor - 1e-6:
+            best_monitor = float(monitor_value)
             best_epoch = epoch
             epochs_no_improve = 0
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -3504,7 +3525,8 @@ def train_eol_full_lstm(
             checkpoint = {
                 "model_state_dict": best_model_state,
                 "epoch": best_epoch,
-                "val_loss": best_val_loss,
+                # keep legacy field name for compatibility; value depends on monitor_metric
+                "val_loss": best_monitor,
                 "meta": {
                     "input_dim": input_dim_meta,
                     "num_conditions": num_conditions_meta,

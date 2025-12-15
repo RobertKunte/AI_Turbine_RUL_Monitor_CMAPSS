@@ -1865,6 +1865,11 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residua
     loss.setdefault("low_rul_threshold", 20.0)
     loss.setdefault("overshoot_threshold", 20.0)
 
+    # Critical: this run should NOT early-stop on val_loss (dominated by HI/damage),
+    # otherwise μ can collapse while val_loss looks "good".
+    training = cfg.setdefault("training_params", {})
+    training.setdefault("monitor_metric", "val_rmse")
+
     return cfg
 
 

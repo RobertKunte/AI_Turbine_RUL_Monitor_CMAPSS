@@ -1362,6 +1362,8 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         use_residual_risk_head=bool(encoder_kwargs.get("use_residual_risk_head", False)),
         residual_risk_tau=float(config["loss_params"].get("risk_tau", 0.90)),
         residual_risk_weight=float(config["loss_params"].get("lambda_residual_risk", config["loss_params"].get("lambda_risk", 0.0))),
+        # Training monitor metric (scheduler + early stopping)
+        monitor_metric=str(training_cfg.get("monitor_metric", "val_loss")),
         # Censoring-aware: ranking loss on mu
         use_ranking_loss=bool(config.get("loss_params", {}).get("use_ranking_loss", True)),
         lambda_rank=float(config.get("loss_params", {}).get("lambda_rank", 0.1)),
