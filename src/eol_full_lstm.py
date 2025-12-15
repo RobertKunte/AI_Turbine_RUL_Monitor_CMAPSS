@@ -78,6 +78,81 @@ def log_damage_head_gradients(model: nn.Module, logger=print, prefix: str = "[DE
     return grads
 
 
+def _debug_p2_sanity_enabled() -> bool:
+    """
+    Enable heavy sanity prints for diagnosing Phase-1 -> Phase-2 scale/grad mismatches.
+    Guarded by env var DEBUG_P2_SANITY=1 (or true/yes).
+    """
+    v = os.getenv("DEBUG_P2_SANITY", "0").strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+def _tensor_stats_dict(x: torch.Tensor) -> Dict[str, Any]:
+    # Robust stats helper for debug printing (handles fp16/bf16 safely).
+    with torch.no_grad():
+        x_det = x.detach()
+        x_f = x_det.float().view(-1)
+        if x_f.numel() == 0:
+            return {
+                "shape": tuple(x_det.shape),
+                "dtype": str(x_det.dtype),
+                "min": None,
+                "max": None,
+                "mean": None,
+                "std": None,
+                "nan_frac": None,
+                "inf_frac": None,
+            }
+        nan_frac = float(torch.isnan(x_f).float().mean().item())
+        inf_frac = float(torch.isinf(x_f).float().mean().item())
+        # Replace NaNs/Infs for finite stats to avoid exceptions
+        x_safe = torch.nan_to_num(x_f, nan=0.0, posinf=0.0, neginf=0.0)
+        return {
+            "shape": tuple(x_det.shape),
+            "dtype": str(x_det.dtype),
+            "min": float(x_safe.min().item()),
+            "max": float(x_safe.max().item()),
+            "mean": float(x_safe.mean().item()),
+            "std": float(x_safe.std(unbiased=False).item()),
+            "nan_frac": nan_frac,
+            "inf_frac": inf_frac,
+        }
+
+
+def _print_tensor_stats(label: str, x: torch.Tensor) -> None:
+    s = _tensor_stats_dict(x)
+    print(
+        f"[DEBUG_P2_SANITY] {label}: shape={s['shape']} dtype={s['dtype']} "
+        f"min={s['min']} max={s['max']} mean={s['mean']} std={s['std']} "
+        f"nan_frac={s['nan_frac']} inf_frac={s['inf_frac']}"
+    )
+
+
+def _grad_group_stats(model: nn.Module, name_predicate) -> Dict[str, Any]:
+    """
+    Summarize gradients for params selected by name_predicate(name)->bool.
+    Returns count of params, count with grads, and mean L2 grad norm (over params with grads).
+    """
+    norms: list[float] = []
+    num_params = 0
+    num_with_grad = 0
+    for n, p in model.named_parameters():
+        if not name_predicate(n):
+            continue
+        num_params += 1
+        if p.grad is None:
+            continue
+        num_with_grad += 1
+        g = p.grad.detach()
+        norms.append(float(g.float().norm(2).item()))
+    mean_norm = float(np.mean(norms)) if norms else 0.0
+    return {
+        "num_params": num_params,
+        "num_with_grad": num_with_grad,
+        "mean_l2_grad_norm": mean_norm,
+    }
+
+
 def build_full_eol_sequences_from_df(
     df: pd.DataFrame,
     feature_cols: list[str],
@@ -2003,6 +2078,24 @@ def train_eol_full_lstm(
         damage_phase2_smooth_weight = 0.03
 
     monitor_metric = str(monitor_metric or "val_loss").strip().lower()
+
+    # ------------------------------------------------------------------
+    # Debug instrumentation (guarded; no behavior change unless enabled)
+    # ------------------------------------------------------------------
+    debug_p2_sanity = _debug_p2_sanity_enabled()
+    if damage_two_phase and int(damage_warmup_epochs) > 0:
+        debug_epochs = {
+            int(damage_warmup_epochs),
+            int(damage_warmup_epochs) + 1,
+            int(damage_warmup_epochs) + 2,
+        }
+    else:
+        # Backward-compatible default matching the advisor suggestion.
+        debug_epochs = {10, 11, 12}
+    _debug_state = {
+        "val_batch_printed_epochs": set(),
+        "train_grad_printed_epochs": set(),
+    }
     best_monitor = float("inf")
     best_epoch = -1
     epochs_no_improve = 0
@@ -2400,15 +2493,17 @@ def train_eol_full_lstm(
                                         "use_residual_risk_head=True but model did not return rul_risk_q. "
                                         "Enable use_residual_risk_head in encoder_kwargs."
                                     )
-                                tau = float(residual_risk_tau)
-                                tau = min(0.999, max(0.001, tau))
+                                # IMPORTANT: do NOT overwrite the RUL loss `tau` (cycles scale).
+                                # This tau is the *quantile* parameter for the residual-risk pinball loss.
+                                risk_tau = float(residual_risk_tau)
+                                risk_tau = min(0.999, max(0.001, risk_tau))
                                 # Stop-grad through mu to protect mean predictor
                                 mu_det = (rul_pred.squeeze(-1) if rul_pred.dim() > 1 else rul_pred).detach()
                                 overshoot = torch.relu(mu_det - y_batch.view(-1))
                                 q = rul_risk_q.view(-1)
                                 # pinball(q, y, tau) = max(tau*(y-q), (1-tau)*(q-y))
                                 u = overshoot - q
-                                risk_pinball = torch.maximum(tau * u, (1.0 - tau) * (-u)).mean()
+                                risk_pinball = torch.maximum(risk_tau * u, (1.0 - risk_tau) * (-u)).mean()
                                 loss = loss + float(residual_risk_weight) * risk_pinball
                                 if train_component_losses is not None:
                                     train_component_losses.setdefault("residual_risk_loss", []).append(float(risk_pinball.item()))
@@ -2971,6 +3066,32 @@ def train_eol_full_lstm(
                     loss_components = None
                 loss.backward()
 
+                # --------------------------------------------------------------
+                # DEBUG_P2_SANITY: grad flow check after backward (first train batch)
+                # --------------------------------------------------------------
+                if (
+                    debug_p2_sanity
+                    and int(epoch) in debug_epochs
+                    and batch_idx == 0
+                    and int(epoch) not in _debug_state["train_grad_printed_epochs"]
+                ):
+                    _debug_state["train_grad_printed_epochs"].add(int(epoch))
+                    # Report grads for encoder and RUL head (best-effort via name heuristics).
+                    enc_stats = _grad_group_stats(
+                        model,
+                        lambda n: n.startswith("encoder.") or ".encoder." in n,
+                    )
+                    rul_stats = _grad_group_stats(
+                        model,
+                        lambda n: ("fc_rul" in n.lower())
+                        or ("rul" in n.lower() and "bucket" not in n.lower() and "risk" not in n.lower()),
+                    )
+                    print(
+                        f"[DEBUG_P2_SANITY] epoch={epoch} train_batch=0 "
+                        f"loss={float(loss.detach().item()):.6f} "
+                        f"encoder_grads={enc_stats} rul_head_grads={rul_stats}"
+                    )
+
                 # Debug: log damage-head gradients for first few batches of epoch 1
                 if epoch == 1 and batch_idx < 3:
                     log_damage_head_gradients(
@@ -3110,6 +3231,55 @@ def train_eol_full_lstm(
                     offsets = torch.arange(seq_len - 1, -1, -1, device=y_batch.device).float()  # (seq_len,)
                     rul_seq_batch = rul_last + offsets  # broadcast to (batch, seq_len)
                     rul_seq_batch = torch.clamp(rul_seq_batch, 0.0, float(max_rul))
+
+                    # ----------------------------------------------------------
+                    # DEBUG_P2_SANITY: print stats for first val batch in key epochs
+                    # ----------------------------------------------------------
+                    if (
+                        debug_p2_sanity
+                        and int(epoch) in debug_epochs
+                        and batch_idx == 0
+                        and int(epoch) not in _debug_state["val_batch_printed_epochs"]
+                    ):
+                        _debug_state["val_batch_printed_epochs"].add(int(epoch))
+                        try:
+                            from src.config import RUL_LOSS_SCALE as _RUL_LOSS_SCALE  # type: ignore
+                        except Exception:
+                            _RUL_LOSS_SCALE = 1.0 / 125.0
+
+                        pred_mu = (rul_pred.squeeze(-1) if rul_pred.dim() > 1 else rul_pred).detach()
+                        y_rul = y_batch.detach()
+                        pred_mu_clamped = torch.clamp(pred_mu, min=0.0, max=float(max_rul))
+
+                        y_flat = y_rul.view(-1).float()
+                        mu_clamped_flat = pred_mu_clamped.view(-1).float()
+                        mu_raw_flat = pred_mu.view(-1).float()
+
+                        w = torch.exp(-y_flat / float(tau))
+                        err2_clamped = (mu_clamped_flat - y_flat) ** 2
+                        weighted_mse = (w * err2_clamped).mean()
+                        rmse_raw = torch.sqrt(((mu_raw_flat - y_flat) ** 2).mean())
+                        rmse_clamped = torch.sqrt(err2_clamped.mean())
+                        frac_capped = float((y_flat >= float(max_rul) - 1e-6).float().mean().item())
+
+                        print(
+                            f"[DEBUG_P2_SANITY] epoch={epoch} val_batch=0 "
+                            f"damage_two_phase={bool(damage_two_phase)} warmup_epochs={int(damage_warmup_epochs)}"
+                        )
+                        print(
+                            f"[DEBUG_P2_SANITY] RUL loss path: weights=exp(-rul_true/tau), "
+                            f"tau={float(tau)} max_rul={float(max_rul)} RUL_LOSS_SCALE={float(_RUL_LOSS_SCALE)}"
+                        )
+                        _print_tensor_stats("y_rul", y_rul)
+                        _print_tensor_stats("pred_rul_mu_raw", pred_mu)
+                        _print_tensor_stats("pred_rul_mu_clamped", pred_mu_clamped)
+                        _print_tensor_stats("rul_seq_last_timestep", rul_seq_batch[:, -1])
+                        _print_tensor_stats("weights_exp(-y/tau)", w)
+                        print(
+                            f"[DEBUG_P2_SANITY] batch_metrics: "
+                            f"rmse_raw={float(rmse_raw.item()):.6f} rmse_clamped={float(rmse_clamped.item()):.6f} "
+                            f"weighted_mse(clamped)={float(weighted_mse.item()):.6f} frac_y_at_max_rul={frac_capped:.4f}"
+                        )
                     
                     # --- DEBUG: Run monotonicity debug helper on first batch of first epoch ---
                     if epoch == 1 and batch_idx == 0:
