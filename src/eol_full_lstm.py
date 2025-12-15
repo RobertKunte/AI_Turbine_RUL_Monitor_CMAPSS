@@ -1764,8 +1764,12 @@ def train_eol_full_lstm(
     rul_q50_bias_weight: float = 0.0,
     rul_bias_calibration_mode: str = "off",  # off | batch_abs | ema
     rul_bias_ema_beta: float = 0.98,
+    # NEW (risk v2): residual risk head (overshoot quantile) for safe_RUL
+    use_residual_risk_head: bool = False,
+    residual_risk_tau: float = 0.90,
+    residual_risk_weight: float = 0.10,
     # NEW: bucket head auxiliary loss (classification)
-    use_bucket_head: bool = True,
+    use_bucket_head: bool = False,
     lambda_bucket: float = 0.1,
     rul_bucket_edges: Optional[list[float]] = None,
     # NEW: censoring-aware training stabilizers
@@ -2166,10 +2170,13 @@ def train_eol_full_lstm(
                         rul_sigma = None
                         rul_quantiles_pred = None
                         rul_bucket_logits = None
+                        rul_risk_q = None
                         if use_condition_embedding:
                             if supports_cond_recon:
                                 out = model(X_batch, cond_ids=cond_ids_batch, return_aux=True)
-                                if isinstance(out, (tuple, list)) and len(out) == 8:
+                                if isinstance(out, (tuple, list)) and len(out) == 9:
+                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles_pred, rul_bucket_logits, rul_risk_q = out
+                                elif isinstance(out, (tuple, list)) and len(out) == 8:
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles_pred, rul_bucket_logits = out
                                 elif isinstance(out, (tuple, list)) and len(out) == 7:
                                     # Older v5q contract: no bucket
@@ -2182,7 +2189,9 @@ def train_eol_full_lstm(
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                             else:
                                 out = model(X_batch, cond_ids=cond_ids_batch)
-                                if isinstance(out, (tuple, list)) and len(out) == 6:
+                                if isinstance(out, (tuple, list)) and len(out) == 7:
+                                    rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred, rul_bucket_logits, rul_risk_q = out
+                                elif isinstance(out, (tuple, list)) and len(out) == 6:
                                     rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred, rul_bucket_logits = out
                                 elif isinstance(out, (tuple, list)) and len(out) == 5:
                                     # Older v5q contract: no bucket
@@ -2195,7 +2204,9 @@ def train_eol_full_lstm(
                         else:
                             if supports_cond_recon:
                                 out = model(X_batch, return_aux=True)
-                                if isinstance(out, (tuple, list)) and len(out) == 8:
+                                if isinstance(out, (tuple, list)) and len(out) == 9:
+                                    rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles_pred, rul_bucket_logits, rul_risk_q = out
+                                elif isinstance(out, (tuple, list)) and len(out) == 8:
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles_pred, rul_bucket_logits = out
                                 elif isinstance(out, (tuple, list)) and len(out) == 7:
                                     # Older v5q contract: no bucket
@@ -2208,7 +2219,9 @@ def train_eol_full_lstm(
                                     rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                             else:
                                 out = model(X_batch)
-                                if isinstance(out, (tuple, list)) and len(out) == 6:
+                                if isinstance(out, (tuple, list)) and len(out) == 7:
+                                    rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred, rul_bucket_logits, rul_risk_q = out
+                                elif isinstance(out, (tuple, list)) and len(out) == 6:
                                     rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred, rul_bucket_logits = out
                                 elif isinstance(out, (tuple, list)) and len(out) == 5:
                                     # Older v5q contract: no bucket
@@ -2371,6 +2384,28 @@ def train_eol_full_lstm(
                                     if train_component_losses is not None:
                                         train_component_losses.setdefault("q50_bias_batch", []).append(float(bias_batch.item()))
                                         train_component_losses.setdefault("q50_bias_term", []).append(float(bias_term.item()))
+
+                            # --------------------------------------------------------------
+                            # NEW (risk v2): residual risk head (overshoot quantile) for safe_RUL
+                            # --------------------------------------------------------------
+                            if bool(use_residual_risk_head) and float(residual_risk_weight) > 0.0:
+                                if rul_risk_q is None or (not torch.is_tensor(rul_risk_q)):
+                                    raise RuntimeError(
+                                        "use_residual_risk_head=True but model did not return rul_risk_q. "
+                                        "Enable use_residual_risk_head in encoder_kwargs."
+                                    )
+                                tau = float(residual_risk_tau)
+                                tau = min(0.999, max(0.001, tau))
+                                # Stop-grad through mu to protect mean predictor
+                                mu_det = (rul_pred.squeeze(-1) if rul_pred.dim() > 1 else rul_pred).detach()
+                                overshoot = torch.relu(mu_det - y_batch.view(-1))
+                                q = rul_risk_q.view(-1)
+                                # pinball(q, y, tau) = max(tau*(y-q), (1-tau)*(q-y))
+                                u = overshoot - q
+                                risk_pinball = torch.maximum(tau * u, (1.0 - tau) * (-u)).mean()
+                                loss = loss + float(residual_risk_weight) * risk_pinball
+                                if train_component_losses is not None:
+                                    train_component_losses.setdefault("residual_risk_loss", []).append(float(risk_pinball.item()))
 
                             # --------------------------------------------------------------
                             # NEW: Pairwise ranking loss across truncations of the same engine

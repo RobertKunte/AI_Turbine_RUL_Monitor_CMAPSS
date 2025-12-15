@@ -13,7 +13,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 
 # ============================================================
@@ -95,6 +95,23 @@ def infer_dataset_from_run_name(run_name: str) -> Optional[str]:
     if rn.startswith("fd004"):
         return "FD004"
     return None
+
+
+def normalize_run_name(run_name: str) -> str:
+    """
+    RUN_NAMES should contain only experiment names.
+    Users sometimes paste CLI fragments like: "<name> --device cuda".
+    We strip anything after the first whitespace to avoid:
+      - running the wrong experiment (fallback routing)
+      - passing garbage into sync_artifacts (--run_name)
+    """
+    rn = str(run_name).strip()
+    if not rn:
+        return rn
+    parts = rn.split()
+    if len(parts) > 1:
+        print(f"[colab] WARNING: RUN_NAMES entry contains extra tokens; using '{parts[0]}' and ignoring: {' '.join(parts[1:])}")
+    return parts[0]
 
 
 def copy_results_run_from_drive(run_name: str) -> None:
@@ -259,6 +276,7 @@ def main() -> None:
         raise RuntimeError("RUN_NAMES is empty. Please add at least one experiment name.")
 
     for idx, run_name in enumerate(RUN_NAMES, 1):
+        run_name = normalize_run_name(run_name)
         print("\n" + "=" * 70)
         print(f"[Run {idx}/{len(RUN_NAMES)}] {run_name}")
         print("=" * 70)

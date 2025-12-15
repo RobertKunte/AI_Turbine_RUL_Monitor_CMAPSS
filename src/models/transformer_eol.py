@@ -275,6 +275,9 @@ class EOLFullTransformerEncoder(nn.Module):
         # NEW (v5q): optional quantile head for RUL at last observed cycle
         use_rul_quantiles_head: bool = False,
         rul_quantiles: Tuple[float, ...] = (0.1, 0.5, 0.9),
+        # NEW (risk): residual quantile risk head (predicts overshoot quantile; inference derives safe_RUL)
+        use_residual_risk_head: bool = False,
+        residual_risk_hidden_dim: int = 128,
         # NEW (censoring-aware): auxiliary RUL bucket head
         use_bucket_head: bool = False,
         rul_bucket_edges: Tuple[float, ...] = (25.0, 50.0, 75.0, 100.0, 125.0),
@@ -313,6 +316,10 @@ class EOLFullTransformerEncoder(nn.Module):
         # v5q: quantile head flags
         self.use_rul_quantiles_head: bool = bool(use_rul_quantiles_head)
         self.rul_quantiles: Tuple[float, ...] = tuple(float(q) for q in rul_quantiles)
+
+        # Residual risk head flags
+        self.use_residual_risk_head: bool = bool(use_residual_risk_head)
+        self.residual_risk_hidden_dim: int = int(residual_risk_hidden_dim)
 
         # Censoring-aware: bucket head flags
         self.use_bucket_head: bool = bool(use_bucket_head)
@@ -416,6 +423,18 @@ class EOLFullTransformerEncoder(nn.Module):
             self.fc_rul_quantiles = nn.Linear(rul_in_dim, q_dim)
         else:
             self.fc_rul_quantiles = None
+
+        # NEW: residual risk head (scalar per sample)
+        self.fc_rul_residual_risk: Optional[nn.Module]
+        if self.use_residual_risk_head:
+            h = max(8, int(self.residual_risk_hidden_dim))
+            self.fc_rul_residual_risk = nn.Sequential(
+                nn.Linear(rul_in_dim, h),
+                nn.ReLU(),
+                nn.Linear(h, 1),
+            )
+        else:
+            self.fc_rul_residual_risk = None
         # Censoring-aware: bucket logits from same RUL input representation (optional)
         self.fc_rul_bucket: Optional[nn.Linear]
         if self.use_bucket_head:
@@ -780,6 +799,12 @@ class EOLFullTransformerEncoder(nn.Module):
             bucket_input = quantile_input if quantile_input is not None else shared
             rul_bucket_logits = self.fc_rul_bucket(bucket_input)  # [B, num_buckets]
 
+        # Residual risk prediction (scalar per sample; semantics handled in training/inference)
+        rul_risk_q: Optional[torch.Tensor] = None
+        if self.use_residual_risk_head and self.fc_rul_residual_risk is not None:
+            risk_input = quantile_input if quantile_input is not None else shared
+            rul_risk_q = self.fc_rul_residual_risk(risk_input).squeeze(-1)  # [B]
+
         if return_aux:
             return (
                 rul_pred,
@@ -790,8 +815,9 @@ class EOLFullTransformerEncoder(nn.Module):
                 rul_sigma,
                 rul_quantiles_pred,
                 rul_bucket_logits,
+                rul_risk_q,
             )
-        return rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred, rul_bucket_logits
+        return rul_pred, health_last, health_seq, rul_sigma, rul_quantiles_pred, rul_bucket_logits, rul_risk_q
 
     # ------------------------------------------------------------------
     # Encoder-side helper for world models

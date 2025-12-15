@@ -1139,6 +1139,9 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             # v5q: optional quantile head for RUL at last observed cycle
             use_rul_quantiles_head=encoder_kwargs.get("use_rul_quantiles_head", False),
             rul_quantiles=tuple(encoder_kwargs.get("rul_quantiles", (0.1, 0.5, 0.9))),
+            # risk: residual quantile risk head (overshoot)
+            use_residual_risk_head=encoder_kwargs.get("use_residual_risk_head", False),
+            residual_risk_hidden_dim=int(encoder_kwargs.get("residual_risk_hidden_dim", 128)),
             # Censoring-aware: optional bucket head for RUL
             use_bucket_head=encoder_kwargs.get("use_bucket_head", False),
             rul_bucket_edges=tuple(encoder_kwargs.get("rul_bucket_edges", (25.0, 50.0, 75.0, 100.0, 125.0))),
@@ -1355,14 +1358,18 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         rul_q50_bias_weight=float(config["loss_params"].get("lambda_q50_bias", config["loss_params"].get("rul_q50_bias_weight", 0.0))),
         rul_bias_calibration_mode=str(config["loss_params"].get("bias_calibration_mode", config["loss_params"].get("rul_bias_calibration_mode", "off"))),
         rul_bias_ema_beta=float(config["loss_params"].get("bias_ema_beta", config["loss_params"].get("rul_bias_ema_beta", 0.98))),
+        # Residual risk head (safe_RUL): predict overshoot quantile and subtract in inference
+        use_residual_risk_head=bool(encoder_kwargs.get("use_residual_risk_head", False)),
+        residual_risk_tau=float(config["loss_params"].get("risk_tau", 0.90)),
+        residual_risk_weight=float(config["loss_params"].get("lambda_residual_risk", config["loss_params"].get("lambda_risk", 0.0))),
         # Censoring-aware: ranking loss on mu
         use_ranking_loss=bool(config.get("loss_params", {}).get("use_ranking_loss", True)),
         lambda_rank=float(config.get("loss_params", {}).get("lambda_rank", 0.1)),
         rank_margin=float(config.get("loss_params", {}).get("rank_margin", 1.0)),
-        # Censoring-aware: bucket head loss
-        use_bucket_head=bool(config.get("loss_params", {}).get("use_bucket_head", True)),
+        # Censoring-aware: bucket head loss (must match model construction; default OFF for backward compatibility)
+        use_bucket_head=bool(encoder_kwargs.get("use_bucket_head", False)),
         lambda_bucket=float(config.get("loss_params", {}).get("lambda_bucket", 0.1)),
-        rul_bucket_edges=config.get("loss_params", {}).get("rul_bucket_edges", None),
+        rul_bucket_edges=encoder_kwargs.get("rul_bucket_edges", None),
     )
     
     # ===================================================================

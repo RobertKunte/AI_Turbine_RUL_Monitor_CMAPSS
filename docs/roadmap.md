@@ -96,6 +96,22 @@ This file is the living backlog. Each item includes **Goal**, **Artifacts**, **A
   - No regressions in model loading (strict=True) or feature/scaler checks.
 - **Owner role**: **Planner**, **Implementer**, **Reviewer**, **Experimenter**
 
+### 8) Residual quantile risk head for safe RUL (μ + overshoot-qτ) — **In Progress**
+- **Goal**: Preserve mean RUL performance (μ) while reducing dangerous overestimation outliers via an auxiliary head that predicts an upper quantile of overshoot residual (overestimation error).
+- **Artifacts**:
+  - `docs/decisions/ADR-0008-residual-quantile-risk-head.md`
+  - Plots under `results/fd004/<run>/`:
+    - `true_vs_pred_mu.png`
+    - `true_vs_pred_safe.png`
+    - `overshoot_hist_mu_vs_safe.png`
+    - `risk_quantile_coverage.png`
+  - JSON metrics: `overshoot_metrics_mu_vs_safe.json`
+- **Acceptance criteria**:
+  - Backward compatible when `use_residual_risk_head=False` (no behavior change).
+  - For `true_rul_last <= 20`, safe_RUL reduces overshoot rate/p95 vs μ.
+  - Mean metrics (RMSE/NASA) do not catastrophically degrade.
+- **Owner role**: **Planner**, **Implementer**, **Reviewer**, **Experimenter**
+
 ---
 
 ## Next (2–6 weeks)

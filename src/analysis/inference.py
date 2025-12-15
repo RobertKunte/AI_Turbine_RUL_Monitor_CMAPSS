@@ -57,6 +57,7 @@ class EngineEOLMetrics:
     q10: Optional[float] = None
     q50: Optional[float] = None
     q90: Optional[float] = None
+    risk_q: Optional[float] = None  # predicted overshoot quantile (residual risk head), if available
 
 
 @dataclass
@@ -721,6 +722,7 @@ def load_model_from_experiment(
         has_rul_sigma_head = any(k.endswith("fc_rul_log_sigma.weight") for k in keys)
         has_rul_quantiles_head = any(k.endswith("fc_rul_quantiles.weight") for k in keys)
         has_rul_bucket_head = any(k.endswith("fc_rul_bucket.weight") for k in keys)
+        has_residual_risk_head = any(k.startswith("fc_rul_residual_risk.") for k in keys)
         fc_rul_key = next((k for k in keys if k.endswith("fc_rul.weight")), None)
         fc_rul_in = state_dict[fc_rul_key].shape[1] if fc_rul_key is not None else d_model
 
@@ -768,6 +770,13 @@ def load_model_from_experiment(
         else:
             rul_bucket_edges_tuple = (25.0, 50.0, 75.0, 100.0, 125.0)
 
+        # Residual risk head: detect optional head from checkpoint keys (strict-load gate)
+        use_residual_risk_head = bool(config.get("use_residual_risk_head", has_residual_risk_head))
+        rr_hidden_cfg = config.get("residual_risk_hidden_dim")
+        if rr_hidden_cfg is None and has_residual_risk_head and "fc_rul_residual_risk.0.weight" in state_dict:
+            rr_hidden_cfg = int(state_dict["fc_rul_residual_risk.0.weight"].shape[0])
+        residual_risk_hidden_dim = int(rr_hidden_cfg or 128)
+
         model = EOLFullTransformerEncoder(
             input_dim=input_dim,
             d_model=d_model,
@@ -809,6 +818,9 @@ def load_model_from_experiment(
             # v5q: quantiles head
             use_rul_quantiles_head=use_rul_quantiles_head,
             rul_quantiles=rul_quantiles_tuple,
+            # risk: residual risk head
+            use_residual_risk_head=use_residual_risk_head,
+            residual_risk_hidden_dim=residual_risk_hidden_dim,
             # Censoring-aware: bucket head
             use_bucket_head=use_bucket_head,
             rul_bucket_edges=rul_bucket_edges_tuple,
@@ -1584,6 +1596,7 @@ def run_inference_for_experiment(
             hi_seq = None
             rul_sigma_pred = None
             rul_quantiles_pred = None
+            rul_risk_q_pred = None
             
             if isinstance(outputs, dict):
                 # V3 output format
@@ -1606,13 +1619,22 @@ def run_inference_for_experiment(
                     # Fixed contract (v5u/v5q + bucket): (rul_pred, hi_last, hi_seq, rul_sigma, rul_quantiles, bucket_logits)
                     _, hi_last, hi_seq, rul_sigma_pred, rul_quantiles_pred, _ = outputs
                 elif len(outputs) == 7:
-                    # Fixed return_aux contract:
-                    # (rul_pred, hi_last, hi_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles)
-                    _, hi_last, hi_seq, _, _, rul_sigma_pred, rul_quantiles_pred = outputs
+                    # Ambiguous length-7 contract:
+                    # - Non-aux (risk): (rul_pred, hi_last, hi_seq, rul_sigma, rul_quantiles, bucket_logits, rul_risk_q)
+                    # - Aux (older):    (rul_pred, hi_last, hi_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles)
+                    # Disambiguate by checking whether outputs[3] looks like cond_seq_avg (2D tensor).
+                    if torch.is_tensor(outputs[3]) and outputs[3].dim() == 2:
+                        _, hi_last, hi_seq, _, _, rul_sigma_pred, rul_quantiles_pred = outputs
+                    else:
+                        _, hi_last, hi_seq, rul_sigma_pred, rul_quantiles_pred, _, rul_risk_q_pred = outputs
                 elif len(outputs) == 8:
                     # Fixed return_aux + bucket:
                     # (rul_pred, hi_last, hi_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles, bucket_logits)
                     _, hi_last, hi_seq, _, _, rul_sigma_pred, rul_quantiles_pred, _ = outputs
+                elif len(outputs) == 9:
+                    # Fixed return_aux + bucket + residual risk:
+                    # (rul_pred, hi_last, hi_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles, bucket_logits, rul_risk_q)
+                    _, hi_last, hi_seq, _, _, rul_sigma_pred, rul_quantiles_pred, _, rul_risk_q_pred = outputs
             
             # Post-process hi_seq if present
             if hi_seq is not None and torch.is_tensor(hi_seq):
@@ -1686,6 +1708,13 @@ def run_inference_for_experiment(
                 q90_np = q_np[:, idx90].astype(np.float32)
     except Exception:
         q10_np, q50_np, q90_np = None, None, None
+
+    risk_q_np: Optional[np.ndarray] = None
+    try:
+        if "rul_risk_q_pred" in locals() and rul_risk_q_pred is not None and torch.is_tensor(rul_risk_q_pred):
+            risk_q_np = rul_risk_q_pred.detach().cpu().numpy().flatten().astype(np.float32)
+    except Exception:
+        risk_q_np = None
     
     # Apply RUL capping (same as evaluate_on_test_data)
     # Get max_rul from config (default 125)
@@ -1755,6 +1784,7 @@ def run_inference_for_experiment(
             q10=float(q10_np[i]) if q10_np is not None else None,
             q50=float(q50_np[i]) if q50_np is not None else None,
             q90=float(q90_np[i]) if q90_np is not None else None,
+            risk_q=float(risk_q_np[i]) if risk_q_np is not None else None,
         ))
         
         # Build trajectory if requested
@@ -1874,7 +1904,113 @@ def run_inference_for_experiment(
                 hi_damage=hi_traj,
                 hi_cal=hi_cal_traj,
             )
-    
+
+    # ------------------------------------------------------------------
+    # Residual risk head diagnostics: mu vs safe, overshoot stats, coverage
+    # ------------------------------------------------------------------
+    try:
+        if risk_q_np is not None and np.isfinite(risk_q_np).any():
+            # FD004 wording: last observed cycle
+            low_thr = float(config.get("low_rul_threshold", config.get("loss_params", {}).get("low_rul_threshold", 20.0)))
+            over_thr = float(config.get("overshoot_threshold", config.get("loss_params", {}).get("overshoot_threshold", 20.0)))
+            tau = float(config.get("risk_tau", config.get("loss_params", {}).get("risk_tau", 0.90)))
+            tau = min(0.999, max(0.001, tau))
+
+            y_true = true_vals_capped.astype(np.float32)
+            mu = rul_pred.astype(np.float32)
+            risk_pred = np.maximum(0.0, risk_q_np.astype(np.float32))
+            safe = np.clip(mu - risk_pred, 0.0, float(max_rul))
+
+            overshoot_mu = mu - y_true
+            overshoot_safe = safe - y_true
+            low_mask = np.isfinite(y_true) & (y_true <= low_thr)
+
+            def _summ(arr: np.ndarray, mask: np.ndarray) -> dict:
+                a = arr[np.isfinite(arr) & mask]
+                if a.size == 0:
+                    return {"n": 0}
+                return {
+                    "n": int(a.size),
+                    "mean": float(np.mean(a)),
+                    "p95": float(np.percentile(a, 95)),
+                    "max": float(np.max(a)),
+                    "rate_gt_thr": float(np.mean(a > over_thr)),
+                }
+
+            metrics = {
+                "low_rul_threshold": low_thr,
+                "overshoot_threshold": over_thr,
+                "risk_tau": tau,
+                "overshoot_mu_low": _summ(overshoot_mu, low_mask),
+                "overshoot_safe_low": _summ(overshoot_safe, low_mask),
+                "overshoot_mu_all": _summ(overshoot_mu, np.isfinite(y_true)),
+                "overshoot_safe_all": _summ(overshoot_safe, np.isfinite(y_true)),
+                "coverage_all": float(np.mean((overshoot_mu <= risk_pred) & np.isfinite(overshoot_mu))),
+                "coverage_low": float(np.mean((overshoot_mu[low_mask] <= risk_pred[low_mask]) & np.isfinite(overshoot_mu[low_mask]))) if np.any(low_mask) else float("nan"),
+            }
+
+            out_path = experiment_dir / "overshoot_metrics_mu_vs_safe.json"
+            with open(out_path, "w") as f:
+                json.dump(metrics, f, indent=2)
+            print(f"[INFO] Wrote {out_path}")
+
+            import matplotlib.pyplot as plt
+
+            # Scatter: true vs mu
+            def _scatter(x, y, title, save_name):
+                m = np.isfinite(x) & np.isfinite(y)
+                if not np.any(m):
+                    return
+                lo = float(np.nanmin(np.concatenate([x[m], y[m]])))
+                hi = float(np.nanmax(np.concatenate([x[m], y[m]])))
+                lo = max(0.0, lo)
+                plt.figure(figsize=(7, 6))
+                plt.scatter(x[m], y[m], s=12, alpha=0.35)
+                plt.plot([lo, hi], [lo, hi], "k--", linewidth=1)
+                plt.xlabel("True RUL at last observed cycle")
+                plt.ylabel("Predicted RUL")
+                plt.title(title)
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(experiment_dir / save_name, dpi=200)
+                plt.close()
+
+            _scatter(y_true, mu, "True vs Pred (μ)\n(last observed cycle / right-censored)", "true_vs_pred_mu.png")
+            _scatter(y_true, safe, "True vs Pred (safe = μ - risk)\n(last observed cycle / right-censored)", "true_vs_pred_safe.png")
+
+            # Histogram: overshoot distributions
+            plt.figure(figsize=(8, 4))
+            v1 = overshoot_mu[np.isfinite(overshoot_mu)]
+            v2 = overshoot_safe[np.isfinite(overshoot_safe)]
+            plt.hist(v1, bins=60, alpha=0.5, label="μ overshoot", color="tab:blue")
+            plt.hist(v2, bins=60, alpha=0.5, label="safe overshoot", color="tab:orange")
+            plt.axvline(0.0, color="k", linestyle="--", linewidth=1)
+            plt.xlabel("overshoot = pred - true (cycles)")
+            plt.ylabel("count")
+            plt.title("Overshoot histogram: μ vs safe\n(last observed cycle / right-censored)")
+            plt.legend()
+            plt.grid(True, alpha=0.25)
+            plt.tight_layout()
+            plt.savefig(experiment_dir / "overshoot_hist_mu_vs_safe.png", dpi=200)
+            plt.close()
+
+            # Coverage bar plot (overall + low bucket)
+            cov_all = metrics["coverage_all"]
+            cov_low = metrics["coverage_low"]
+            plt.figure(figsize=(6, 4))
+            plt.bar([0, 1], [cov_all, cov_low], tick_label=["all", f"true<= {low_thr:g}"])
+            plt.axhline(tau, color="k", linestyle="--", linewidth=1, label=f"target τ={tau:.2f}")
+            plt.ylim(0.0, 1.0)
+            plt.ylabel("P( overshoot(μ) <= risk_pred )")
+            plt.title("Residual risk quantile coverage\n(last observed cycle / right-censored)")
+            plt.legend()
+            plt.grid(True, alpha=0.25, axis="y")
+            plt.tight_layout()
+            plt.savefig(experiment_dir / "risk_quantile_coverage.png", dpi=200)
+            plt.close()
+    except Exception as e:
+        print(f"[WARNING] Residual risk diagnostics failed: {e}")
+
     return eol_metrics, trajectories
 
 

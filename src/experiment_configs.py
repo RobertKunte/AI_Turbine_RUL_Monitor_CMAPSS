@@ -1838,6 +1838,36 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_quantil
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_config() -> ExperimentConfig:
+    """
+    FD004 v5 (cond_norm) + multiview censoring + residual risk head.
+
+    Strategy:
+      - Keep μ as the primary head (MSE training unchanged)
+      - Add a separate head predicting an upper quantile of overshoot residual
+      - Derive safe_RUL = clamp(μ - relu(risk_q), 0, max_rul) in inference
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_censoring_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk"
+
+    enc = cfg.setdefault("encoder_kwargs", {})
+    enc["use_residual_risk_head"] = True
+    enc.setdefault("residual_risk_hidden_dim", 128)
+
+    # Ensure direct RUL quantiles are OFF for this experiment (explicit safety layer instead)
+    enc["use_rul_quantiles_head"] = False
+
+    loss = cfg.setdefault("loss_params", {})
+    loss["risk_tau"] = 0.90
+    loss["lambda_residual_risk"] = 0.10
+
+    # Diagnostics knobs (inference-only; safe defaults)
+    loss.setdefault("low_rul_threshold", 20.0)
+    loss.setdefault("overshoot_threshold", 20.0)
+
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
     """
     Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
@@ -3365,6 +3395,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_censoring_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_quantiles_risk":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_quantiles_risk_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3e":
