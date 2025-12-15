@@ -3064,12 +3064,10 @@ def train_eol_full_lstm(
                     if use_condition_embedding:
                         if supports_cond_recon:
                             out = model(X_batch, cond_ids=cond_ids_batch, return_aux=True)
-                            if isinstance(out, (tuple, list)) and len(out) == 8:
-                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _, _ = out
-                            elif isinstance(out, (tuple, list)) and len(out) == 7:
-                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _ = out
-                            elif isinstance(out, (tuple, list)) and len(out) == 6:
-                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _ = out
+                            if isinstance(out, (tuple, list)) and len(out) >= 5:
+                                # Forward contracts may append extra fields (sigma/quantiles/bucket/risk).
+                                # For validation loss we only need the first 5.
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out[:5]
                             else:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                         else:
@@ -3085,12 +3083,8 @@ def train_eol_full_lstm(
                     else:
                         if supports_cond_recon:
                             out = model(X_batch, return_aux=True)
-                            if isinstance(out, (tuple, list)) and len(out) == 8:
-                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _, _ = out
-                            elif isinstance(out, (tuple, list)) and len(out) == 7:
-                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _, _ = out
-                            elif isinstance(out, (tuple, list)) and len(out) == 6:
-                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon, _ = out
+                            if isinstance(out, (tuple, list)) and len(out) >= 5:
+                                rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out[:5]
                             else:
                                 rul_pred, health_last, health_seq, cond_seq_avg, cond_recon = out
                         else:

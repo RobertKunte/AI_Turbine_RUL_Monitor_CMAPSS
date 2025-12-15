@@ -134,6 +134,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--run_id", type=str, default=None, help="Explicit run_id")
     parser.add_argument("--run_name", type=str, default=None, help="Resolve run_id via registry by experiment_name")
     parser.add_argument("--latest", action="store_true", help="Use latest run in registry")
+    # Tolerate older Colab cells that accidentally pass training flags through.
+    parser.add_argument("--device", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--what",
         type=str,
@@ -141,7 +143,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         choices=["artifacts", "results", "both"],
         help="What to sync: artifacts (artifacts/runs/<run_id>), results (results/<dataset>/<run_name>), or both",
     )
-    args = parser.parse_args(argv)
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        # Be permissive: the sync tool should not fail because of irrelevant flags.
+        print(f"[sync_artifacts] WARNING: ignoring unknown args: {unknown}")
 
     if args.push == args.pull:
         raise SystemExit("Must specify exactly one of --push or --pull")
