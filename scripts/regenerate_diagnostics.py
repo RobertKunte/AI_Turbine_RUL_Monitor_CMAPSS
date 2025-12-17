@@ -167,6 +167,60 @@ def main() -> None:
         device=device,
     )
 
+    # Post-check: ensure summary.json and eol_metrics.json agree (same folder truth).
+    def _load_json(p: Path) -> dict:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+    eol_after = _load_json(run_dir / "eol_metrics.json")
+    summary_after = _load_json(run_dir / "summary.json")
+
+    def _pick_metrics_from_eol(eol: dict) -> dict:
+        keys = ["rmse", "mae", "bias", "r2", "nasa_mean", "nasa_sum", "num_engines"]
+        out = {}
+        for k in keys:
+            if k in eol:
+                out[k] = eol[k]
+        meta = eol.get("_meta")
+        if isinstance(meta, dict):
+            out["_meta.generated_git_sha"] = meta.get("generated_git_sha")
+            out["_meta.generated_at_utc"] = meta.get("generated_at_utc")
+        return out
+
+    def _pick_metrics_from_summary(s: dict) -> dict:
+        tm = s.get("test_metrics", {})
+        out = dict(tm) if isinstance(tm, dict) else {}
+        dm = s.get("diagnostics_meta")
+        if isinstance(dm, dict):
+            out["diagnostics_meta.generated_git_sha"] = dm.get("generated_git_sha")
+            out["diagnostics_meta.generated_at_utc"] = dm.get("generated_at_utc")
+        sm = s.get("_meta")
+        if isinstance(sm, dict):
+            out["summary._meta.generated_git_sha"] = sm.get("generated_git_sha")
+        return out
+
+    eol_m = _pick_metrics_from_eol(eol_after)
+    sum_m = _pick_metrics_from_summary(summary_after)
+
+    print("\n=== regenerate_diagnostics (post-check) ===")
+    print("eol_metrics.json:", eol_m)
+    print("summary.json:test_metrics:", sum_m)
+
+    # Hard check for the core metrics (tolerate float formatting)
+    for k in ["rmse", "mae", "bias", "r2", "nasa_mean", "nasa_sum"]:
+        a = eol_after.get(k)
+        b = (summary_after.get("test_metrics") or {}).get(k)
+        if a is None or b is None:
+            continue
+        try:
+            if abs(float(a) - float(b)) > 1e-6:
+                raise SystemExit(
+                    f"[ERROR] Metrics mismatch after regeneration for key '{k}': "
+                    f"eol_metrics.json={a} vs summary.json:test_metrics={b}. "
+                    f"Run dir: {run_dir}"
+                )
+        except Exception:
+            pass
+
     print("Done. Regenerated diagnostics in:", run_dir)
 
 
