@@ -1948,6 +1948,9 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residua
     loss["risk_low_weight"] = 20.0
     loss.setdefault("low_rul_threshold", 20.0)
     loss.setdefault("overshoot_threshold", 20.0)
+    # Training budget: allow up to 120 epochs (early stopping still applies).
+    train = cfg.setdefault("training_params", {})
+    train["num_epochs"] = 120
     return cfg
 
 
