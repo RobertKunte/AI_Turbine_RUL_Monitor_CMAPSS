@@ -1497,6 +1497,31 @@ def run_inference_for_experiment(
         num_conditions=num_conditions,
     )
 
+    # ------------------------------------------------------------------
+    # CRITICAL: restore runtime feature-index attributes for Transformer v2/v5
+    # ------------------------------------------------------------------
+    # These indices are not in state_dict but affect predictions (cond encoder + condition normalizer).
+    try:
+        from src.models.transformer_eol import EOLFullTransformerEncoder
+        from src.additional_features import group_feature_columns
+
+        if isinstance(model, EOLFullTransformerEncoder):
+            cond_idx = [i for i, c in enumerate(feature_cols) if c.startswith("Cond_")]
+            if getattr(model, "use_cond_encoder", False) and getattr(model, "cond_in_dim", 0) > 0:
+                if len(cond_idx) == int(getattr(model, "cond_in_dim", 0)):
+                    model.cond_feature_indices = torch.as_tensor(cond_idx, dtype=torch.long, device=device)
+
+            if getattr(model, "use_condition_normalizer", False):
+                groups = group_feature_columns(feature_cols)
+                residual_cols = set(groups.get("residual", []))
+                sens_idx = [i for i, c in enumerate(feature_cols) if c in residual_cols]
+                if len(sens_idx) > 0:
+                    model.sensor_feature_indices_for_norm = torch.as_tensor(sens_idx, dtype=torch.long, device=device)
+                    if hasattr(model, "set_condition_normalizer_dims") and len(cond_idx) > 0:
+                        model.set_condition_normalizer_dims(cond_dim=len(cond_idx), sensor_dim=len(sens_idx))
+    except Exception as e:
+        print(f"[inference] WARNING: Could not restore transformer feature indices: {e}")
+
     # Second safety check: ensure model.input_dim (if present) matches the
     # feature dimensionality used by the inference pipeline.
     check_feature_dimensions(

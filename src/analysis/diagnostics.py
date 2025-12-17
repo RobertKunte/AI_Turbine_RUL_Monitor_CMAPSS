@@ -1903,6 +1903,38 @@ def run_diagnostics_for_run(
             model=model,
             context="diagnostics",
         )
+
+        # ------------------------------------------------------------------
+        # CRITICAL: restore runtime feature-index attributes for Transformer v2/v5
+        # ------------------------------------------------------------------
+        # Some transformer variants rely on `cond_feature_indices` (Cond_* positions)
+        # and `sensor_feature_indices_for_norm` (residual sensor positions) which are
+        # NOT part of the state_dict. Training code sets them at init time, but
+        # loading from checkpoint does not. If missing, diagnostics can produce
+        # different (often much worse) test metrics than the training script.
+        try:
+            from src.models.transformer_eol import EOLFullTransformerEncoder
+
+            if isinstance(model, EOLFullTransformerEncoder):
+                # Cond_* indices for continuous condition encoder
+                cond_idx = [i for i, c in enumerate(feature_cols) if c.startswith("Cond_")]
+                if getattr(model, "use_cond_encoder", False) and getattr(model, "cond_in_dim", 0) > 0:
+                    if len(cond_idx) == int(getattr(model, "cond_in_dim", 0)):
+                        model.cond_feature_indices = torch.as_tensor(cond_idx, dtype=torch.long, device=device)
+
+                # Residual sensor indices for condition normalizer (v5)
+                if getattr(model, "use_condition_normalizer", False):
+                    groups = group_feature_columns(feature_cols)
+                    residual_cols = set(groups.get("residual", []))
+                    sens_idx = [i for i, c in enumerate(feature_cols) if c in residual_cols]
+                    if len(sens_idx) > 0:
+                        model.sensor_feature_indices_for_norm = torch.as_tensor(sens_idx, dtype=torch.long, device=device)
+                        # Initialise condition normalizer dims if possible
+                        if hasattr(model, "set_condition_normalizer_dims") and len(cond_idx) > 0:
+                            model.set_condition_normalizer_dims(cond_dim=len(cond_idx), sensor_dim=len(sens_idx))
+        except Exception as e:
+            print(f"[diagnostics] WARNING: Could not restore transformer feature indices: {e}")
+
         test_metrics_diag = evaluate_on_test_data(
             model=model,
             df_test=df_test_fe,
