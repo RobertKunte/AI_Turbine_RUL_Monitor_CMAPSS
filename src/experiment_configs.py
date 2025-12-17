@@ -1873,6 +1873,48 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residua
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau90_w1_config() -> ExperimentConfig:
+    """
+    Residual-risk sweep A1:
+      - risk_tau = 0.90 (baseline quantile)
+      - lambda_residual_risk = 1.0 (stronger learning signal for risk head)
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau90_w1"
+    loss = cfg.setdefault("loss_params", {})
+    loss["risk_tau"] = 0.90
+    loss["lambda_residual_risk"] = 1.0
+    return cfg
+
+
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_config() -> ExperimentConfig:
+    """
+    Residual-risk sweep A2:
+      - risk_tau = 0.95 (target ~95% coverage)
+      - lambda_residual_risk = 1.0
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1"
+    loss = cfg.setdefault("loss_params", {})
+    loss["risk_tau"] = 0.95
+    loss["lambda_residual_risk"] = 1.0
+    return cfg
+
+
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau99_w2_config() -> ExperimentConfig:
+    """
+    Residual-risk sweep A3:
+      - risk_tau = 0.99 (target ~99% coverage; very conservative)
+      - lambda_residual_risk = 2.0 (stronger weight to learn extreme quantile)
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau99_w2"
+    loss = cfg.setdefault("loss_params", {})
+    loss["risk_tau"] = 0.99
+    loss["lambda_residual_risk"] = 2.0
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v3c_mlp_two_phase_tuned_config() -> ExperimentConfig:
     """
     Tuned version of v3c: stronger Phase-1 damage warmup and slightly higher
@@ -3402,6 +3444,12 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_quantiles_risk_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau90_w1":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau90_w1_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau99_w2":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau99_w2_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3e":
