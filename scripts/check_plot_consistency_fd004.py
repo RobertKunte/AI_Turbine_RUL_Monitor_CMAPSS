@@ -168,7 +168,9 @@ def main() -> None:
         experiment_dir=run_dir,
         split="test",
         device=device,
-        return_hi_trajectories=False,
+        # Must be True for residual-risk runs: risk_q is only extracted from the full forward output,
+        # which is only executed when return_hi_trajectories=True in run_inference_for_experiment.
+        return_hi_trajectories=True,
     )
     # Sort by unit_id for deterministic arrays
     eol_sorted = sorted(eol_metrics_inf, key=lambda m: int(m.unit_id))
