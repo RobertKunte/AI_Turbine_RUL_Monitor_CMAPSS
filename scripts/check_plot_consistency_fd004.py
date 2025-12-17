@@ -77,8 +77,15 @@ def _plot_overlay_hist(
     plt.figure(figsize=(9, 4.5))
     va = a[np.isfinite(a)]
     vb = b[np.isfinite(b)]
-    plt.hist(va, bins=bins, alpha=0.55, label=label_a, color="tab:blue")
-    plt.hist(vb, bins=bins, alpha=0.55, label=label_b, color="tab:orange")
+    # Use shared bin edges so overlays are visually comparable.
+    v_all = np.concatenate([va, vb]) if (va.size + vb.size) > 0 else np.array([0.0])
+    lo = float(np.nanmin(v_all))
+    hi = float(np.nanmax(v_all))
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+        lo, hi = -1.0, 1.0
+    edges = np.linspace(lo, hi, int(bins) + 1)
+    plt.hist(va, bins=edges, alpha=0.55, label=label_a, color="tab:blue")
+    plt.hist(vb, bins=edges, alpha=0.55, label=label_b, color="tab:orange")
     plt.axvline(0.0, color="k", linestyle="--", linewidth=1)
     plt.title(title)
     plt.xlabel(xlabel)

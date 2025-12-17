@@ -1957,26 +1957,47 @@ def run_inference_for_experiment(
             import matplotlib.pyplot as plt
 
             # Scatter: true vs mu
-            def _scatter(x, y, title, save_name):
+            def _scatter_like_diagnostics(x, y, title, save_name):
+                """
+                Match the exact style of src/analysis/diagnostics.py:plot_true_vs_pred_scatter
+                so that `true_vs_pred_mu.png` / `true_vs_pred_safe.png` look identical
+                to `true_vs_pred.png` when points are identical.
+                """
                 m = np.isfinite(x) & np.isfinite(y)
                 if not np.any(m):
                     return
-                lo = float(np.nanmin(np.concatenate([x[m], y[m]])))
-                hi = float(np.nanmax(np.concatenate([x[m], y[m]])))
-                lo = max(0.0, lo)
-                plt.figure(figsize=(7, 6))
-                plt.scatter(x[m], y[m], s=12, alpha=0.35)
-                plt.plot([lo, hi], [lo, hi], "k--", linewidth=1)
-                plt.xlabel("True RUL at last observed cycle")
-                plt.ylabel("Predicted RUL")
-                plt.title(title)
-                plt.grid(True, alpha=0.3)
-                plt.tight_layout()
-                plt.savefig(experiment_dir / save_name, dpi=200)
-                plt.close()
+                # Deterministic draw order to avoid visual differences from overplotting
+                xm = np.asarray(x[m], dtype=float)
+                ym = np.asarray(y[m], dtype=float)
+                order = np.argsort(xm, kind="mergesort")
+                xm = xm[order]
+                ym = ym[order]
 
-            _scatter(y_true, mu, "True vs Pred (μ)\n(last observed cycle / right-censored)", "true_vs_pred_mu.png")
-            _scatter(y_true, safe, "True vs Pred (safe = μ - risk)\n(last observed cycle / right-censored)", "true_vs_pred_safe.png")
+                fig, ax = plt.subplots(figsize=(8, 8))
+                ax.scatter(xm, ym, alpha=0.5, s=20)
+                ax.plot([0, float(max_rul)], [0, float(max_rul)], "r--", linewidth=2, label="Perfect prediction")
+                ax.set_xlabel("True RUL [cycles]")
+                ax.set_ylabel("Predicted RUL [cycles]")
+                ax.set_title(title)
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                ax.set_aspect("equal", adjustable="box")
+                plt.tight_layout()
+                plt.savefig(experiment_dir / save_name, dpi=300, bbox_inches="tight")
+                plt.close(fig)
+
+            _scatter_like_diagnostics(
+                y_true,
+                mu,
+                "True vs Pred (μ)\n(last observed cycle / right-censored)",
+                "true_vs_pred_mu.png",
+            )
+            _scatter_like_diagnostics(
+                y_true,
+                safe,
+                "True vs Pred (safe = μ - risk)\n(last observed cycle / right-censored)",
+                "true_vs_pred_safe.png",
+            )
 
             # Histogram: overshoot distributions
             plt.figure(figsize=(8, 4))
