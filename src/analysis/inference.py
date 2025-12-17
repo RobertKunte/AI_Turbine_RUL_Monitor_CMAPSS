@@ -1378,66 +1378,33 @@ def run_inference_for_experiment(
         cycle_col="TimeInCycles",
     )
     
-    # Create true_rul_dict based on the order of unit_ids_split
-    # CRITICAL: y_test_true from load_cmapps_subset is in the same order as
-    # the engines appear in the RUL file. The RUL file contains RUL values
-    # in the order that engines first appear in the test data file.
-    # build_test_sequences_from_df uses df_test[unit_col].unique() which returns
-    # units in the order of first appearance, so the order should match.
-    # However, to be safe, we use the actual order from unit_ids_split after
-    # build_test_sequences_from_df has been called.
+    # Align y_test_true to unit_ids_split robustly (order-independent).
+    # Prefer CMAPSS mapping: y_test_true[i] corresponds to unit_id == i+1 (1..N).
+    unit_ids_split_array = unit_ids_split.numpy() if hasattr(unit_ids_split, "numpy") else np.array(unit_ids_split)
+    y_test_true_vec = np.asarray(y_test_true, dtype=float).reshape(-1)
     if split == "test":
-        # Get unique unit IDs in the same order as they appear in df_test
-        # This should match the order used by build_test_sequences_from_df
-        unit_ids_test_ordered = df_test["UnitNumber"].unique()
-        
-        # Verify that lengths match
-        if len(unit_ids_test_ordered) != len(y_test_true):
-            raise ValueError(
-                f"Mismatch: {len(unit_ids_test_ordered)} unique units in test data, "
-                f"but {len(y_test_true)} RUL values in RUL file. "
-                f"This suggests a data loading issue."
-            )
-        
-        # IMPORTANT: The RUL file contains RUL values in the order that engines
-        # first appear in the test data file. df_test["UnitNumber"].unique() returns
-        # units in the order of first appearance, so y_test_true[i] should correspond
-        # to unit_ids_test_ordered[i]. However, we need to verify this matches
-        # the order in unit_ids_split (which comes from build_test_sequences_from_df).
-        # Create mapping: unit_id -> true_rul (based on order in y_test_true)
-        true_rul_dict = dict(zip(unit_ids_test_ordered, y_test_true))
-        
-        # Verify that unit_ids_split matches unit_ids_test_ordered
-        # (they should be in the same order)
-        unit_ids_split_array = unit_ids_split.numpy() if hasattr(unit_ids_split, 'numpy') else np.array(unit_ids_split)
-        if len(unit_ids_split_array) != len(unit_ids_test_ordered):
-            raise ValueError(
-                f"Mismatch: {len(unit_ids_split_array)} units in unit_ids_split, "
-                f"but {len(unit_ids_test_ordered)} unique units in test data."
-            )
-        
-        # Check if the order matches (first few should be the same)
-        if not np.array_equal(unit_ids_split_array, unit_ids_test_ordered):
-            # Order doesn't match - we need to reorder y_test_true to match unit_ids_split
-            # Create a mapping from unit_id to its index in unit_ids_test_ordered
-            unit_to_index = {uid: idx for idx, uid in enumerate(unit_ids_test_ordered)}
-            # Reorder y_test_true to match unit_ids_split order
-            y_test_true_reordered = np.array([
-                y_test_true[unit_to_index[uid]] for uid in unit_ids_split_array
-            ])
-            # Update true_rul_dict with reordered values
-            true_rul_dict = dict(zip(unit_ids_split_array, y_test_true_reordered))
-            print(f"[WARNING] Reordered y_test_true to match unit_ids_split order")
+        if unit_ids_split_array.size == y_test_true_vec.size and unit_ids_split_array.min() == 1 and unit_ids_split_array.max() == y_test_true_vec.size:
+            y_true_aligned = np.array([y_test_true_vec[int(uid) - 1] for uid in unit_ids_split_array], dtype=float)
+        else:
+            # Fallback: map by df_test unique order (best-effort)
+            unit_ids_test_ordered = df_test["UnitNumber"].unique()
+            if len(unit_ids_test_ordered) != len(y_test_true_vec):
+                raise ValueError(
+                    f"Mismatch: {len(unit_ids_test_ordered)} unique units in test data, "
+                    f"but {len(y_test_true_vec)} RUL values in RUL file."
+                )
+            unit_to_index = {int(uid): idx for idx, uid in enumerate(unit_ids_test_ordered)}
+            y_true_aligned = np.array([y_test_true_vec[unit_to_index[int(uid)]] for uid in unit_ids_split_array], dtype=float)
+        true_rul_dict = dict(zip(unit_ids_split_array, y_true_aligned))
     else:
-        # For validation, we don't have true RUL - would need to reconstruct
-        # For now, use test data
+        # Validation split not implemented; keep existing behavior (use test mapping).
         unit_ids_test_ordered = df_test["UnitNumber"].unique()
-        if len(unit_ids_test_ordered) != len(y_test_true):
+        if len(unit_ids_test_ordered) != len(y_test_true_vec):
             raise ValueError(
                 f"Mismatch: {len(unit_ids_test_ordered)} unique units in test data, "
-                f"but {len(y_test_true)} RUL values in RUL file."
+                f"but {len(y_test_true_vec)} RUL values in RUL file."
             )
-        true_rul_dict = dict(zip(unit_ids_test_ordered, y_test_true))
+        true_rul_dict = dict(zip(unit_ids_test_ordered, y_test_true_vec))
     
     # Derive input_dim and num_conditions from actual data
     input_dim = X_split.shape[-1]  # [N, T, F] -> F

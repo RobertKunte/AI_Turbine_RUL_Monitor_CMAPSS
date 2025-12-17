@@ -784,33 +784,39 @@ def evaluate_on_test_data(
     )
 
     # ------------------------------------------------------------------
-    # Align y_test_true to the unit-id order used by build_test_sequences_from_df
+    # Align y_test_true to unit_ids_test in an order-independent way
     # ------------------------------------------------------------------
-    # The RUL file is ordered by the first appearance of engines in the test file.
-    # build_test_sequences_from_df uses df_test[unit_col].unique(), i.e. first-appearance order.
-    # However, some feature pipelines / preprocessing steps can change row ordering, which may
-    # cause unit_ids_test to differ from df_test[unit_col].unique(). If that happens, we must
-    # reorder y_test_true to match unit_ids_test, otherwise true-vs-pred plots can look "wrong"
-    # even with identical predictions.
-    unit_ids_file_order = df_test[unit_col].unique()
+    # IMPORTANT: `y_test_true` comes from RUL_FD00x.txt and is a plain vector.
+    # Feature engineering may reorder df_test rows, so relying on df_test[unit].unique()
+    # can silently mis-pair true RULs to engines. For CMAPSS, UnitNumber is 1..N, so
+    # we prefer the robust mapping: y_test_true[i] corresponds to unit_id == i+1.
     unit_ids_seq_order = unit_ids_test.numpy() if hasattr(unit_ids_test, "numpy") else np.asarray(unit_ids_test)
-    y_test_true_aligned = np.asarray(y_test_true)
-    if len(unit_ids_file_order) == len(y_test_true_aligned) and len(unit_ids_seq_order) == len(unit_ids_file_order):
-        if not np.array_equal(unit_ids_seq_order, unit_ids_file_order):
-            unit_to_index = {int(uid): idx for idx, uid in enumerate(unit_ids_file_order)}
-            try:
-                y_test_true_aligned = np.array([y_test_true_aligned[unit_to_index[int(uid)]] for uid in unit_ids_seq_order])
-                print("[evaluate_on_test_data] WARNING: Reordered y_test_true to match unit_ids_test order (engine alignment fix).")
-            except Exception as e:
-                print(f"[evaluate_on_test_data] WARNING: Failed to reorder y_test_true for alignment: {e}")
-                y_test_true_aligned = np.asarray(y_test_true)
-    else:
-        # If shapes don't match, keep original but warn.
-        if len(unit_ids_file_order) != len(y_test_true_aligned):
-            print(
-                "[evaluate_on_test_data] WARNING: len(df_test[unit_col].unique()) != len(y_test_true). "
-                "Cannot safely align true RUL to engine order."
-            )
+    y_test_true_vec = np.asarray(y_test_true).reshape(-1)
+    y_test_true_aligned = y_test_true_vec
+    try:
+        unit_ids_unique = np.asarray(unit_ids_seq_order, dtype=int).reshape(-1)
+        n = int(len(y_test_true_vec))
+        # Robust CMAPSS assumption: unit ids are 1..N and RUL file lines are in that order.
+        if unit_ids_unique.size == n and unit_ids_unique.min() == 1 and unit_ids_unique.max() == n:
+            # Map by unit_id index (1-based -> 0-based)
+            y_test_true_aligned = np.array([y_test_true_vec[int(uid) - 1] for uid in unit_ids_unique], dtype=float)
+        else:
+            # Fallback: keep previous behavior using df_test unique order (best-effort).
+            unit_ids_file_order = df_test[unit_col].unique()
+            if len(unit_ids_file_order) == len(y_test_true_vec) and len(unit_ids_unique) == len(unit_ids_file_order):
+                unit_to_index = {int(uid): idx for idx, uid in enumerate(unit_ids_file_order)}
+                y_test_true_aligned = np.array([y_test_true_vec[unit_to_index[int(uid)]] for uid in unit_ids_unique], dtype=float)
+                if not np.array_equal(unit_ids_unique, unit_ids_file_order):
+                    print("[evaluate_on_test_data] WARNING: Reordered y_test_true to match unit_ids_test order (fallback by df_test unique order).")
+            else:
+                print(
+                    "[evaluate_on_test_data] WARNING: Could not safely align y_test_true to unit_ids_test "
+                    f"(len(y_test_true)={len(y_test_true_vec)}, len(unit_ids_test)={len(unit_ids_unique)}). Using raw y_test_true."
+                )
+                y_test_true_aligned = y_test_true_vec
+    except Exception as e:
+        print(f"[evaluate_on_test_data] WARNING: Alignment failed, using raw y_test_true. Reason: {e}")
+        y_test_true_aligned = y_test_true_vec
     
     # Apply scaling if available
     if scaler is not None:
