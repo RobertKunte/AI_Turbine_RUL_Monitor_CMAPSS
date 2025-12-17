@@ -782,6 +782,35 @@ def evaluate_on_test_data(
         unit_col=unit_col,
         cycle_col=cycle_col,
     )
+
+    # ------------------------------------------------------------------
+    # Align y_test_true to the unit-id order used by build_test_sequences_from_df
+    # ------------------------------------------------------------------
+    # The RUL file is ordered by the first appearance of engines in the test file.
+    # build_test_sequences_from_df uses df_test[unit_col].unique(), i.e. first-appearance order.
+    # However, some feature pipelines / preprocessing steps can change row ordering, which may
+    # cause unit_ids_test to differ from df_test[unit_col].unique(). If that happens, we must
+    # reorder y_test_true to match unit_ids_test, otherwise true-vs-pred plots can look "wrong"
+    # even with identical predictions.
+    unit_ids_file_order = df_test[unit_col].unique()
+    unit_ids_seq_order = unit_ids_test.numpy() if hasattr(unit_ids_test, "numpy") else np.asarray(unit_ids_test)
+    y_test_true_aligned = np.asarray(y_test_true)
+    if len(unit_ids_file_order) == len(y_test_true_aligned) and len(unit_ids_seq_order) == len(unit_ids_file_order):
+        if not np.array_equal(unit_ids_seq_order, unit_ids_file_order):
+            unit_to_index = {int(uid): idx for idx, uid in enumerate(unit_ids_file_order)}
+            try:
+                y_test_true_aligned = np.array([y_test_true_aligned[unit_to_index[int(uid)]] for uid in unit_ids_seq_order])
+                print("[evaluate_on_test_data] WARNING: Reordered y_test_true to match unit_ids_test order (engine alignment fix).")
+            except Exception as e:
+                print(f"[evaluate_on_test_data] WARNING: Failed to reorder y_test_true for alignment: {e}")
+                y_test_true_aligned = np.asarray(y_test_true)
+    else:
+        # If shapes don't match, keep original but warn.
+        if len(unit_ids_file_order) != len(y_test_true_aligned):
+            print(
+                "[evaluate_on_test_data] WARNING: len(df_test[unit_col].unique()) != len(y_test_true). "
+                "Cannot safely align true RUL to engine order."
+            )
     
     # Apply scaling if available
     if scaler is not None:
@@ -830,7 +859,7 @@ def evaluate_on_test_data(
     y_test_pred = np.maximum(y_test_pred, 0.0)  # Ensure non-negative
     
     # Cap true RUL at max_rul for consistency
-    y_test_true_capped = np.minimum(y_test_true, max_rul)
+    y_test_true_capped = np.minimum(y_test_true_aligned, max_rul)
     
     # Use shared metrics function for consistency with diagnostics
     # This ensures both evaluation and diagnostics use exactly the same formulas
