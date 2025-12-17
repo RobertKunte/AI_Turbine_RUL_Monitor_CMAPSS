@@ -1418,6 +1418,9 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     phys_features_cfg = config.get("phys_features", {})
     features_cfg = config.get("features", {})
     summary = {
+        "_meta": {
+            "generated_git_sha": _get_git_sha(),
+        },
         "experiment_name": experiment_name,
         "dataset": dataset_name,
         "phase": phase,

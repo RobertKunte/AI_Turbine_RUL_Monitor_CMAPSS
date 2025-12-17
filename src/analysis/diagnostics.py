@@ -2202,6 +2202,49 @@ def run_diagnostics_for_run(
     
     with open(metrics_path, 'w') as f:
         json.dump(eol_metrics_json, f, indent=2)
+
+    # ------------------------------------------------------------------
+    # Keep summary.json metrics consistent with the diagnostics we just wrote
+    # ------------------------------------------------------------------
+    # Rationale: users often compare `summary.json:test_metrics` with `eol_metrics.json`
+    # and plots. If diagnostics is re-run later (or older runs are opened), summary.json
+    # can become stale. We persist a canonical "diagnostics_test_metrics" block and also
+    # update the top-level test_* fields to match.
+    try:
+        summary_path = experiment_dir / "summary.json"
+        if summary_path.exists():
+            summary_obj = json.loads(summary_path.read_text(encoding="utf-8"))
+        else:
+            summary_obj = {}
+
+        diag_test_metrics = {
+            "rmse": float(eol_metrics_dict["rmse"]),
+            "mae": float(eol_metrics_dict["mae"]),
+            "bias": float(eol_metrics_dict["bias"]),
+            "r2": float(eol_metrics_dict["r2"]),
+            "nasa_mean": float(eol_metrics_dict["nasa_mean"]),
+            "nasa_sum": float(eol_metrics_dict["nasa_sum"]),
+            "num_engines": int(eol_metrics_dict["num_engines"]),
+        }
+
+        summary_obj["diagnostics_test_metrics"] = diag_test_metrics
+        summary_obj["diagnostics_meta"] = {
+            "generated_at_utc": generated_at_utc,
+            "generated_git_sha": generated_git_sha,
+        }
+
+        # Update "official" test_metrics + flat keys to match diagnostics (single source of truth).
+        summary_obj["test_metrics"] = dict(diag_test_metrics)
+        summary_obj["test_rmse"] = float(diag_test_metrics["rmse"])
+        summary_obj["test_mae"] = float(diag_test_metrics["mae"])
+        summary_obj["test_bias"] = float(diag_test_metrics["bias"])
+        summary_obj["test_r2"] = float(diag_test_metrics["r2"])
+        summary_obj["test_nasa_mean"] = float(diag_test_metrics["nasa_mean"])
+
+        summary_path.write_text(json.dumps(summary_obj, indent=2), encoding="utf-8")
+        print(f"  ✓ Updated summary.json test metrics for consistency: {summary_path}")
+    except Exception as e:
+        print(f"  ⚠️  WARNING: failed to update summary.json with diagnostics metrics: {e}")
     
     print(f"\n✅ Diagnostics complete for {dataset_name}!")
     print(f"  Plots saved to: {experiment_dir}")
