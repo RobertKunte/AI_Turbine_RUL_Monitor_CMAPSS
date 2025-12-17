@@ -312,6 +312,21 @@ def main() -> None:
             sh(f'cp -u -r "{src}/"* "{dst}/"', check=False)
             print(f"[colab] Fallback pushed results: {src} -> {dst}")
 
+    # ------------------------------------------------------------------
+    # Optional: Regenerate diagnostics for existing runs (stale run folders)
+    # ------------------------------------------------------------------
+    # Sometimes older run folders contain stale `eol_metrics.json` / plots produced by older
+    # code (e.g., before engine/target alignment fixes). Use this helper to rebuild them:
+    #
+    # Example:
+    #   sh("python -u scripts/regenerate_diagnostics.py "
+    #      "--run_dir results/fd004/<run_name> --device cpu --force")
+    #
+    # Or for the most recently run experiment in this script (last RUN_NAMES entry):
+    #   last_run = normalize_run_name(RUN_NAMES[-1])
+    #   dataset = infer_dataset_from_run_name(last_run) or "FD004"
+    #   sh(f"python -u scripts/regenerate_diagnostics.py --run_dir results/{dataset.lower()}/{last_run} --device {DEVICE} --force")
+
     # Optional diagnostics hook (commented):
     # sh(f\"python run_diagnostics.py --experiments {RUN_NAME}\")
 

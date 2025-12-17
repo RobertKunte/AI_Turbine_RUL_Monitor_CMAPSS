@@ -38,6 +38,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
+import subprocess
+from datetime import datetime, timezone
 from src.data_loading import load_cmapps_subset
 from src.additional_features import (
     create_physical_features,
@@ -1498,45 +1500,6 @@ def plot_hi_cal_v2_vs_hi_phys_v3(
 
     print(f"Saved HI_cal_v2 vs HI_phys_v3 scatter to {out_path}")
 
-    # Optionally, log and persist RMSE summary for HI_phys_v3 vs HI_damage
-    if hi_rmse_per_engine:
-        rmse_values = np.array(list(hi_rmse_per_engine.values()), dtype=float)
-        hi_rmse_mean = float(rmse_values.mean())
-        hi_rmse_median = float(np.median(rmse_values))
-        hi_rmse_std = float(rmse_values.std())
-        hi_rmse_min = float(rmse_values.min())
-        hi_rmse_max = float(rmse_values.max())
-
-        print("============================================================")
-        print("[Diagnostics] HI_phys_v3 vs HI_damage – per-engine RMSE")
-        print("============================================================")
-        print(f"Num engines: {len(rmse_values)}")
-        print(f"RMSE mean:   {hi_rmse_mean:.6f}")
-        print(f"RMSE median: {hi_rmse_median:.6f}")
-        print(f"RMSE std:    {hi_rmse_std:.6f}")
-        print(f"RMSE min:    {hi_rmse_min:.6f}")
-        print(f"RMSE max:    {hi_rmse_max:.6f}")
-
-        if metrics_path is not None:
-            try:
-                import json
-
-                metrics = {
-                    "hi_rmse_per_engine": {str(k): float(v) for k, v in hi_rmse_per_engine.items()},
-                    "summary": {
-                        "rmse_mean": hi_rmse_mean,
-                        "rmse_median": hi_rmse_median,
-                        "rmse_std": hi_rmse_std,
-                        "rmse_min": hi_rmse_min,
-                        "rmse_max": hi_rmse_max,
-                    },
-                }
-                with open(metrics_path, "w") as f:
-                    json.dump(metrics, f, indent=2)
-                print(f"  ✓ Saved HI damage metrics to: {metrics_path}")
-            except Exception as e:
-                print(f"  ⚠️  Could not save HI damage metrics to {metrics_path}: {e}")
-
 
 def run_diagnostics_for_run(
     exp_dir: Union[str, Path],
@@ -2203,6 +2166,21 @@ def run_diagnostics_for_run(
     # Save metrics as JSON (convert numpy arrays to lists for JSON serialization)
     print("[8] Saving metrics...")
     metrics_path = experiment_dir / "eol_metrics.json"
+
+    # Stamp metrics with code provenance so it's obvious when a run folder contains
+    # stale diagnostics created by older code (e.g., before engine/target alignment fixes).
+    def _get_git_sha() -> Optional[str]:
+        try:
+            return subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip() or None
+        except Exception:
+            return None
+    
+    generated_at_utc = datetime.now(timezone.utc).isoformat()
+    generated_git_sha = _get_git_sha()
     
     # Convert numpy arrays to lists for JSON serialization
     eol_metrics_json = {}
@@ -2213,6 +2191,14 @@ def run_diagnostics_for_run(
             eol_metrics_json[key] = float(value)
         else:
             eol_metrics_json[key] = value
+
+    # Add provenance metadata (does not affect downstream numeric consumers).
+    eol_metrics_json["_meta"] = {
+        "generated_at_utc": generated_at_utc,
+        "generated_git_sha": generated_git_sha,
+        "dataset": dataset_name,
+        "run_name": run_name,
+    }
     
     with open(metrics_path, 'w') as f:
         json.dump(eol_metrics_json, f, indent=2)
