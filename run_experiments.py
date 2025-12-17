@@ -1362,6 +1362,10 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         use_residual_risk_head=bool(encoder_kwargs.get("use_residual_risk_head", False)),
         residual_risk_tau=float(config["loss_params"].get("risk_tau", 0.90)),
         residual_risk_weight=float(config["loss_params"].get("lambda_residual_risk", config["loss_params"].get("lambda_risk", 0.0))),
+        # Residual risk v2b: emphasize low-RUL region (safety-critical tail)
+        residual_risk_low_rul_threshold=float(config["loss_params"].get("low_rul_threshold", 20.0)),
+        residual_risk_low_weight=float(config["loss_params"].get("risk_low_weight", 1.0)),
+        residual_risk_low_only=bool(config["loss_params"].get("risk_low_only", False)),
         # Training monitor metric (scheduler + early stopping)
         monitor_metric=str(training_cfg.get("monitor_metric", "val_loss")),
         # Censoring-aware: ranking loss on mu

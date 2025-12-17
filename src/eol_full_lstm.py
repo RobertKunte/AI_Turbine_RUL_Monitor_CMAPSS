@@ -1872,6 +1872,12 @@ def train_eol_full_lstm(
     use_residual_risk_head: bool = False,
     residual_risk_tau: float = 0.90,
     residual_risk_weight: float = 0.10,
+    # NEW (risk v2b): focus residual-risk training on low-RUL (safety-critical) region
+    # If low_only=True, the residual-risk loss is computed only on samples with rul_true <= low_rul_threshold.
+    # Otherwise, samples in the low-RUL region are up-weighted by low_weight (>1).
+    residual_risk_low_rul_threshold: float = 20.0,
+    residual_risk_low_weight: float = 1.0,
+    residual_risk_low_only: bool = False,
     # NEW: bucket head auxiliary loss (classification)
     use_bucket_head: bool = False,
     lambda_bucket: float = 0.1,
@@ -2532,7 +2538,30 @@ def train_eol_full_lstm(
                                 q = rul_risk_q.view(-1)
                                 # pinball(q, y, tau) = max(tau*(y-q), (1-tau)*(q-y))
                                 u = overshoot - q
-                                risk_pinball = torch.maximum(risk_tau * u, (1.0 - risk_tau) * (-u)).mean()
+                                pin = torch.maximum(risk_tau * u, (1.0 - risk_tau) * (-u))  # [B]
+
+                                # Safety-focused weighting in low-RUL region
+                                low_thr = float(residual_risk_low_rul_threshold)
+                                low_w = float(residual_risk_low_weight)
+                                low_only = bool(residual_risk_low_only)
+                                if low_thr > 0.0:
+                                    m_low = (y_batch.view(-1).float() <= low_thr)
+                                else:
+                                    m_low = torch.zeros_like(pin, dtype=torch.bool)
+
+                                if low_only:
+                                    if bool(m_low.any().item()):
+                                        risk_pinball = pin[m_low].mean()
+                                    else:
+                                        risk_pinball = pin.new_tensor(0.0)
+                                else:
+                                    if low_w > 1.0 and bool(m_low.any().item()):
+                                        w = torch.ones_like(pin)
+                                        w[m_low] = low_w
+                                        risk_pinball = (pin * w).sum() / (w.sum() + 1e-8)
+                                    else:
+                                        risk_pinball = pin.mean()
+
                                 loss = loss + float(residual_risk_weight) * risk_pinball
                                 if train_component_losses is not None:
                                     train_component_losses.setdefault("residual_risk_loss", []).append(float(risk_pinball.item()))
