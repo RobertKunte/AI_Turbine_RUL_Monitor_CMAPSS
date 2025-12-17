@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Dict, Tuple, List, Any
 
 import numpy as np
+import pandas as pd
 import torch
 
 # Ensure project root is on sys.path (so `import src...` works when run as a script)
@@ -39,9 +40,17 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.analysis.inference import load_model_from_experiment, run_inference_for_experiment
-from src.analysis.diagnostics import build_eval_data
-from src.additional_features import FeatureConfig, TemporalFeatureConfig
+from src.additional_features import (
+    FeatureConfig,
+    TemporalFeatureConfig,
+    create_physical_features,
+    create_all_features,
+    build_condition_features,
+    create_twin_features,
+)
 from src.config import PhysicsFeatureConfig, ResidualFeatureConfig
+from src.data_loading import load_cmapps_subset
+from src.feature_safety import remove_rul_leakage
 from src.eol_full_lstm import evaluate_on_test_data
 
 
@@ -127,6 +136,98 @@ def _build_feature_config_from_summary(config: dict) -> Tuple[FeatureConfig, Phy
     return feature_config, physics_config, (phys_features_cfg or {})
 
 
+def _build_df_test_features_fast(
+    *,
+    dataset_name: str,
+    feature_config: FeatureConfig,
+    physics_config: PhysicsFeatureConfig,
+    phys_features_cfg: Dict[str, Any],
+) -> Tuple[np.ndarray, pd.DataFrame, List[str]]:
+    """
+    Fast reconstruction of the *test* feature pipeline for the diagnostics path.
+
+    Important: we intentionally do NOT build full train sliding windows here
+    (that step is slow on CPU and not needed to compare EOL true/pred).
+
+    Returns:
+      - y_test_true: raw per-engine true RUL array from the dataset loader
+      - df_test_fe: feature-engineered test dataframe
+      - feature_cols: feature column list (after remove_rul_leakage), matching training logic
+    """
+    df_train, df_test, y_test_true = load_cmapps_subset(
+        dataset_name,
+        max_rul=None,
+        clip_train=False,
+        clip_test=True,
+    )
+
+    # 1) Physics features (core + optional residuals)
+    df_train_fe = create_physical_features(df_train.copy(), physics_config, "UnitNumber", "TimeInCycles")
+    df_test_fe = create_physical_features(df_test.copy(), physics_config, "UnitNumber", "TimeInCycles")
+
+    # 2) Continuous condition vector (Cond_*)
+    use_phys_condition_vec = bool(phys_features_cfg.get("use_condition_vector", False))
+    condition_vector_version = int(phys_features_cfg.get("condition_vector_version", 2))
+    if use_phys_condition_vec:
+        print("  Using continuous condition vector features (Cond_*) [compare/diag-fast]")
+        df_train_fe = build_condition_features(
+            df_train_fe,
+            unit_col="UnitNumber",
+            cycle_col="TimeInCycles",
+            version=condition_vector_version,
+        )
+        df_test_fe = build_condition_features(
+            df_test_fe,
+            unit_col="UnitNumber",
+            cycle_col="TimeInCycles",
+            version=condition_vector_version,
+        )
+
+    # 3) Digital twin + residuals (Twin_* + Resid_* from twin model)
+    use_twin_features = bool(
+        phys_features_cfg.get("use_twin_features", phys_features_cfg.get("use_digital_twin_residuals", False))
+    )
+    twin_baseline_len = int(phys_features_cfg.get("twin_baseline_len", 30))
+    if use_twin_features:
+        print(f"  Using HealthyTwinRegressor (baseline_len={twin_baseline_len}) [compare/diag-fast]")
+        df_train_fe, twin_model = create_twin_features(
+            df_train_fe,
+            unit_col="UnitNumber",
+            cycle_col="TimeInCycles",
+            baseline_len=twin_baseline_len,
+            condition_vector_version=condition_vector_version,
+        )
+        df_test_fe = twin_model.add_twin_and_residuals(df_test_fe)
+
+    # 4) Temporal / multi-scale features
+    df_train_fe = create_all_features(
+        df_train_fe,
+        "UnitNumber",
+        "TimeInCycles",
+        feature_config,
+        inplace=False,
+        physics_config=physics_config,
+    )
+    df_test_fe = create_all_features(
+        df_test_fe,
+        "UnitNumber",
+        "TimeInCycles",
+        feature_config,
+        inplace=False,
+        physics_config=physics_config,
+    )
+
+    # Build feature columns (same exclusions as training/diagnostics)
+    feature_cols = [
+        c for c in df_train_fe.columns
+        if c not in ["UnitNumber", "TimeInCycles", "RUL", "RUL_raw", "MaxTime", "ConditionID"]
+    ]
+    feature_cols, _ = remove_rul_leakage(feature_cols)
+    print(f"[compare] diag-fast feature_cols={len(feature_cols)}")
+
+    return np.asarray(y_test_true, dtype=float), df_test_fe, feature_cols
+
+
 def _metrics_to_arrays(eol_metrics) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     # Sort by unit_id for stable alignment
     eol_metrics_sorted = sorted(eol_metrics, key=lambda m: int(m.unit_id))
@@ -185,14 +286,13 @@ def main() -> None:
     max_rul = int(config.get("max_rul", 125))
     past_len = int(config.get("past_len", config.get("sequence_length", 30)))
 
-    # Build DF + feature_cols via the diagnostics helper (same as run_diagnostics_for_run)
-    _, _, y_test_true, unit_ids_test, _, _, feature_cols, df_test_fe = build_eval_data(
+    # Fast diagnostics reconstruction: rebuild df_test_fe + feature_cols only
+    # (avoid building full train sliding windows; not needed for EOL comparison)
+    y_test_true, df_test_fe, feature_cols = _build_df_test_features_fast(
         dataset_name=dataset,
-        max_rul=max_rul,
-        past_len=past_len,
         feature_config=feature_config,
         physics_config=physics_config,
-        phys_features=phys_features_cfg,
+        phys_features_cfg=phys_features_cfg,
     )
 
     scaler_loaded = _load_scaler(experiment_dir)
