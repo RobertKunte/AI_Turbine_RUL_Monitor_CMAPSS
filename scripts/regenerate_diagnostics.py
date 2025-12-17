@@ -63,6 +63,14 @@ def _load_eol_metrics_meta(run_dir: Path) -> dict:
         return {}
 
 
+def _pick_checkpoint_file(run_dir: Path) -> Optional[Path]:
+    pts = sorted(run_dir.glob("*.pt"))
+    if not pts:
+        return None
+    best = [p for p in pts if "best" in p.name.lower()]
+    return best[0] if best else pts[0]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -117,7 +125,38 @@ def main() -> None:
         print("OK: diagnostics appear up-to-date; nothing to do.")
         return
 
-    import torch
+    # Preflight: ensure checkpoint file is readable. If it's truncated/corrupted,
+    # diagnostics cannot run and we should fail loudly with actionable instructions.
+    ckpt_path = _pick_checkpoint_file(run_dir)
+    if ckpt_path is None:
+        raise FileNotFoundError(f"No .pt checkpoint found in: {run_dir}")
+    try:
+        import torch
+
+        # Quick load to validate file integrity; we don't keep the object.
+        _ = torch.load(ckpt_path, map_location="cpu")
+    except EOFError:
+        size = None
+        try:
+            size = ckpt_path.stat().st_size
+        except Exception:
+            pass
+        print("\n[ERROR] Checkpoint file appears truncated/corrupted (EOFError):", ckpt_path)
+        if size is not None:
+            print("        size_bytes:", int(size))
+        print("\nAction:")
+        print("  1) Delete the local broken checkpoint file (copy-only-newer sync may not overwrite it):")
+        print(f"     rm -f '{ckpt_path}'")
+        print("  2) Re-pull the run from Drive (results + artifacts):")
+        print("     python -m src.tools.sync_artifacts --pull --run_name "
+              f"{run_name} --what both")
+        print("  3) Re-run this script.")
+        raise SystemExit(2)
+    except Exception as e:
+        print("\n[ERROR] Could not load checkpoint file:", ckpt_path)
+        print("Reason:", repr(e))
+        raise SystemExit(2)
+
     from src.analysis.diagnostics import run_diagnostics_for_run
 
     device = torch.device(args.device)
