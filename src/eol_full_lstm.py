@@ -746,6 +746,11 @@ def evaluate_on_test_data(
     """
     model.eval()
     model.to(device)
+
+    # Optional: print an evaluation fingerprint to debug "metrics differ between training and diagnostics".
+    # Enable via: EVAL_FINGERPRINT=1
+    import os
+    debug_fingerprint = os.environ.get("EVAL_FINGERPRINT", "").strip() in {"1", "true", "True", "yes"}
     
     # Filter feature_cols to only include columns that exist in test DataFrame
     # This ensures we don't try to use features that were computed during training
@@ -866,6 +871,26 @@ def evaluate_on_test_data(
     
     # Cap true RUL at max_rul for consistency
     y_test_true_capped = np.minimum(y_test_true_aligned, max_rul)
+
+    if debug_fingerprint:
+        try:
+            import hashlib
+
+            uid = np.asarray(unit_ids_test.numpy(), dtype=int).reshape(-1)
+            yt = np.asarray(y_test_true_capped, dtype=float).reshape(-1)
+            yp = np.asarray(y_test_pred, dtype=float).reshape(-1)
+            # Stable small digest (rounded to reduce float noise)
+            digest = hashlib.sha256(
+                np.round(np.stack([uid.astype(np.float64), yt, yp], axis=1), 6).tobytes()
+            ).hexdigest()[:16]
+            print("[evaluate_on_test_data:FINGERPRINT]")
+            print(f"  n={len(uid)} features={len(available_feature_cols)} max_rul={max_rul}")
+            print(f"  unit_ids[:5]={uid[:5].tolist()}")
+            print(f"  y_true[:5]={np.round(yt[:5], 4).tolist()}")
+            print(f"  y_pred[:5]={np.round(yp[:5], 4).tolist()}")
+            print(f"  sha256_16={digest}")
+        except Exception as e:
+            print(f"[evaluate_on_test_data:FINGERPRINT] WARNING: failed: {e}")
     
     # Use shared metrics function for consistency with diagnostics
     # This ensures both evaluation and diagnostics use exactly the same formulas
