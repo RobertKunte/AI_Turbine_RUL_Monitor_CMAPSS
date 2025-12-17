@@ -1915,6 +1915,8 @@ def run_inference_for_experiment(
 
             overshoot_mu = mu - y_true
             overshoot_safe = safe - y_true
+            # "Cost of safety": how much earlier safe is than truth (positive = conservative)
+            margin_safe = y_true - safe
             low_mask = np.isfinite(y_true) & (y_true <= low_thr)
 
             def _summ(arr: np.ndarray, mask: np.ndarray) -> dict:
@@ -1929,6 +1931,32 @@ def run_inference_for_experiment(
                     "rate_gt_thr": float(np.mean(a > over_thr)),
                 }
 
+            def _summ_margin(arr: np.ndarray, mask: np.ndarray) -> dict:
+                a = arr[np.isfinite(arr) & mask]
+                if a.size == 0:
+                    return {"n": 0}
+                return {
+                    "n": int(a.size),
+                    "mean": float(np.mean(a)),
+                    "median": float(np.median(a)),
+                    "p90": float(np.percentile(a, 90)),
+                    "p95": float(np.percentile(a, 95)),
+                    "max": float(np.max(a)),
+                    "min": float(np.min(a)),
+                }
+
+            def _summ_err(arr: np.ndarray, mask: np.ndarray) -> dict:
+                a = arr[np.isfinite(arr) & mask]
+                if a.size == 0:
+                    return {"n": 0}
+                mse = float(np.mean(a ** 2))
+                return {
+                    "n": int(a.size),
+                    "rmse": float(np.sqrt(mse)),
+                    "mae": float(np.mean(np.abs(a))),
+                    "bias": float(np.mean(a)),
+                }
+
             metrics = {
                 "low_rul_threshold": low_thr,
                 "overshoot_threshold": over_thr,
@@ -1937,6 +1965,15 @@ def run_inference_for_experiment(
                 "overshoot_safe_low": _summ(overshoot_safe, low_mask),
                 "overshoot_mu_all": _summ(overshoot_mu, np.isfinite(y_true)),
                 "overshoot_safe_all": _summ(overshoot_safe, np.isfinite(y_true)),
+                # Safety KPI (strict): rate of optimistic "safe" predictions (safe > true)
+                "overshoot_safe_rate_pos_all": float(np.mean((overshoot_safe > 0.0) & np.isfinite(overshoot_safe))),
+                "overshoot_safe_rate_pos_low": float(np.mean((overshoot_safe[low_mask] > 0.0) & np.isfinite(overshoot_safe[low_mask]))) if np.any(low_mask) else float("nan"),
+                # "Cost of safety": how conservative safe is (true - safe)
+                "margin_safe_all": _summ_margin(margin_safe, np.isfinite(y_true)),
+                "margin_safe_low": _summ_margin(margin_safe, low_mask),
+                # Monitor μ quality separately (overall + low-RUL)
+                "mu_metrics_all": _summ_err(overshoot_mu, np.isfinite(y_true)),
+                "mu_metrics_low": _summ_err(overshoot_mu, low_mask),
                 "coverage_all": float(np.mean((overshoot_mu <= risk_pred) & np.isfinite(overshoot_mu))),
                 "coverage_low": float(np.mean((overshoot_mu[low_mask] <= risk_pred[low_mask]) & np.isfinite(overshoot_mu[low_mask]))) if np.any(low_mask) else float("nan"),
             }

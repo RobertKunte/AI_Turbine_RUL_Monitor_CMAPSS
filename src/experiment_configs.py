@@ -1869,6 +1869,8 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residua
     # otherwise μ can collapse while val_loss looks "good".
     training = cfg.setdefault("training_params", {})
     training.setdefault("monitor_metric", "val_rmse")
+    # Training budget: make risk-head calibration stable across seeds/runs.
+    training.setdefault("num_epochs", 100)
 
     return cfg
 
@@ -1948,9 +1950,89 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residua
     loss["risk_low_weight"] = 20.0
     loss.setdefault("low_rul_threshold", 20.0)
     loss.setdefault("overshoot_threshold", 20.0)
-    # Training budget: allow up to 15 epochs (early stopping still applies).
+    # Training budget: align with the project default for comparable sweeps.
     train = cfg.setdefault("training_params", {})
-    train["num_epochs"] = 15
+    train["num_epochs"] = 100
+    return cfg
+
+
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_low20_config() -> ExperimentConfig:
+    """
+    Residual-risk sweep (τ=0.95 target):
+      - risk_tau = 0.95
+      - lambda_residual_risk = 1.0
+      - risk_low_weight = 20.0 for rul_true <= low_rul_threshold (default 20)
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_low20"
+    loss = cfg.setdefault("loss_params", {})
+    loss["risk_tau"] = 0.95
+    loss["lambda_residual_risk"] = 1.0
+    loss["risk_low_weight"] = 20.0
+    loss.setdefault("low_rul_threshold", 20.0)
+    loss.setdefault("overshoot_threshold", 20.0)
+    train = cfg.setdefault("training_params", {})
+    train["num_epochs"] = 100
+    return cfg
+
+
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w3_low20_config() -> ExperimentConfig:
+    """
+    Residual-risk sweep (τ=0.95 target):
+      - risk_tau = 0.95
+      - lambda_residual_risk = 3.0
+      - risk_low_weight = 20.0 for rul_true <= low_rul_threshold (default 20)
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w3_low20"
+    loss = cfg.setdefault("loss_params", {})
+    loss["risk_tau"] = 0.95
+    loss["lambda_residual_risk"] = 3.0
+    loss["risk_low_weight"] = 20.0
+    loss.setdefault("low_rul_threshold", 20.0)
+    loss.setdefault("overshoot_threshold", 20.0)
+    train = cfg.setdefault("training_params", {})
+    train["num_epochs"] = 100
+    return cfg
+
+
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w5_low20_config() -> ExperimentConfig:
+    """
+    Residual-risk sweep (τ=0.95 target):
+      - risk_tau = 0.95
+      - lambda_residual_risk = 5.0
+      - risk_low_weight = 20.0 for rul_true <= low_rul_threshold (default 20)
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w5_low20"
+    loss = cfg.setdefault("loss_params", {})
+    loss["risk_tau"] = 0.95
+    loss["lambda_residual_risk"] = 5.0
+    loss["risk_low_weight"] = 20.0
+    loss.setdefault("low_rul_threshold", 20.0)
+    loss.setdefault("overshoot_threshold", 20.0)
+    train = cfg.setdefault("training_params", {})
+    train["num_epochs"] = 100
+    return cfg
+
+
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w8_low20_config() -> ExperimentConfig:
+    """
+    Residual-risk sweep (τ=0.95 target):
+      - risk_tau = 0.95
+      - lambda_residual_risk = 8.0
+      - risk_low_weight = 20.0 for rul_true <= low_rul_threshold (default 20)
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w8_low20"
+    loss = cfg.setdefault("loss_params", {})
+    loss["risk_tau"] = 0.95
+    loss["lambda_residual_risk"] = 8.0
+    loss["risk_low_weight"] = 20.0
+    loss.setdefault("low_rul_threshold", 20.0)
+    loss.setdefault("overshoot_threshold", 20.0)
+    train = cfg.setdefault("training_params", {})
+    train["num_epochs"] = 100
     return cfg
 
 
@@ -3493,6 +3575,14 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w3_low10_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau99_w5_low20":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau99_w5_low20_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_low20":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_low20_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w3_low20":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w3_low20_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w5_low20":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w5_low20_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w8_low20":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w8_low20_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3d":
         return get_fd004_decoder_v1_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v1_from_encoder_v3e":

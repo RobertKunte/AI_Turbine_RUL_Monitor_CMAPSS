@@ -2111,6 +2111,70 @@ def run_diagnostics_for_run(
         max_rul=max_rul,
         title=f"{dataset_name} True vs Predicted RUL",
     )
+
+    # Always also emit explicit μ + safe scatter plots for consistency with inference outputs.
+    # - μ is identical to the point prediction used in true_vs_pred.png.
+    # - safe uses the residual-risk head if available; otherwise we fall back to safe=μ.
+    plot_true_vs_pred_scatter(
+        y_true=y_true_eol,
+        y_pred=rul_pred_full_np,
+        out_path=experiment_dir / "true_vs_pred_mu.png",
+        max_rul=max_rul,
+        title=f"{dataset_name} True vs Pred (μ)",
+    )
+
+    try:
+        safe_pred_np = None
+
+        # Compute risk_q on the same EOL test windows used by diagnostics (one window per engine).
+        # X_test_scaled/cond_ids_test come from build_eval_data and match the engine order of y_true_eol.
+        # If the model does not expose a residual-risk head, we fallback to safe=μ.
+        X_t = torch.as_tensor(X_test_scaled, dtype=torch.float32, device=device)
+        cond_t = None
+        try:
+            if cond_ids_test is not None:
+                cond_t = torch.as_tensor(cond_ids_test, dtype=torch.long, device=device)
+        except Exception:
+            cond_t = None
+
+        model.eval()
+        with torch.no_grad():
+            try:
+                outputs = model(X_t, cond_ids=cond_t) if cond_t is not None else model(X_t)
+            except TypeError:
+                # Some models don't accept cond_ids kwarg (or don't need it).
+                outputs = model(X_t)
+
+        rul_risk_q_pred = None
+        if isinstance(outputs, (tuple, list)):
+            # Mirror the inference disambiguation logic for the common return contracts.
+            if len(outputs) == 7:
+                # Either (rul_pred, hi_last, hi_seq, rul_sigma, rul_quantiles, bucket_logits, rul_risk_q)
+                # or older aux contract; disambiguate by checking outputs[3] shape.
+                if not (torch.is_tensor(outputs[3]) and outputs[3].dim() == 2):
+                    rul_risk_q_pred = outputs[6]
+            elif len(outputs) >= 9:
+                # (rul_pred, hi_last, hi_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles, bucket_logits, rul_risk_q)
+                rul_risk_q_pred = outputs[8]
+
+        if rul_risk_q_pred is not None and torch.is_tensor(rul_risk_q_pred):
+            risk_q_np = rul_risk_q_pred.detach().cpu().numpy().reshape(-1).astype(np.float32)
+            risk_q_np = np.maximum(0.0, risk_q_np)
+            mu_np = np.asarray(rul_pred_full_np, dtype=np.float32).reshape(-1)
+            safe_pred_np = np.clip(mu_np - risk_q_np, 0.0, float(max_rul))
+        else:
+            # No residual risk head available → safe == μ.
+            safe_pred_np = np.asarray(rul_pred_full_np, dtype=np.float32).reshape(-1)
+
+        plot_true_vs_pred_scatter(
+            y_true=y_true_eol,
+            y_pred=safe_pred_np,
+            out_path=experiment_dir / "true_vs_pred_safe.png",
+            max_rul=max_rul,
+            title=f"{dataset_name} True vs Pred (safe = μ - risk)",
+        )
+    except Exception as e:
+        print(f"[diagnostics] WARNING: Failed to generate true_vs_pred_safe.png: {e}")
     
     # 3. HI + RUL trajectories (always create if we have trajectories)
     # Note: We don't need to check for trajectory heads here since we build trajectories
