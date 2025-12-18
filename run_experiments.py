@@ -568,6 +568,47 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         if c not in ["HI_phys_final", "HI_target_hybrid", "HI_phys_v2", "HI_phys_v3"]
     ]
 
+    # -------------------------------------------------------------------
+    # Optional feature-group filtering (backwards compatible):
+    # - If features.include_groups is missing/None -> keep ALL features (old behavior)
+    # - If provided -> select only the requested semantic groups
+    # -------------------------------------------------------------------
+    groups = group_feature_columns(feature_cols)
+    include_groups = features_cfg.get("include_groups", None)
+    print(
+        "[Train] Feature groups: "
+        f"total={len(feature_cols)}, raw={len(groups.get('raw', []))}, ms={len(groups.get('ms', []))}, "
+        f"residual={len(groups.get('residual', []))}, cond={len(groups.get('cond', []))}, twin={len(groups.get('twin', []))}"
+    )
+    if include_groups is None:
+        print("[Train] include_groups=None -> using ALL features")
+        # Optional info log for the canonical FD004 ms+DT + cond + twin feature space.
+        if (
+            dataset_name.upper() == "FD004"
+            and bool(use_temporal_features)
+            and bool(use_phys_condition_vec)
+            and bool(use_twin_features)
+        ):
+            print("[Train] Info: FD004 ms+DT + Cond_* + Twin_/Resid_* typically yields ~659 features.")
+    else:
+        if not isinstance(include_groups, (list, tuple)):
+            raise ValueError(
+                "features.include_groups must be a list of group names (or omitted/None). "
+                f"Got: {type(include_groups)}"
+            )
+        allowed = sorted(groups.keys())
+        unknown = [g for g in include_groups if g not in groups]
+        if unknown:
+            raise ValueError(f"Unknown feature groups: {unknown}. Allowed: {allowed}")
+        selected_cols: List[str] = []
+        for g in include_groups:
+            selected_cols.extend(groups[g])
+        # De-duplicate while preserving order
+        seen = set()
+        selected_cols = [c for c in selected_cols if not (c in seen or seen.add(c))]
+        feature_cols = selected_cols
+        print(f"[Train] include_groups={list(include_groups)} -> selected={len(feature_cols)}")
+
     print(f"Using {len(feature_cols)} features for model input.")
 
     # -------------------------------------------------------------------
@@ -776,6 +817,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 "fd004_transformer_latent_worldmodel_dynamic_v1",
                 "fd004_transformer_latent_worldmodel_dynamic_freeze_v1",
                 "fd004_transformer_latent_worldmodel_dynamic_delta_v2",
+                "fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659",
             ]:
                 print("\n[2] Training Transformer World Model V1 (Transformer encoder + GRU decoder)...")
                 summary = train_transformer_world_model_v1(

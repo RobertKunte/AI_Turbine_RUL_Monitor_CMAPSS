@@ -438,9 +438,21 @@ class TransformerWorldModelV1(nn.Module):
                 if hasattr(self.encoder, "fc_health") and hasattr(self.encoder, "fc_rul"):
                     # Use full forward pass to respect internal shared_head etc.
                     if cond_ids is not None:
-                        rul_anchor_raw, hi_anchor_raw, _ = self.encoder(past_seq, cond_ids)
+                        enc_out = self.encoder(past_seq, cond_ids)
                     else:
-                        rul_anchor_raw, hi_anchor_raw, _ = self.encoder(past_seq, None)
+                        enc_out = self.encoder(past_seq, None)
+
+                    if not isinstance(enc_out, (tuple, list)) or len(enc_out) < 2:
+                        raise RuntimeError(
+                            "[TransformerWorldModelV1] Encoder forward must return at least "
+                            "(rul_pred, health_last, ...) but got incompatible output."
+                        )
+
+                    # The encoder may return many auxiliary outputs; we only need:
+                    # - RUL point prediction (cycles)
+                    # - HI / health_last (logit or score)
+                    rul_anchor_raw = enc_out[0]
+                    hi_anchor_raw = enc_out[1]
 
                     hi_anchor_vec = torch.sigmoid(hi_anchor_raw).unsqueeze(1)  # [B,1]
 

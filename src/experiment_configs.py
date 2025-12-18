@@ -954,6 +954,92 @@ def get_fd004_transformer_latent_worldmodel_dynamic_delta_v2_config() -> Experim
     config["world_model_params"] = world_params
     return config
 
+
+def get_fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659_config() -> ExperimentConfig:
+    """
+    Dynamic latent Transformer World Model V1 (Branch A+) that starts from the
+    ms_dt_v2 damage_v5 cond_norm multiview residual-risk encoder checkpoint
+    and uses the FULL feature space (~659 on FD004).
+
+    Notes:
+    - Feature filtering is intentionally OFF (features.include_groups omitted)
+    - Encoder checkpoint load is guarded by an input_dim mismatch check
+    """
+    base = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau99_w5_low20_config()
+    cfg = copy.deepcopy(base)
+
+    cfg["experiment_name"] = "fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659"
+    cfg["encoder_type"] = "world_model_universal_v3"
+    cfg["dataset"] = "FD004"
+
+    # Map encoder kwargs to the WM-V1 training loop expectations (nhead key)
+    enc_base = base.get("encoder_kwargs", {})
+    cfg["encoder_kwargs"] = {
+        "d_model": enc_base.get("d_model", 96),
+        "num_layers": enc_base.get("num_layers", 3),
+        "nhead": enc_base.get("n_heads", enc_base.get("nhead", 4)),
+        "dim_feedforward": enc_base.get("dim_feedforward", 256),
+        "dropout": enc_base.get("dropout", 0.1),
+        # keep these for symmetry with other WM configs (unused in WM-V1)
+        "kernel_sizes": base.get("encoder_kwargs", {}).get("kernel_sizes", [3, 5, 9]),
+        "seq_encoder_type": "transformer",
+        "decoder_num_layers": 1,
+    }
+
+    # Ensure feature filtering stays OFF: do not set include_groups
+    feats = cfg.get("features", {})
+    feats.pop("include_groups", None)
+    cfg["features"] = feats
+
+    # World model params (dynamic latent A+)
+    ckpt_path = (
+        "results/fd004/"
+        "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau99_w5_low20/"
+        "eol_full_lstm_best_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau99_w5_low20.pt"
+    )
+
+    cfg["world_model_params"] = {
+        "past_len": base.get("past_len", 30),
+        "future_horizon": 30,
+        "max_rul": base.get("max_rul", 125),
+        "d_model": cfg["encoder_kwargs"]["d_model"],
+        "decoder_hidden_dim": 256,
+        "num_layers_decoder": 1,
+        "dropout": cfg["encoder_kwargs"]["dropout"],
+        # Latent-only: no sensor trajectory loss
+        "sensor_loss_weight": 0.0,
+        # Strong focus on future HI + RUL
+        "hi_future_loss_weight": 10.0,
+        "rul_future_loss_weight": 1.0,
+        # Optimizer / training hyperparameters (used by training loop)
+        "learning_rate": 1e-3,
+        "weight_decay": 1e-4,
+        "num_epochs": cfg.get("training_params", {}).get("num_epochs", 80),
+        "batch_size": cfg.get("training_params", {}).get("batch_size", 256),
+        # Dynamic latent world-model flags
+        "target_mode": "latent_hi_rul",
+        "init_from_rul_hi": False,
+        "use_latent_history": True,
+        "use_hi_anchor": True,
+        "use_future_conds": True,
+        # A+ latent transformer decoder + EOL fusion
+        "use_eol_fusion": True,
+        "eol_fusion_mode": "token",
+        "predict_latent": True,
+        "latent_decoder_type": "transformer",
+        "latent_decoder_num_layers": 2,
+        "latent_decoder_nhead": 4,
+        "eol_scalar_loss_weight": 0.1,
+        # Encoder checkpoint + staged training
+        "encoder_checkpoint": ckpt_path,
+        "freeze_encoder": True,
+        "freeze_encoder_epochs": 10,
+        "unfreeze_encoder_layers": 1,
+        "encoder_lr_mult": 0.1,
+    }
+
+    return cfg
+
 def get_fd003_transformer_encoder_ms_dt_v1_config() -> ExperimentConfig:
     """
     Multi-Scale + Digital-Twin Transformer-Encoder experiment on FD003.
@@ -3728,6 +3814,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_latent_worldmodel_dynamic_freeze_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_dynamic_delta_v2":
         return get_fd004_transformer_latent_worldmodel_dynamic_delta_v2_config()
+    if experiment_name == "fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659":
+        return get_fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659_config()
     # Check for world model phase 5 v3 experiments first
     if "world" in experiment_name and "phase5" in experiment_name and "v3" in experiment_name:
         for dataset in ["FD001", "FD002", "FD003", "FD004"]:

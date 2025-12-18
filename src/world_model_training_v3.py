@@ -1692,6 +1692,48 @@ def train_transformer_world_model_v1(
         try:
             print(f"[WorldModelV1] Loading encoder weights from: {encoder_ckpt_path}")
             state = torch.load(encoder_ckpt_path, map_location=device)
+
+            def infer_checkpoint_input_dim(ckpt: object) -> Optional[int]:
+                # 1) meta.input_dim if present
+                if isinstance(ckpt, dict):
+                    meta = ckpt.get("meta", {})
+                    if isinstance(meta, dict) and "input_dim" in meta:
+                        try:
+                            return int(meta["input_dim"])
+                        except Exception:
+                            pass
+
+                    # 2) state dict inference via common key names
+                    sd = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
+                    if isinstance(sd, dict):
+                        for k, v in sd.items():
+                            if not hasattr(v, "shape"):
+                                continue
+                            # EOLFullTransformerEncoder uses `input_proj: Linear(input_dim, d_model)`
+                            if str(k).endswith("input_proj.weight") and len(v.shape) == 2:
+                                return int(v.shape[1])
+                            if "input_projection" in str(k) and str(k).endswith(".weight") and len(v.shape) == 2:
+                                return int(v.shape[1])
+                            if str(k).endswith("feat_proj.weight") and len(v.shape) == 2:
+                                return int(v.shape[1])
+                return None
+
+            ckpt_input_dim = infer_checkpoint_input_dim(state)
+            if ckpt_input_dim is not None:
+                if int(ckpt_input_dim) != int(input_dim):
+                    raise RuntimeError(
+                        "Encoder checkpoint feature-set mismatch:\n"
+                        f"- checkpoint_input_dim={int(ckpt_input_dim)}\n"
+                        f"- current_input_dim={int(input_dim)}\n"
+                        "This usually happens when features.include_groups is enabled or feature engineering differs.\n"
+                        "Fix: use the matching encoder run / same features, or disable include_groups."
+                    )
+            else:
+                print(
+                    "[WorldModelV1] Warning: could not infer checkpoint input_dim; "
+                    "skipping feature-set mismatch guard."
+                )
+
             # Accept either a full checkpoint or a plain state_dict
             if isinstance(state, dict) and "model_state_dict" in state:
                 encoder.load_state_dict(state["model_state_dict"], strict=False)
