@@ -1918,9 +1918,17 @@ def run_diagnostics_for_run(
             if isinstance(model, EOLFullTransformerEncoder):
                 # Cond_* indices for continuous condition encoder
                 cond_idx = [i for i, c in enumerate(feature_cols) if c.startswith("Cond_")]
-                if getattr(model, "use_cond_encoder", False) and getattr(model, "cond_in_dim", 0) > 0:
-                    if len(cond_idx) == int(getattr(model, "cond_in_dim", 0)):
-                        model.cond_feature_indices = torch.as_tensor(cond_idx, dtype=torch.long, device=device)
+                # NOTE: cond_in_dim may not be persisted in older checkpoints/configs (often None/0).
+                # Always re-attach indices when present to match training-time behavior.
+                if cond_idx and hasattr(model, "cond_feature_indices"):
+                    model.cond_feature_indices = torch.as_tensor(cond_idx, dtype=torch.long, device=device)
+                # If the model tracks cond_in_dim, fill it if missing.
+                if hasattr(model, "cond_in_dim"):
+                    try:
+                        if getattr(model, "cond_in_dim", 0) in (None, 0) and len(cond_idx) > 0:
+                            model.cond_in_dim = int(len(cond_idx))
+                    except Exception:
+                        pass
 
                 # Residual sensor indices for condition normalizer (v5)
                 if getattr(model, "use_condition_normalizer", False):
@@ -1928,9 +1936,14 @@ def run_diagnostics_for_run(
                     residual_cols = set(groups.get("residual", []))
                     sens_idx = [i for i, c in enumerate(feature_cols) if c in residual_cols]
                     if len(sens_idx) > 0:
-                        model.sensor_feature_indices_for_norm = torch.as_tensor(sens_idx, dtype=torch.long, device=device)
-                        # Initialise condition normalizer dims if possible
-                        if hasattr(model, "set_condition_normalizer_dims") and len(cond_idx) > 0:
+                        if hasattr(model, "sensor_feature_indices_for_norm"):
+                            model.sensor_feature_indices_for_norm = torch.as_tensor(sens_idx, dtype=torch.long, device=device)
+                        # Initialise condition normalizer dims if needed (after dims are known).
+                        if (
+                            hasattr(model, "set_condition_normalizer_dims")
+                            and len(cond_idx) > 0
+                            and getattr(model, "condition_normalizer", None) is None
+                        ):
                             model.set_condition_normalizer_dims(cond_dim=len(cond_idx), sensor_dim=len(sens_idx))
         except Exception as e:
             print(f"[diagnostics] WARNING: Could not restore transformer feature indices: {e}")
@@ -2305,7 +2318,8 @@ def run_diagnostics_for_run(
     # Rationale: users often compare `summary.json:test_metrics` with `eol_metrics.json`
     # and plots. If diagnostics is re-run later (or older runs are opened), summary.json
     # can become stale. We persist a canonical "diagnostics_test_metrics" block and also
-    # update the top-level test_* fields to match.
+    # update a dedicated diagnostics block. IMPORTANT: we must NOT overwrite the
+    # training-time "official" metrics stored in summary.json.
     try:
         summary_path = experiment_dir / "summary.json"
         if summary_path.exists():
@@ -2324,21 +2338,33 @@ def run_diagnostics_for_run(
         }
 
         summary_obj["diagnostics_test_metrics"] = diag_test_metrics
+        # Backward-compatible alias
+        summary_obj["test_metrics_diagnostics"] = dict(diag_test_metrics)
         summary_obj["diagnostics_meta"] = {
             "generated_at_utc": generated_at_utc,
             "generated_git_sha": generated_git_sha,
         }
 
-        # Update "official" test_metrics + flat keys to match diagnostics (single source of truth).
-        summary_obj["test_metrics"] = dict(diag_test_metrics)
-        summary_obj["test_rmse"] = float(diag_test_metrics["rmse"])
-        summary_obj["test_mae"] = float(diag_test_metrics["mae"])
-        summary_obj["test_bias"] = float(diag_test_metrics["bias"])
-        summary_obj["test_r2"] = float(diag_test_metrics["r2"])
-        summary_obj["test_nasa_mean"] = float(diag_test_metrics["nasa_mean"])
+        # Preserve training metrics as the official metrics in summary.json.
+        # If training metrics are present, keep them untouched and snapshot them once.
+        if isinstance(summary_obj.get("test_metrics"), dict):
+            summary_obj.setdefault("test_metrics_training", dict(summary_obj["test_metrics"]))
+        # Only populate missing training keys for older runs that don't have them.
+        if "test_metrics" not in summary_obj:
+            summary_obj["test_metrics"] = dict(diag_test_metrics)
+        if "test_rmse" not in summary_obj:
+            summary_obj["test_rmse"] = float(diag_test_metrics["rmse"])
+        if "test_mae" not in summary_obj:
+            summary_obj["test_mae"] = float(diag_test_metrics["mae"])
+        if "test_bias" not in summary_obj:
+            summary_obj["test_bias"] = float(diag_test_metrics["bias"])
+        if "test_r2" not in summary_obj:
+            summary_obj["test_r2"] = float(diag_test_metrics["r2"])
+        if "test_nasa_mean" not in summary_obj:
+            summary_obj["test_nasa_mean"] = float(diag_test_metrics["nasa_mean"])
 
         summary_path.write_text(json.dumps(summary_obj, indent=2), encoding="utf-8")
-        print(f"  ✓ Updated summary.json test metrics for consistency: {summary_path}")
+        print(f"  ✓ Wrote diagnostics_test_metrics (without overwriting training test_metrics): {summary_path}")
     except Exception as e:
         print(f"  ⚠️  WARNING: failed to update summary.json with diagnostics metrics: {e}")
     

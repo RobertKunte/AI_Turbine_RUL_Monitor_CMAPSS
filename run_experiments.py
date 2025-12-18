@@ -1519,24 +1519,24 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     print("\n" + "=" * 80)
     print(f"Experiment Complete: {experiment_name}")
     print("=" * 80)
-    # IMPORTANT: Prefer the persisted summary.json metrics (reloaded above) for printing.
-    # Diagnostics may rewrite summary.json for consistency, so printing `test_metrics`
-    # (computed before diagnostics) can be misleading.
-    tm = summary.get("test_metrics") if isinstance(summary, dict) else None
-    if isinstance(tm, dict) and all(k in tm for k in ["rmse", "mae", "bias", "r2", "nasa_mean"]):
-        print("Test Metrics: (from summary.json)")
-        print(f"  RMSE: {tm['rmse']:.2f} cycles")
-        print(f"  MAE:  {tm['mae']:.2f} cycles")
-        print(f"  Bias: {tm['bias']:.2f} cycles")
-        print(f"  R²:   {tm['r2']:.4f}")
-        print(f"  NASA Mean: {tm['nasa_mean']:.2f}")
-    else:
-        print("Test Metrics: (from evaluate_on_test_data, pre-diagnostics)")
-        print(f"  RMSE: {test_metrics['pointwise']['rmse']:.2f} cycles")
-        print(f"  MAE:  {test_metrics['pointwise']['mae']:.2f} cycles")
-        print(f"  Bias: {test_metrics['pointwise']['bias']:.2f} cycles")
-        print(f"  R²:   {test_metrics['pointwise']['r2']:.4f}")
-        print(f"  NASA Mean: {test_metrics['nasa_pointwise']['score_mean']:.2f}")
+    # Print training metrics (authoritative) + diagnostics metrics (secondary) if present.
+    print("Test Metrics (training eval_on_test_data):")
+    print(f"  RMSE: {test_metrics['pointwise']['rmse']:.2f} cycles")
+    print(f"  MAE:  {test_metrics['pointwise']['mae']:.2f} cycles")
+    print(f"  Bias: {test_metrics['pointwise']['bias']:.2f} cycles")
+    print(f"  R²:   {test_metrics['pointwise']['r2']:.4f}")
+    print(f"  NASA Mean: {test_metrics['nasa_pointwise']['score_mean']:.2f}")
+
+    diag_tm = None
+    if isinstance(summary, dict):
+        diag_tm = summary.get("diagnostics_test_metrics") or summary.get("test_metrics_diagnostics")
+    if isinstance(diag_tm, dict) and all(k in diag_tm for k in ["rmse", "mae", "bias", "r2", "nasa_mean"]):
+        print("Test Metrics (diagnostics):")
+        print(f"  RMSE: {diag_tm['rmse']:.2f} cycles")
+        print(f"  MAE:  {diag_tm['mae']:.2f} cycles")
+        print(f"  Bias: {diag_tm['bias']:.2f} cycles")
+        print(f"  R²:   {diag_tm['r2']:.4f}")
+        print(f"  NASA Mean: {diag_tm['nasa_mean']:.2f}")
     print("=" * 80)
     
     _registry_finish(summary, results_dir=results_dir, summary_path=results_dir / "summary.json")
