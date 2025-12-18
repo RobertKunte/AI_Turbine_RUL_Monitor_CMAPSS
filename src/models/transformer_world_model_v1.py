@@ -166,6 +166,10 @@ class TransformerWorldModelV1(nn.Module):
         self.latent_to_delta_hi: Optional[nn.Module] = None
         self.latent_to_delta_rul: Optional[nn.Module] = None
         self.eol_scalar_head: Optional[nn.Module] = None
+        # Latent-token heads (d_model -> 1) for the transformer-latent path.
+        # Needed because the classic heads (hi_head/rul_head) operate on d_dec (GRU hidden size).
+        self.hi_head_latent: Optional[nn.Module] = None
+        self.rul_head_latent: Optional[nn.Module] = None
 
         use_transformer_latent = (
             self.latent_decoder_type == "transformer"
@@ -198,6 +202,9 @@ class TransformerWorldModelV1(nn.Module):
             # Delta heads from latent tokens (dynamic delta semantics)
             self.latent_to_delta_hi = nn.Linear(self.d_model, 1)
             self.latent_to_delta_rul = nn.Linear(self.d_model, 1)
+            # Direct HI/RUL heads from latent tokens (simple latent mode)
+            self.hi_head_latent = nn.Linear(self.d_model, 1)
+            self.rul_head_latent = nn.Linear(self.d_model, 1)
 
     def forward(
         self,
@@ -303,10 +310,14 @@ class TransformerWorldModelV1(nn.Module):
                     pred_sensors = past_seq.new_zeros(B, H, self.num_sensors_out)
                     pred_hi = None
                     pred_rul = None
-                    if self.predict_hi and self.hi_head is not None:
-                        pred_hi = torch.sigmoid(self.hi_head(z_future)).view(B, H, 1)
-                    if self.predict_rul and self.rul_head is not None:
-                        pred_rul = torch.sigmoid(self.rul_head(z_future)).view(B, H, 1)
+                    if self.predict_hi:
+                        head = self.hi_head_latent if self.hi_head_latent is not None else self.hi_head
+                        if head is not None:
+                            pred_hi = torch.sigmoid(head(z_future)).view(B, H, 1)
+                    if self.predict_rul:
+                        head = self.rul_head_latent if self.rul_head_latent is not None else self.rul_head
+                        if head is not None:
+                            pred_rul = torch.sigmoid(head(z_future)).view(B, H, 1)
                     return pred_sensors, pred_hi, pred_rul, eol_scalar
 
                 if self.use_latent_history:
