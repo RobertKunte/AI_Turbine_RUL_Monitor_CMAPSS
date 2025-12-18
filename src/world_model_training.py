@@ -163,6 +163,32 @@ class WorldModelTrainingConfig:
     clip_grad_norm: Optional[float] = None
     freeze_encoder_epochs_after_eol_on: int = 0
 
+    # --------------------------------------------------
+    # Selection / alignment knobs (default OFF for backward compatibility)
+    # --------------------------------------------------
+    # If True, only allow "best checkpoint" updates once EOL is active
+    # (prevents selecting a pre-EOL checkpoint in 3-phase schedules).
+    select_best_after_eol_active: bool = False
+    # EOL becomes "active" once eol_mult >= this threshold.
+    eol_active_min_mult: float = 0.01
+    # Which metric to use for best checkpoint selection.
+    # - "val_total" (default): uses epoch_val_loss (current behavior)
+    # - "val_eol_weighted": uses epoch_val_eol_weighted
+    # - "val_eol": uses epoch_val_eol_loss
+    best_metric: str = "val_total"
+
+    # Align scalar EOL target definition (default preserves current behavior).
+    # - "future0": use Y_future[:, 0] (current behavior in v3 training loop)
+    # - "current": approximate current-step RUL from future0 (+1 with capping)
+    # - "future_last": use Y_future[:, -1]
+    eol_target_mode: str = "future0"
+    # If True, clamp seq2seq RUL targets to [0, max_rul] inside training/eval.
+    cap_rul_targets_to_max_rul: bool = False
+    # If True, clip eval y_true to [0, max_rul] (fixes mismatch when loader returns raw RUL).
+    eval_clip_y_true_to_max_rul: bool = False
+    # Optional: initialize EOL head bias close to mean target for faster stable ramp-in.
+    init_eol_bias_to_target_mean: bool = False
+
     # Stage-1: additional HI shape losses (default off; enable via experiment config)
     hi_early_slope_weight: float = 0.0
     hi_early_slope_epsilon: float = 1e-3

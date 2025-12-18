@@ -364,6 +364,16 @@ def train_world_model_universal_v3(
     eol_loss_type = str(getattr(world_model_config, "eol_loss_type", "mse")).lower()
     eol_huber_beta = float(getattr(world_model_config, "eol_huber_beta", 0.1))
 
+    # -------------------------------
+    # Selection / target alignment knobs (default OFF)
+    # -------------------------------
+    select_best_after_eol_active = bool(getattr(world_model_config, "select_best_after_eol_active", False))
+    eol_active_min_mult = float(getattr(world_model_config, "eol_active_min_mult", 0.01))
+    best_metric = str(getattr(world_model_config, "best_metric", "val_total"))
+    cap_rul_targets = bool(getattr(world_model_config, "cap_rul_targets_to_max_rul", False))
+    eol_target_mode = str(getattr(world_model_config, "eol_target_mode", "future0")).lower()
+    init_eol_bias = bool(getattr(world_model_config, "init_eol_bias_to_target_mean", False))
+
     # Resolve EOL normalization scale once (used only inside loss)
     def _resolve_eol_scale() -> float:
         scale_cfg = getattr(world_model_config, "eol_scale", "rul_cap")
@@ -392,6 +402,7 @@ def train_world_model_universal_v3(
 
     freeze_encoder_n = int(getattr(world_model_config, "freeze_encoder_epochs_after_eol_on", 0) or 0)
     eol_on_epoch: Optional[int] = None
+    eol_became_active_epoch: Optional[int] = None
 
     def _set_requires_grad(module: nn.Module, flag: bool) -> None:
         for p in module.parameters():
@@ -408,6 +419,26 @@ def train_world_model_universal_v3(
             return torch.abs(pred - target)
         # default mse
         return (pred - target) ** 2
+
+    # Optional: initialize EOL head bias close to mean target (raw units).
+    # Note: even when normalize_eol=True, the model output is still in raw units;
+    # normalization happens only inside the loss.
+    if init_eol_bias:
+        try:
+            if hasattr(model, "fc_rul") and isinstance(model.fc_rul, nn.Linear) and model.fc_rul.bias is not None:
+                max_rul_f = float(max_rul if max_rul is not None else 125.0)
+                # df_train["RUL"] may be raw; clamp if requested
+                if "RUL" in df_train.columns:
+                    v = df_train["RUL"].to_numpy(dtype=float)
+                    if cap_rul_targets:
+                        v = np.clip(v, 0.0, max_rul_f)
+                    mu = float(np.nanmean(v)) if v.size else float(max_rul_f)
+                else:
+                    mu = float(max_rul_f)
+                model.fc_rul.bias.data.fill_(mu)
+                print(f"[init] Initialized EOL head bias to mean target ~= {mu:.2f} (cap_targets={cap_rul_targets})")
+        except Exception as e:
+            print(f"  ⚠️  Warning: init_eol_bias_to_target_mean failed: {e}")
     
     history = {
         "train_loss": [],
@@ -523,9 +554,11 @@ def train_world_model_universal_v3(
     for epoch in range(num_epochs):
         eol_mult = _eol_mult_for_epoch(epoch)
         eol_weight_eff = float(world_model_config.eol_loss_weight) * float(getattr(world_model_config, "eol_w_max", 1.0)) * float(eol_mult)
-        eol_active = bool(eol_mult > 0.0)
+        eol_active = bool(eol_mult >= eol_active_min_mult)
         if eol_active and eol_on_epoch is None:
             eol_on_epoch = int(epoch)
+        if eol_active and eol_became_active_epoch is None:
+            eol_became_active_epoch = int(epoch)
 
         # Optional: freeze encoder briefly when EOL starts to protect representation
         if freeze_encoder_n > 0 and eol_on_epoch is not None and (epoch - eol_on_epoch) < freeze_encoder_n:
@@ -575,8 +608,39 @@ def train_world_model_universal_v3(
             # ------------------------------------------------------------------
             # Targets
             # ------------------------------------------------------------------
-            target_traj_rul = Y_batch              # (B, H, 1) - future RUL trajectory
-            target_eol = Y_batch[:, 0, 0]          # (B,)       - RUL at start of window
+            target_traj_rul = Y_batch              # (B, H, 1) - future RUL trajectory (may be raw)
+            if cap_rul_targets:
+                max_rul_f = float(max_rul if max_rul is not None else 125.0)
+                target_traj_rul = target_traj_rul.clamp(0.0, max_rul_f)
+
+            # Scalar EOL target (explicit definition; must match eval units)
+            if eol_target_mode in {"future0", "t0", "start"}:
+                target_eol = target_traj_rul[:, 0, 0]
+                target_def = "target_traj[:,0] (future0)"
+            elif eol_target_mode in {"future_last", "last"}:
+                target_eol = target_traj_rul[:, -1, 0]
+                target_def = "target_traj[:,-1] (future_last)"
+            elif eol_target_mode in {"current", "now"}:
+                # Approximate current-step RUL from the next-step target (+1),
+                # then re-apply the cap (plateau region stays at max_rul).
+                max_rul_f = float(max_rul if max_rul is not None else 125.0)
+                target_eol = (target_traj_rul[:, 0, 0] + 1.0).clamp(0.0, max_rul_f)
+                target_def = "min(max_rul, target_traj[:,0] + 1) (current approx)"
+            else:
+                target_eol = target_traj_rul[:, 0, 0]
+                target_def = f"unknown({eol_target_mode}) -> fallback future0"
+
+            # Runtime range check (first epoch / first batch)
+            if epoch == 0 and batch_idx == 0:
+                with torch.no_grad():
+                    te = target_eol.detach()
+                    te_max = float(te.max().cpu().item())
+                    te_min = float(te.min().cpu().item())
+                    mr = float(max_rul if max_rul is not None else 125.0)
+                    print(f"[target] eol_target_mode={eol_target_mode} ({target_def}) cap_targets={cap_rul_targets}")
+                    print(f"[target] eol_true_scalar: min={te_min:.2f} max={te_max:.2f} (max_rul={mr:.2f})")
+                    if te_max > mr + 1e-3:
+                        print("  ⚠️  Warning: eol_true_scalar exceeds max_rul -> likely unit/clip mismatch.")
 
             # Physics-informed Health Index targets derived from RUL
             MAX_VISIBLE_RUL = float(max_rul if max_rul is not None else 125.0)
@@ -792,7 +856,19 @@ def train_world_model_universal_v3(
                 
                 # Targets
                 target_traj_rul = Y_batch              # (B, H, 1)
-                target_eol = Y_batch[:, 0, 0]          # (B,)
+                if cap_rul_targets:
+                    max_rul_f = float(max_rul if max_rul is not None else 125.0)
+                    target_traj_rul = target_traj_rul.clamp(0.0, max_rul_f)
+
+                if eol_target_mode in {"future0", "t0", "start"}:
+                    target_eol = target_traj_rul[:, 0, 0]
+                elif eol_target_mode in {"future_last", "last"}:
+                    target_eol = target_traj_rul[:, -1, 0]
+                elif eol_target_mode in {"current", "now"}:
+                    max_rul_f = float(max_rul if max_rul is not None else 125.0)
+                    target_eol = (target_traj_rul[:, 0, 0] + 1.0).clamp(0.0, max_rul_f)
+                else:
+                    target_eol = target_traj_rul[:, 0, 0]
 
                 # Physics-informed HI targets (same as training loop)
                 MAX_VISIBLE_RUL = float(max_rul if max_rul is not None else 125.0)
@@ -945,20 +1021,54 @@ def train_world_model_universal_v3(
             f"val_shape: {epoch_val_hi_early_slope_loss:.4f}+{epoch_val_hi_curvature_loss:.4f} (w: {epoch_val_shape_weighted:.4f}), "
             f"val_eol_hi: {epoch_val_eol_hi_loss:.4f} (w: {epoch_val_eol_hi_weighted:.4f})"
         )
-        
-        # Early stopping
-        if epoch_val_loss < best_val_loss:
-            best_val_loss = epoch_val_loss
+
+        # --------------------------------------------------
+        # Best checkpoint selection + early stopping (optionally EOL-aware)
+        # --------------------------------------------------
+        allow_best_update = (not select_best_after_eol_active) or bool(eol_active)
+
+        # Choose which metric to optimize for best checkpoint
+        if best_metric == "val_total":
+            metric_val = float(epoch_val_loss)
+        elif best_metric == "val_eol_weighted":
+            metric_val = float(epoch_val_eol_weighted)
+        elif best_metric == "val_eol":
+            metric_val = float(epoch_val_eol_loss)
+        else:
+            metric_val = float(epoch_val_loss)
+
+        print(
+            f"[checkpoint] eol_active={eol_active} mult={eol_mult:.3f} "
+            f"allow_best_update={allow_best_update} best_metric={best_metric} metric={metric_val:.4f}"
+        )
+
+        # If gating is enabled, don't start patience until EOL becomes active
+        if select_best_after_eol_active and (not eol_active):
+            continue
+
+        # If EOL just turned on, reset patience/best so we don't keep the pre-EOL best.
+        if select_best_after_eol_active and eol_became_active_epoch is not None and epoch == eol_became_active_epoch:
+            best_val_loss = float("inf")
             epochs_no_improve = 0
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "epoch": epoch,
-                "val_loss": epoch_val_loss,
-                "input_dim": len(feature_cols),
-                "d_model": d_model,
-                "num_conditions": num_conditions,
-                "encoder_type": "world_model_universal_v3",
-            }, best_model_path)
+
+        if allow_best_update and metric_val < best_val_loss:
+            best_val_loss = metric_val
+            epochs_no_improve = 0
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "epoch": epoch,
+                    "val_loss": metric_val,
+                    "best_metric": best_metric,
+                    "input_dim": len(feature_cols),
+                    "d_model": d_model,
+                    "num_conditions": num_conditions,
+                    "encoder_type": "world_model_universal_v3",
+                    "eol_mult": float(eol_mult),
+                    "eol_active_min_mult": float(eol_active_min_mult),
+                },
+                best_model_path,
+            )
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
@@ -970,7 +1080,10 @@ def train_world_model_universal_v3(
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     
-    print(f"\n[7] Best model loaded from epoch {checkpoint['epoch']+1} (val_loss={checkpoint['val_loss']:.4f})")
+    print(
+        f"\n[7] Best model loaded from epoch {checkpoint['epoch']+1} "
+        f"(best_metric={checkpoint.get('best_metric','val_total')}, val={checkpoint['val_loss']:.4f})"
+    )
     
     # ===================================================================
     # 7. Evaluate on test set
@@ -986,6 +1099,7 @@ def train_world_model_universal_v3(
         max_rul=max_rul,
         num_conditions=num_conditions,
         device=device,
+        clip_y_true_to_max_rul=bool(getattr(world_model_config, "eval_clip_y_true_to_max_rul", False)),
     )
     
     print(f"  Test RMSE: {test_metrics['RMSE']:.2f} cycles")
@@ -1092,6 +1206,14 @@ def train_world_model_universal_v3(
             "eol_huber_beta": float(getattr(world_model_config, "eol_huber_beta", 0.1)),
             "clip_grad_norm": getattr(world_model_config, "clip_grad_norm", None),
             "freeze_encoder_epochs_after_eol_on": int(getattr(world_model_config, "freeze_encoder_epochs_after_eol_on", 0) or 0),
+            # Selection / alignment
+            "select_best_after_eol_active": bool(getattr(world_model_config, "select_best_after_eol_active", False)),
+            "eol_active_min_mult": float(getattr(world_model_config, "eol_active_min_mult", 0.01)),
+            "best_metric": str(getattr(world_model_config, "best_metric", "val_total")),
+            "cap_rul_targets_to_max_rul": bool(getattr(world_model_config, "cap_rul_targets_to_max_rul", False)),
+            "eol_target_mode": str(getattr(world_model_config, "eol_target_mode", "future0")),
+            "eval_clip_y_true_to_max_rul": bool(getattr(world_model_config, "eval_clip_y_true_to_max_rul", False)),
+            "init_eol_bias_to_target_mean": bool(getattr(world_model_config, "init_eol_bias_to_target_mean", False)),
             "hi_early_slope_weight": float(getattr(world_model_config, "hi_early_slope_weight", 0.0)),
             "hi_early_slope_epsilon": float(getattr(world_model_config, "hi_early_slope_epsilon", 1e-3)),
             "hi_early_slope_rul_threshold": getattr(world_model_config, "hi_early_slope_rul_threshold", None),
@@ -2000,6 +2122,8 @@ def evaluate_world_model_v3_eol(
     max_rul: int = 125,
     num_conditions: int = 1,
     device: torch.device = None,
+    # Optional: clip y_true to max_rul (fixes unit mismatch when loader returns raw RUL)
+    clip_y_true_to_max_rul: bool = False,
 ) -> Dict[str, Any]:
     """
     Evaluate World Model v3 on test set (EOL metrics).
@@ -2120,6 +2244,20 @@ def evaluate_world_model_v3_eol(
     
     y_true = np.array(y_true_all)
     y_pred = np.array(y_pred_all)
+
+    # Optional: clip y_true to the same range as y_pred (evaluation alignment)
+    if clip_y_true_to_max_rul:
+        y_true = np.clip(y_true, 0.0, float(max_rul))
+
+    # One-time range log (helps catch unit mismatch early)
+    try:
+        print(
+            f"[eval] y_true: min={float(np.min(y_true)):.2f} max={float(np.max(y_true)):.2f} "
+            f"| y_pred: min={float(np.min(y_pred)):.2f} max={float(np.max(y_pred)):.2f} "
+            f"(max_rul={float(max_rul):.2f}, clip_y_true={clip_y_true_to_max_rul})"
+        )
+    except Exception:
+        pass
     
     # Compute metrics
     errors = y_pred - y_true

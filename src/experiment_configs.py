@@ -3508,6 +3508,16 @@ def get_world_model_phase5_universal_v3_residual_config(
                 "use_hi_slope_in_eol": False,
                 # Keep max multiplier; normalization handles scale
                 "eol_w_max": 1.0,
+                # NEW: ensure we select best checkpoint only after EOL turns on
+                "select_best_after_eol_active": True,
+                "eol_active_min_mult": 0.02,
+                "best_metric": "val_total",
+                # NEW: align scalar EOL target + evaluation units to [0, max_rul]
+                "cap_rul_targets_to_max_rul": True,
+                "eol_target_mode": "current",
+                "eval_clip_y_true_to_max_rul": True,
+                # Optional: initialize EOL head bias near mean target
+                "init_eol_bias_to_target_mean": True,
             }
         )
     
