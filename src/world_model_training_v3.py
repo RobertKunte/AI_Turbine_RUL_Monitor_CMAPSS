@@ -1740,33 +1740,81 @@ def train_transformer_world_model_v1(
             else:
                 sd = state
 
-            # Robust loading: skip any tensor keys that exist in both but have mismatched shapes.
-            # This typically happens for optional heads (e.g., HI-cal fusion changing fc_rul in-dim),
-            # while the encoder backbone weights are still compatible and useful for WM training.
+            def load_encoder_backbone_from_checkpoint(
+                *,
+                state_dict: dict[str, torch.Tensor],
+                model: nn.Module,
+                allowed_substrings: Optional[list[str]] = None,
+            ) -> None:
+                drop_tokens = [
+                    "fc_rul",
+                    "fc_health",
+                    "fc_hi",
+                    "fc_eol",
+                    "bucket",
+                    "damage",
+                    "calib",
+                    "risk",
+                    "head",
+                    "sigma",
+                    "quantile",
+                ]
+                allow = allowed_substrings or [
+                    "input_proj",
+                    "pos_encoding",
+                    "transformer",
+                    "attn_pool",
+                    "condition_embedding",
+                    "cond_proj",
+                    "cond_encoder",
+                    "cond_recon",
+                    "condition_normalizer",
+                    "shared_head",
+                ]
+
+                selected: dict[str, torch.Tensor] = {}
+                skipped_names: list[str] = []
+                for k, v in state_dict.items():
+                    ks = str(k)
+                    if any(tok in ks for tok in drop_tokens):
+                        skipped_names.append(ks)
+                        continue
+                    if any(tok in ks for tok in allow):
+                        selected[k] = v
+                    else:
+                        skipped_names.append(ks)
+
+                print(
+                    f"[WorldModelV1] Encoder ckpt tensors: total={len(state_dict)} | selected(backbone)={len(selected)} | skipped={len(skipped_names)}"
+                )
+                if skipped_names:
+                    print("[WorldModelV1] Skipped tensors (first 10):")
+                    for name in skipped_names[:10]:
+                        print(f"  - {name}")
+
+                model.load_state_dict(selected, strict=False)
+
             if isinstance(sd, dict):
-                cur = encoder.state_dict()
-                filtered: dict[str, torch.Tensor] = {}
-                skipped: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
-                for k, v in sd.items():
-                    if k in cur and hasattr(v, "shape") and hasattr(cur[k], "shape"):
-                        if tuple(v.shape) != tuple(cur[k].shape):
-                            skipped.append((str(k), tuple(v.shape), tuple(cur[k].shape)))
-                            continue
-                    filtered[k] = v
-
-                if skipped:
-                    print(
-                        f"[WorldModelV1] Warning: skipped {len(skipped)} mismatched encoder tensors while loading checkpoint "
-                        f"(showing up to 5):"
-                    )
-                    for k, s1, s2 in skipped[:5]:
-                        print(f"  - {k}: ckpt={s1} vs model={s2}")
-                encoder.load_state_dict(filtered, strict=False)
+                load_encoder_backbone_from_checkpoint(
+                    state_dict=sd,
+                    model=encoder,
+                    allowed_substrings=[
+                        "input_proj",
+                        "pos_encoding",
+                        "transformer",
+                        "attn_pool",
+                        "condition_embedding",
+                        "cond_proj",
+                        "cond_encoder",
+                        "cond_recon",
+                        "condition_normalizer",
+                        "shared_head",
+                    ],
+                )
+                print("[WorldModelV1] Encoder backbone loaded successfully (heads excluded).")
             else:
-                # Fallback: if it's not a dict, attempt best-effort load
                 encoder.load_state_dict(sd, strict=False)
-
-            print("[WorldModelV1] Encoder weights loaded (strict=False, mismatches skipped).")
+                print("[WorldModelV1] Encoder weights loaded (strict=False).")
         except Exception as e:
             print(f"[WorldModelV1] Warning: failed to load encoder checkpoint '{encoder_ckpt_path}': {e}")
     else:
@@ -2002,7 +2050,22 @@ def train_transformer_world_model_v1(
                 eol_loss = F.mse_loss(pred_eol.view(-1), current_rul_b.view(-1))
                 loss = loss + eol_scalar_loss_weight * eol_loss
 
+            # AMP/overflow-ish guard (even without AMP): skip non-finite losses
+            if not torch.isfinite(loss).all():
+                print(f"  ⚠️  Non-finite loss at epoch={epoch+1} batch={batch_idx}: {loss.detach().cpu().item()}")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             loss.backward()
+            # Optional: grad clipping for stability (WM-V1 path)
+            grad_clip_norm = getattr(world_model_config, "grad_clip_norm", None)
+            if grad_clip_norm is not None:
+                try:
+                    torch.nn.utils.clip_grad_norm_(
+                        world_model.parameters(), max_norm=float(grad_clip_norm)
+                    )
+                except Exception as e:
+                    print(f"  ⚠️  Warning: grad_clip_norm failed: {e}")
             optimizer.step()
 
             running_train += loss.item() * X_b.size(0)
@@ -2296,7 +2359,7 @@ def evaluate_transformer_world_model_v1_on_test(
             current_hi_b = Y_hi_b[:, 0]  # (B,)
             current_rul_b = current_hi_b  # normalized RUL in [0,1]
 
-            pred_sensors, pred_hi, pred_rul = model(
+            out = model(
                 past_seq=X_b,
                 cond_vec=cond_vec,
                 cond_ids=cond_b,
@@ -2305,6 +2368,10 @@ def evaluate_transformer_world_model_v1_on_test(
                 current_rul=current_rul_b,
                 current_hi=current_hi_b,
             )
+            if isinstance(out, (tuple, list)) and len(out) == 4:
+                pred_sensors, pred_hi, pred_rul, _pred_eol = out
+            else:
+                pred_sensors, pred_hi, pred_rul = out
 
             if pred_rul is None:
                 continue

@@ -1019,8 +1019,10 @@ def get_fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659_confi
         "hi_future_loss_weight": 10.0,
         "rul_future_loss_weight": 1.0,
         # Optimizer / training hyperparameters (used by training loop)
-        "learning_rate": 1e-3,
+        # Training stability knobs (WM-V1)
+        "learning_rate": 5e-4,
         "weight_decay": 1e-4,
+        "grad_clip_norm": 1.0,
         "num_epochs": cfg.get("training_params", {}).get("num_epochs", 80),
         "batch_size": cfg.get("training_params", {}).get("batch_size", 256),
         # Dynamic latent world-model flags

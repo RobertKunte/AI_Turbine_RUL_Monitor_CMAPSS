@@ -853,6 +853,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             world_model_config.unfreeze_encoder_layers = world_model_params.get("unfreeze_encoder_layers", 0)
             world_model_config.encoder_lr_mult = world_model_params.get("encoder_lr_mult", 0.1)
             world_model_config.eol_scalar_loss_weight = world_model_params.get("eol_scalar_loss_weight", 0.0)
+            world_model_config.grad_clip_norm = world_model_params.get("grad_clip_norm", None)
 
             # If this is one of the Transformer World Model V1 experiments, route to
             # the dedicated training function; otherwise use the existing
@@ -885,8 +886,8 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                     cond_dim=9,
                     batch_size=config['training_params']['batch_size'],
                     num_epochs=config['training_params']['num_epochs'],
-                    lr=config['optimizer_params']['lr'],
-                    weight_decay=config['optimizer_params']['weight_decay'],
+                    lr=world_model_params.get('learning_rate', config['optimizer_params']['lr']),
+                    weight_decay=world_model_params.get('weight_decay', config['optimizer_params']['weight_decay']),
                     patience=config['training_params']['patience'],
                     results_dir=results_dir,
                     device=device,
