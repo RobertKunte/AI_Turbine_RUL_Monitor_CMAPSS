@@ -443,7 +443,11 @@ def train_world_model_universal_v3(
         )
         # endregion
         a = float(raw_a)
-        b = float(getattr(world_model_config, "phase_b_frac", getattr(world_model_config, "phase_b_end_frac", 0.8)))
+        # phase_b_frac may exist but be None -> treat as missing and fall back
+        b_raw = getattr(world_model_config, "phase_b_frac", None)
+        if b_raw is None:
+            b_raw = getattr(world_model_config, "phase_b_end_frac", 0.8)
+        b = float(b_raw)
         a = max(0.0, min(1.0, a))
         b = max(0.0, min(1.0, b))
         if b <= a:
