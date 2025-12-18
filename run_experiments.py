@@ -1131,8 +1131,6 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         # Optional: sensor feature indices for condition normalisation (v5)
         sensor_feature_indices_for_norm = None
         try:
-            from src.additional_features import group_feature_columns
-
             groups = group_feature_columns(feature_cols)
             residual_cols = set(groups.get("residual", []))
             if residual_cols:
