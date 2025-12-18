@@ -989,6 +989,13 @@ def get_fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659_confi
     # Ensure feature filtering stays OFF: do not set include_groups
     feats = cfg.get("features", {})
     feats.pop("include_groups", None)
+    # Match the v5 encoder feature-set dimensionality (659) by augmenting the
+    # multiscale block with extra temporal base columns for Twin_/Resid_.
+    # This is experiment-local and does NOT affect other runs.
+    ms = feats.get("multiscale", {})
+    ms.setdefault("extra_temporal_base_prefixes", ["Twin_", "Resid_"])
+    ms.setdefault("extra_temporal_base_max_cols", 31)
+    feats["multiscale"] = ms
     cfg["features"] = feats
 
     # World model params (dynamic latent A+)

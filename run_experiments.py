@@ -70,6 +70,7 @@ from src.data_loading import load_cmapps_subset
 from src.additional_features import (
     create_physical_features,
     create_all_features,
+    add_temporal_features,
     FeatureConfig,
     TemporalFeatureConfig,
     PhysicsFeatureConfig,
@@ -503,6 +504,54 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         inplace=False,
         physics_config=physics_config,
     )
+
+    # Optional: add *additional* temporal features for extra base columns.
+    # This is OFF by default and only activated when explicitly configured.
+    extra_prefixes = ms_cfg.get("extra_temporal_base_prefixes", None)
+    extra_max_cols = ms_cfg.get("extra_temporal_base_max_cols", None)
+    if use_temporal_features and extra_prefixes:
+        if not isinstance(extra_prefixes, (list, tuple)):
+            raise ValueError(
+                "features.multiscale.extra_temporal_base_prefixes must be a list of prefixes "
+                f"(e.g. ['Twin_','Resid_']). Got: {type(extra_prefixes)}"
+            )
+        prefixes = [str(p) for p in extra_prefixes]
+        candidates = [
+            c for c in df_train.columns
+            if any(c.startswith(p) for p in prefixes)
+        ]
+        candidates = sorted(set(candidates))
+        if extra_max_cols is not None:
+            candidates = candidates[: int(extra_max_cols)]
+        if candidates:
+            print(
+                f"[Train] Adding extra temporal base cols for multiscale: "
+                f"prefixes={prefixes} count={len(candidates)}"
+            )
+            extra_temporal_cfg = TemporalFeatureConfig(
+                base_cols=candidates,
+                short_windows=windows_short,
+                long_windows=combined_long if combined_long else (30,),
+                add_rolling_mean=True,
+                add_rolling_std=False,
+                add_trend=True,
+                add_delta=True,
+                delta_lags=(5, 10),
+            )
+            df_train = add_temporal_features(
+                df_train,
+                unit_col="UnitNumber",
+                cycle_col="TimeInCycles",
+                config=extra_temporal_cfg,
+                inplace=False,
+            )
+            df_test = add_temporal_features(
+                df_test,
+                unit_col="UnitNumber",
+                cycle_col="TimeInCycles",
+                config=extra_temporal_cfg,
+                inplace=False,
+            )
 
     # Optional physics-based Health Index (only needed explicitly for the
     # physics state encoder; kept here to avoid touching core model code).
