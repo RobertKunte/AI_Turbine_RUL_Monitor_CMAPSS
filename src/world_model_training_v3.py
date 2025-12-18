@@ -1736,10 +1736,37 @@ def train_transformer_world_model_v1(
 
             # Accept either a full checkpoint or a plain state_dict
             if isinstance(state, dict) and "model_state_dict" in state:
-                encoder.load_state_dict(state["model_state_dict"], strict=False)
+                sd = state["model_state_dict"]
             else:
-                encoder.load_state_dict(state, strict=False)
-            print("[WorldModelV1] Encoder weights loaded successfully.")
+                sd = state
+
+            # Robust loading: skip any tensor keys that exist in both but have mismatched shapes.
+            # This typically happens for optional heads (e.g., HI-cal fusion changing fc_rul in-dim),
+            # while the encoder backbone weights are still compatible and useful for WM training.
+            if isinstance(sd, dict):
+                cur = encoder.state_dict()
+                filtered: dict[str, torch.Tensor] = {}
+                skipped: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+                for k, v in sd.items():
+                    if k in cur and hasattr(v, "shape") and hasattr(cur[k], "shape"):
+                        if tuple(v.shape) != tuple(cur[k].shape):
+                            skipped.append((str(k), tuple(v.shape), tuple(cur[k].shape)))
+                            continue
+                    filtered[k] = v
+
+                if skipped:
+                    print(
+                        f"[WorldModelV1] Warning: skipped {len(skipped)} mismatched encoder tensors while loading checkpoint "
+                        f"(showing up to 5):"
+                    )
+                    for k, s1, s2 in skipped[:5]:
+                        print(f"  - {k}: ckpt={s1} vs model={s2}")
+                encoder.load_state_dict(filtered, strict=False)
+            else:
+                # Fallback: if it's not a dict, attempt best-effort load
+                encoder.load_state_dict(sd, strict=False)
+
+            print("[WorldModelV1] Encoder weights loaded (strict=False, mismatches skipped).")
         except Exception as e:
             print(f"[WorldModelV1] Warning: failed to load encoder checkpoint '{encoder_ckpt_path}': {e}")
     else:
