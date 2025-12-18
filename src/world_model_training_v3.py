@@ -45,11 +45,10 @@ except ImportError as exc:
     ) from exc
 
 from src.world_model_training import (
-    build_world_model_dataset_with_cond_ids,
     compute_trajectory_step_weights,
     WorldModelTrainingConfig,
-    build_seq2seq_samples_from_df,
 )
+from src.data.windowing import WindowConfig, TargetConfig, build_sliding_windows, build_test_windows_last
 from src.models.world_model import WorldModelUniversalV3
 from src.loss import (
     monotonic_health_loss,
@@ -207,27 +206,41 @@ def train_world_model_universal_v3(
     # ===================================================================
     print("[1] Building seq2seq sequences...")
     use_padded_horizon_targets = bool(getattr(world_model_config, "use_padded_horizon_targets", False))
-    target_clamp_min = float(getattr(world_model_config, "target_clamp_min", 0.0))
     use_horizon_mask = bool(getattr(world_model_config, "use_horizon_mask", False))
+    cap_targets = bool(getattr(world_model_config, "cap_rul_targets_to_max_rul", False))
+    eol_target_mode = str(getattr(world_model_config, "eol_target_mode", "future0"))
 
-    seq_out = build_world_model_dataset_with_cond_ids(
-        df=df_train,
-        feature_cols=feature_cols,
-        target_col="RUL",
-        past_len=past_len,
-        horizon=horizon,
-        unit_col="UnitNumber",
-        cond_col="ConditionID",
-        use_padded_horizon_targets=use_padded_horizon_targets,
-        target_clamp_min=target_clamp_min,
-        return_horizon_mask=use_horizon_mask,
+    window_cfg = WindowConfig(
+        past_len=int(past_len),
+        horizon=int(horizon),
+        stride=1,
+        require_full_horizon=not bool(use_padded_horizon_targets),
+        pad_mode="clamp",
+    )
+    target_cfg = TargetConfig(
+        max_rul=int(max_rul if max_rul is not None else 125),
+        cap_targets=bool(cap_targets),
+        eol_target_mode=str(eol_target_mode),
+        clip_eval_y_true=bool(getattr(world_model_config, "eval_clip_y_true_to_max_rul", False)),
     )
 
-    if isinstance(seq_out, tuple) and len(seq_out) == 4:
-        X_train, Y_train, cond_ids_train, horizon_mask_train = seq_out
-    else:
-        X_train, Y_train, cond_ids_train = seq_out  # type: ignore[misc]
-        horizon_mask_train = None
+    built = build_sliding_windows(
+        df_train,
+        feature_cols,
+        target_col="RUL",
+        unit_col="UnitNumber",
+        time_col="TimeInCycles",
+        cond_col="ConditionID",
+        window_cfg=window_cfg,
+        target_cfg=target_cfg,
+        return_mask=bool(use_horizon_mask),
+    )
+
+    X_train = torch.tensor(built["X"], dtype=torch.float32)
+    Y_train = torch.tensor(built["Y_seq"], dtype=torch.float32)
+    unit_ids_train = torch.tensor(built["unit_ids"], dtype=torch.long)
+    cond_ids_train = torch.tensor(built["cond_ids"], dtype=torch.long)
+    horizon_mask_train = torch.tensor(built["mask"], dtype=torch.float32) if (use_horizon_mask and built["mask"] is not None) else None
     
     print(f"  Train sequences: {X_train.shape[0]}")
     print(f"  Input shape: {X_train.shape}, Target shape: {Y_train.shape}")
@@ -243,13 +256,18 @@ def train_world_model_universal_v3(
     # 2. Engine-based train/val split
     # ===================================================================
     print("\n[2] Creating engine-based train/val split...")
-    n_total = len(X_train)
-    n_val = int((1 - engine_train_ratio) * n_total)
-    n_train = n_total - n_val
-    
-    indices = torch.randperm(n_total, generator=torch.Generator().manual_seed(random_seed))
-    train_indices = indices[:n_train]
-    val_indices = indices[n_train:]
+    # Proper engine split: split by unique unit IDs, then select samples by membership.
+    rng = torch.Generator().manual_seed(random_seed)
+    unique_units = torch.unique(unit_ids_train)
+    perm = unique_units[torch.randperm(len(unique_units), generator=rng)]
+    n_val_units = max(1, int((1.0 - float(engine_train_ratio)) * float(len(unique_units))))
+    val_units = perm[:n_val_units]
+    train_units = perm[n_val_units:]
+    train_mask = torch.isin(unit_ids_train, train_units)
+    val_mask = torch.isin(unit_ids_train, val_units)
+
+    train_indices = torch.nonzero(train_mask, as_tuple=False).view(-1)
+    val_indices = torch.nonzero(val_mask, as_tuple=False).view(-1)
     
     X_train_split = X_train[train_indices]
     Y_train_split = Y_train[train_indices]
@@ -1144,6 +1162,8 @@ def train_world_model_universal_v3(
         num_conditions=num_conditions,
         device=device,
         clip_y_true_to_max_rul=bool(getattr(world_model_config, "eval_clip_y_true_to_max_rul", False)),
+        window_cfg=window_cfg,
+        target_cfg=target_cfg,
     )
     
     print(f"  Test RMSE: {test_metrics['RMSE']:.2f} cycles")
@@ -1223,6 +1243,19 @@ def train_world_model_universal_v3(
         "past_len": past_len,
         "horizon": horizon,
         "max_rul": max_rul,
+        "window_cfg": {
+            "past_len": int(window_cfg.past_len),
+            "horizon": int(window_cfg.horizon),
+            "stride": int(window_cfg.stride),
+            "pad_mode": str(window_cfg.pad_mode),
+            "require_full_horizon": bool(window_cfg.require_full_horizon),
+        },
+        "target_cfg": {
+            "max_rul": int(target_cfg.max_rul),
+            "cap_targets": bool(target_cfg.cap_targets),
+            "eol_target_mode": str(target_cfg.eol_target_mode),
+            "clip_eval_y_true": bool(target_cfg.clip_eval_y_true),
+        },
         "world_model_config": {
             "forecast_horizon": horizon,
             "traj_loss_weight": world_model_config.traj_loss_weight,
@@ -2167,6 +2200,9 @@ def evaluate_world_model_v3_eol(
     device: torch.device = None,
     # Optional: clip y_true to max_rul (fixes unit mismatch when loader returns raw RUL)
     clip_y_true_to_max_rul: bool = False,
+    # Optional: provide the exact window/target policy used in training
+    window_cfg: Optional[WindowConfig] = None,
+    target_cfg: Optional[TargetConfig] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate World Model v3 on test set (EOL metrics).
@@ -2190,103 +2226,61 @@ def evaluate_world_model_v3_eol(
     
     model = model.to(device)
     model.eval()
-    
-    y_pred_all = []
-    y_true_all = []
-    unit_ids_list = []
-    
-    # Helper function to build EOL input
-    def _build_eol_input_for_unit(df_unit: pd.DataFrame, feature_cols: List[str], past_len: int) -> np.ndarray:
-        """Build past_len window for EOL evaluation."""
-        df_unit = df_unit.sort_values("TimeInCycles")
-        feats = df_unit[feature_cols].values.astype(np.float32)
-        
-        if len(feats) < past_len:
-            # Pad with first row
-            padding = np.tile(feats[0:1], (past_len - len(feats), 1))
-            feats = np.vstack([padding, feats])
-        else:
-            # Take last past_len rows
-            feats = feats[-past_len:]
-        
-        return feats
-    
-    # Create mapping from unit_id to index in y_test_true
-    unit_id_to_idx = {i + 1: i for i in range(len(y_test_true))}
-    
+
+    # Use the central builder for "last window per unit"
+    if window_cfg is None:
+        window_cfg = WindowConfig(past_len=int(past_len), horizon=1, pad_mode="clamp")
+    if target_cfg is None:
+        target_cfg = TargetConfig(max_rul=int(max_rul), cap_targets=True)
+
+    built = build_test_windows_last(
+        df_test=df_test,
+        y_test_true=y_test_true,
+        feature_cols=feature_cols,
+        unit_col="UnitNumber",
+        time_col="TimeInCycles",
+        cond_col="ConditionID",
+        window_cfg=window_cfg,
+        target_cfg=target_cfg,
+    )
+
+    X = built["X"]  # (N, P, F)
+    y_true = built["y_true"]  # (N,)
+    cond_ids_np = built["cond_ids"]
+
+    # Condition-wise scaling (same as training)
+    X_scaled = np.empty_like(X, dtype=np.float32)
+    for cond in np.unique(cond_ids_np):
+        cond = int(cond)
+        idxs = np.where(cond_ids_np == cond)[0]
+        scaler = scaler_dict.get(cond, scaler_dict.get(0))
+        flat = X[idxs].reshape(-1, len(feature_cols))
+        X_scaled[idxs] = scaler.transform(flat).reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
+
+    X_t = torch.tensor(X_scaled, dtype=torch.float32).to(device)
+    cond_t = torch.tensor(cond_ids_np, dtype=torch.long).to(device) if num_conditions > 1 else None
+
+    y_pred_vals: list[float] = []
     with torch.no_grad():
-        for unit_id, df_unit in df_test.groupby("UnitNumber"):
-            unit_id = int(unit_id)
-            
-            # Build input
-            X_past_np = _build_eol_input_for_unit(df_unit, feature_cols, past_len)
-            
-            # Get condition ID
-            cond_id = int(df_unit["ConditionID"].iloc[0])
-            
-            # Scale
-            scaler = scaler_dict.get(cond_id, scaler_dict.get(0))
-            X_past_scaled = scaler.transform(X_past_np.reshape(-1, len(feature_cols))).reshape(past_len, len(feature_cols))
-            
-            X_past = torch.tensor(X_past_scaled, dtype=torch.float32).unsqueeze(0).to(device)  # (1, past_len, F)
-            cond_ids = torch.tensor([cond_id], dtype=torch.long).to(device) if num_conditions > 1 else None
-            
-            # Predict
-            outputs = model(
-                encoder_inputs=X_past,
-                decoder_targets=None,
-                teacher_forcing_ratio=0.0,
-                horizon=1,
-                cond_ids=cond_ids,
-            )
+        outputs = model(
+            encoder_inputs=X_t,
+            decoder_targets=None,
+            teacher_forcing_ratio=0.0,
+            horizon=1,
+            cond_ids=cond_t,
+        )
+        if isinstance(outputs, dict):
+            eol_pred = outputs.get("eol", outputs.get("rul"))
+            if eol_pred is None:
+                raise ValueError("evaluate_world_model_v3_eol: could not find 'eol' or 'rul' in model outputs dict")
+        else:
+            eol_pred = outputs[1] if isinstance(outputs, (tuple, list)) and len(outputs) >= 2 else outputs
 
-            # Robustly extract EOL/RUL prediction from different output formats
-            if isinstance(outputs, dict):
-                # World Model v3 or dict-like wrapper
-                eol_pred = outputs.get("eol", outputs.get("rul"))
-                if eol_pred is None:
-                    raise ValueError("evaluate_world_model_v3_eol: could not find 'eol' or 'rul' in model outputs dict")
-            else:
-                # Tuple/list outputs: e.g. (traj, eol)
-                if isinstance(outputs, (tuple, list)):
-                    if len(outputs) == 2:
-                        _, eol_pred = outputs
-                    else:
-                        # Fallback: assume second element is EOL
-                        eol_pred = outputs[1]
-                else:
-                    # Unexpected type, treat whole output as eol_pred
-                    eol_pred = outputs
-
-            # Normalize shapes: expect either (B, 1), (B,) or (B, H, 1)
-            eol_tensor = eol_pred
-            if isinstance(eol_tensor, np.ndarray):
-                eol_val = float(eol_tensor.reshape(-1)[0])
-            else:
-                if eol_tensor.dim() == 3:
-                    # (B, H, 1) -> first horizon step
-                    eol_val = float(eol_tensor[0, 0, 0].cpu().item())
-                elif eol_tensor.dim() == 2:
-                    # (B, 1)
-                    eol_val = float(eol_tensor[0, 0].cpu().item())
-                else:
-                    # (B,)
-                    eol_val = float(eol_tensor[0].cpu().item())
-
-            pred_rul = np.clip(eol_val, 0.0, max_rul)
-            
-            y_pred_all.append(pred_rul)
-            unit_ids_list.append(unit_id)
-            # Map unit_id to index in y_test_true
-            idx = unit_id_to_idx.get(unit_id, unit_id - 1)
-            if idx < len(y_test_true):
-                y_true_all.append(y_test_true[idx])
-            else:
-                # Fallback: use last value if index out of range
-                y_true_all.append(y_test_true[-1])
-    
-    y_true = np.array(y_true_all)
-    y_pred = np.array(y_pred_all)
+        e = eol_pred
+        if torch.is_tensor(e):
+            e = e.view(-1).detach().cpu().numpy()
+        e = np.asarray(e, dtype=float).reshape(-1)
+        y_pred = np.clip(e, 0.0, float(max_rul)).astype(float)
 
     metrics = evaluate_eol_metrics(
         y_true=y_true,

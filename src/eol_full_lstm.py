@@ -157,6 +157,7 @@ def build_full_eol_sequences_from_df(
     df: pd.DataFrame,
     feature_cols: list[str],
     past_len: int = 30,
+    horizon: int = 40,
     max_rul: int = 125,
     unit_col: str = "UnitNumber",
     cycle_col: str = "TimeInCycles",
@@ -190,14 +191,10 @@ def build_full_eol_sequences_from_df(
         cond_ids: IntTensor [N] - Condition-IDs für jedes Sample
         health_phys_seq: Optional[FloatTensor [N, past_len]] - HI_phys_v2 sequences (None if not available)
     """
-    X_list = []
-    y_list = []
-    unit_id_list = []
-    cond_id_list = []
-    health_phys_seq_list = []
+    from src.data.windowing import WindowConfig, TargetConfig, build_sliding_windows
 
     unit_ids = df[unit_col].unique()
-    
+
     # Check which HI_phys column is available (prefer v3 over v2)
     hi_phys_col: Optional[str] = None
     if "HI_phys_v3" in df.columns:
@@ -227,64 +224,74 @@ def build_full_eol_sequences_from_df(
         # Grouping is purely diagnostic; never break the pipeline.
         print(f"Warning: could not compute feature groups: {e}")
 
-    for uid in unit_ids:
-        df_u = (
-            df[df[unit_col] == uid]
-            .sort_values(cycle_col)
-            .reset_index(drop=True)
+    # Build windows + (optional) padded horizon targets for consistent logging/policy.
+    window_cfg = WindowConfig(
+        past_len=int(past_len),
+        horizon=int(horizon),
+        stride=1,
+        require_full_horizon=False,
+        pad_mode="clamp",
+    )
+    target_cfg = TargetConfig(
+        max_rul=int(max_rul),
+        cap_targets=True,
+        # Preserve legacy behavior: y is current RUL at window end (t),
+        # not the future (t+1) target.
+        eol_target_mode="current_from_df",
+        clip_eval_y_true=False,
+    )
+
+    built = build_sliding_windows(
+        df=df,
+        feature_cols=feature_cols,
+        target_col=rul_col,
+        unit_col=unit_col,
+        time_col=cycle_col,
+        cond_col=cond_col,
+        window_cfg=window_cfg,
+        target_cfg=target_cfg,
+        return_mask=True,
+    )
+
+    X_np = built["X"]
+    y_np = built["Y_eol"]
+    unit_id_np = built["unit_ids"]
+    cond_id_np = built["cond_ids"]
+    t_end_pos_np = built["t_end_pos"]
+
+    X = torch.from_numpy(X_np).float()
+    y = torch.from_numpy(y_np.astype(np.float32, copy=False)).float()
+    unit_ids_tensor = torch.from_numpy(unit_id_np.astype(np.int64, copy=False))
+    cond_ids_tensor = torch.from_numpy(cond_id_np.astype(np.int64, copy=False))
+
+    # Build HI_phys sequences aligned to the exact same samples (if available).
+    health_phys_seq: Optional[torch.Tensor] = None
+    if hi_phys_col is not None and hi_phys_col in df.columns:
+        hi_by_unit: Dict[int, np.ndarray] = {}
+        for uid, df_u in df.groupby(unit_col):
+            df_u = df_u.sort_values(cycle_col).reset_index(drop=True)
+            hi_by_unit[int(uid)] = df_u[hi_phys_col].to_numpy(dtype=np.float32, copy=True)
+
+        hi_windows: list[np.ndarray] = []
+        for uid_i, t_end in zip(unit_id_np, t_end_pos_np):
+            hi_vals = hi_by_unit[int(uid_i)]
+            s = int(t_end) - int(past_len) + 1
+            e = int(t_end) + 1
+            hi_windows.append(hi_vals[s:e])
+        if hi_windows:
+            health_phys_seq = torch.from_numpy(np.stack(hi_windows, axis=0)).float()
+
+    if health_phys_seq is not None:
+        print(
+            f"X shape: {X.shape}, y shape: {y.shape}, unit_ids shape: {unit_ids_tensor.shape}, "
+            f"cond_ids shape: {cond_ids_tensor.shape}, health_phys_seq shape: {tuple(health_phys_seq.shape)}"
         )
-
-        if len(df_u) < past_len:
-            continue
-
-        # ConditionID is constant per unit; take any row
-        cond_id = int(df_u[cond_col].iloc[0]) if cond_col in df_u.columns else 0
-
-        values = df_u[feature_cols].to_numpy(dtype=np.float32)
-        rul_values = df_u[rul_col].to_numpy(dtype=np.float32)
-        
-        # Extract HI_phys (v3 preferred, else v2) if available
-        if hi_phys_col is not None and hi_phys_col in df_u.columns:
-            hi_phys_values = df_u[hi_phys_col].to_numpy(dtype=np.float32)
-        else:
-            hi_phys_values = None
-
-        # Sliding window über den gesamten Lebenslauf
-        for i in range(past_len - 1, len(df_u)):
-            window = values[i - past_len + 1 : i + 1]  # [past_len, num_features]
-            rul_i = rul_values[i]
-            rul_capped = min(rul_i, max_rul)  # Cap RUL at max_rul
-
-            X_list.append(window)
-            y_list.append(rul_capped)
-            unit_id_list.append(uid)
-            cond_id_list.append(cond_id)
-            
-            # Extract HI_phys sequence for this window (v3 preferred, else v2)
-            if hi_phys_values is not None:
-                hi_phys_window = hi_phys_values[i - past_len + 1 : i + 1]  # [past_len]
-                health_phys_seq_list.append(hi_phys_window)
-
-    if len(X_list) == 0:
-        raise ValueError(
-            "[build_full_eol_sequences_from_df] No samples built – "
-            "check past_len and data."
-        )
-
-    X = torch.from_numpy(np.stack(X_list))  # [N, past_len, num_features]
-    y = torch.from_numpy(np.array(y_list, dtype=np.float32))  # [N]
-    unit_ids_tensor = torch.from_numpy(np.array(unit_id_list, dtype=np.int32))  # [N]
-    cond_ids_tensor = torch.from_numpy(np.array(cond_id_list, dtype=np.int64))  # [N]
-    
-    # Build health_phys_seq if available
-    if health_phys_seq_list and len(health_phys_seq_list) > 0:
-        health_phys_seq = torch.from_numpy(np.stack(health_phys_seq_list))  # [N, past_len]
-        print(f"X shape: {X.shape}, y shape: {y.shape}, unit_ids shape: {unit_ids_tensor.shape}, cond_ids shape: {cond_ids_tensor.shape}, health_phys_seq shape: {health_phys_seq.shape}")
     else:
-        health_phys_seq = None
-        print(f"X shape: {X.shape}, y shape: {y.shape}, unit_ids shape: {unit_ids_tensor.shape}, cond_ids shape: {cond_ids_tensor.shape}, health_phys_seq: None")
+        print(
+            f"X shape: {X.shape}, y shape: {y.shape}, unit_ids shape: {unit_ids_tensor.shape}, "
+            f"cond_ids shape: {cond_ids_tensor.shape}, health_phys_seq: None"
+        )
 
-    return X, y, unit_ids_tensor, cond_ids_tensor, health_phys_seq
     print(
         f"RUL stats (capped at {max_rul}): min={y.min().item():.2f}, "
         f"max={y.max().item():.2f}, mean={y.mean().item():.2f}, "
@@ -295,7 +302,7 @@ def build_full_eol_sequences_from_df(
         print(f"ConditionIDs: {unique_conds.tolist()}")
     print("============================================================")
 
-    return X, y, unit_ids_tensor, cond_ids_tensor
+    return X, y, unit_ids_tensor, cond_ids_tensor, health_phys_seq
 
 
 class SequenceDatasetWithUnits:
@@ -634,83 +641,41 @@ def build_test_sequences_from_df(
         unit_ids: IntTensor [N] - Unit-IDs für jedes Sample
         cond_ids: IntTensor [N] - Condition-IDs für jedes Sample
     """
-    X_list = []
-    unit_id_list = []
-    cond_id_list = []
-    
-    # Sort unit_ids to ensure consistent ordering (matches y_test_true order from load_cmapps_subset)
-    unit_ids = np.sort(df_test[unit_col].unique())
-    
+    from src.data.windowing import WindowConfig, TargetConfig, build_test_windows_last
+
     # Filter feature_cols to only include columns that exist in test DataFrame
     available_feature_cols = [col for col in feature_cols if col in df_test.columns]
     missing_cols = [col for col in feature_cols if col not in df_test.columns]
-    
     if missing_cols:
-        print(f"[WARNING] {len(missing_cols)} feature columns not found in test data: {missing_cols[:5]}{'...' if len(missing_cols) > 5 else ''}")
+        print(
+            f"[WARNING] {len(missing_cols)} feature columns not found in test data: "
+            f"{missing_cols[:5]}{'...' if len(missing_cols) > 5 else ''}"
+        )
         print(f"[WARNING] Using {len(available_feature_cols)} available features instead of {len(feature_cols)}")
-    
     if len(available_feature_cols) == 0:
         raise ValueError(
             "[build_test_sequences_from_df] No feature columns available in test DataFrame. "
             f"Requested: {len(feature_cols)}, Available: {len(available_feature_cols)}"
         )
-    
-    print("============================================================")
-    print("[build_test_sequences_from_df] Summary")
-    print("============================================================")
-    print(f"Num test units: {len(unit_ids)}")
-    print(f"Using past_len={past_len}")
-    print(f"Num feature cols requested: {len(feature_cols)}")
-    print(f"Num feature cols available: {len(available_feature_cols)}")
-    
-    # Use only available features
-    feature_cols = available_feature_cols
-    
-    for uid in unit_ids:
-        df_u = (
-            df_test[df_test[unit_col] == uid]
-            .sort_values(cycle_col)
-            .reset_index(drop=True)
-        )
-        
-        # ConditionID is constant per unit; take any row
-        cond_id = int(df_u[cond_col].iloc[0]) if cond_col in df_u.columns else 0
-        
-        if len(df_u) < past_len:
-            # Wenn Engine zu kurz ist, verwende alle verfügbaren Zyklen
-            # und padde mit dem letzten Wert
-            values = df_u[feature_cols].to_numpy(dtype=np.float32)
-            if len(values) > 0:
-                # Pad with last value
-                padding = np.repeat(values[-1:], past_len - len(values), axis=0)
-                window = np.vstack([padding, values])
-            else:
-                continue
-        else:
-            # Nimm die letzten past_len Zyklen
-            values = df_u[feature_cols].to_numpy(dtype=np.float32)
-            window = values[-past_len:]  # [past_len, num_features]
-        
-        X_list.append(window)
-        unit_id_list.append(uid)
-        cond_id_list.append(cond_id)
-    
-    if len(X_list) == 0:
-        raise ValueError(
-            "[build_test_sequences_from_df] No samples built – "
-            "check past_len and test data."
-        )
-    
-    X = torch.from_numpy(np.stack(X_list))  # [N, past_len, num_features]
-    unit_ids_tensor = torch.from_numpy(np.array(unit_id_list, dtype=np.int32))  # [N]
-    cond_ids_tensor = torch.from_numpy(np.array(cond_id_list, dtype=np.int64))  # [N]
 
-    print(f"X shape: {X.shape}, unit_ids shape: {unit_ids_tensor.shape}, cond_ids shape: {cond_ids_tensor.shape}")
-    if cond_col in df_test.columns:
-        unique_conds = torch.unique(cond_ids_tensor)
-        print(f"ConditionIDs: {unique_conds.tolist()}")
-    print("============================================================")
+    # We don't have y_test_true here; build_test_windows_last needs it.
+    # We pass a dummy vector of the correct length (1..N) and return only windows + ids.
+    unit_ids = np.sort(df_test[unit_col].unique())
+    y_dummy = np.zeros((len(unit_ids),), dtype=np.float32)
+    built = build_test_windows_last(
+        df_test=df_test,
+        y_test_true=y_dummy,
+        feature_cols=available_feature_cols,
+        unit_col=unit_col,
+        time_col=cycle_col,
+        cond_col=cond_col,
+        window_cfg=WindowConfig(past_len=int(past_len), horizon=1, pad_mode="clamp"),
+        target_cfg=TargetConfig(max_rul=125, cap_targets=False),
+    )
 
+    X = torch.from_numpy(built["X"]).float()
+    unit_ids_tensor = torch.from_numpy(built["unit_ids"].astype(np.int64))
+    cond_ids_tensor = torch.from_numpy(built["cond_ids"].astype(np.int64))
     return X, unit_ids_tensor, cond_ids_tensor
 
 
@@ -892,24 +857,22 @@ def evaluate_on_test_data(
         except Exception as e:
             print(f"[evaluate_on_test_data:FINGERPRINT] WARNING: failed: {e}")
     
-    # Use shared metrics function for consistency with diagnostics
-    # This ensures both evaluation and diagnostics use exactly the same formulas
-    # Note: Values are already capped above, so pass max_rul=None to avoid double-capping
-    from src.metrics import compute_eol_errors_and_nasa
-    eol_metrics_dict = compute_eol_errors_and_nasa(
-        y_true_eol=y_test_true_capped,
-        y_pred_eol=y_test_pred,
-        max_rul=None,  # Already capped above, so no need to cap again
+    from src.eval.eol_metrics import evaluate_eol_metrics
+    m = evaluate_eol_metrics(
+        y_true=y_test_true_aligned,
+        y_pred=y_test_pred,
+        max_rul=float(max_rul),
+        clip_y_true=True,   # keep legacy eval behavior (NASA-capped)
+        clip_y_pred=True,
+        log_prefix="[eval-eol_full]",
     )
-    
-    # Extract metrics from shared function
-    mse = eol_metrics_dict["mse"]
-    rmse = eol_metrics_dict["rmse"]
-    mae = eol_metrics_dict["mae"]
-    bias = eol_metrics_dict["bias"]
-    r2 = eol_metrics_dict["r2"]
-    nasa_score_sum = eol_metrics_dict["nasa_sum"]
-    nasa_score_mean = eol_metrics_dict["nasa_mean"]
+    mse = float(m["MSE"])
+    rmse = float(m["RMSE"])
+    mae = float(m["MAE"])
+    bias = float(m["Bias"])
+    r2 = float(m["R2"])
+    nasa_score_sum = float(m["nasa_score_sum"])
+    nasa_score_mean = float(m["nasa_score_mean"])
     
     # EOL metrics (same as pointwise for test data - one sample per engine)
     rmse_eol = rmse
@@ -919,7 +882,7 @@ def evaluate_on_test_data(
     print("============================================================")
     print("[evaluate_on_test_data] Test Metrics")
     print("============================================================")
-    print(f"Num test engines: {len(y_test_true_capped)}")
+    print(f"Num test engines: {len(m['y_true'])}")
     print(f"MSE: {mse:.4f}")
     print(f"RMSE: {rmse:.4f} cycles")
     print(f"MAE: {mae:.4f} cycles")
@@ -943,7 +906,7 @@ def evaluate_on_test_data(
             "bias": bias_eol,
             "nasa_score_sum": nasa_score_sum,
             "nasa_score_mean": nasa_score_mean,
-            "num_engines": len(y_test_true_capped),
+            "num_engines": int(len(m["y_true"])),
         },
         "nasa_pointwise": {  # Für Konsistenz mit evaluate_eol_full_lstm
             "score_sum": nasa_score_sum,
@@ -953,8 +916,8 @@ def evaluate_on_test_data(
             "score_sum": nasa_score_sum,
             "score_mean": nasa_score_mean,
         },
-        "y_true": y_test_true_capped,
-        "y_pred": y_test_pred,
+        "y_true": m["y_true"],
+        "y_pred": m["y_pred"],
         "unit_ids": unit_ids_test.numpy(),
     }
 

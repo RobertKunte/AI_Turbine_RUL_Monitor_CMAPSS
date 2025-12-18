@@ -1986,6 +1986,37 @@ def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residua
     return cfg
 
 
+def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_low20_harmonized_windows_config() -> ExperimentConfig:
+    """
+    Same as `..._tau95_w1_low20`, but with explicit harmonized window/target policy
+    persisted to summary.json and consumed by the training pipeline:
+      - past_len=30
+      - horizon=40
+      - pad_mode="clamp"
+      - max_rul=125 (capped targets/eval)
+
+    This is meant to align windowing with the WorldModel v3 policy.
+    """
+    cfg = get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_low20_config()
+    cfg["experiment_name"] = "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_low20_harmwin"
+    cfg["window_cfg"] = {
+        "past_len": 30,
+        "horizon": 40,
+        "stride": 1,
+        "pad_mode": "clamp",
+        "require_full_horizon": False,
+    }
+    cfg["target_cfg"] = {
+        "max_rul": 125,
+        "cap_targets": True,
+        # Transformer/EOL models train on the scalar at the window end (current RUL).
+        "eol_target_mode": "current_from_df",
+        # Eval should be NASA-style capped for comparability.
+        "clip_eval_y_true": True,
+    }
+    return cfg
+
+
 def get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w3_low20_config() -> ExperimentConfig:
     """
     Residual-risk sweep (τ=0.95 target):
@@ -3643,6 +3674,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau99_w5_low20_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_low20":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_low20_config()
+    if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_low20_harmwin":
+        return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w1_low20_harmonized_windows_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w3_low20":
         return get_fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w3_low20_config()
     if experiment_name == "fd004_transformer_encoder_ms_dt_v2_damage_v5_cond_norm_multiview_residual_risk_tau95_w5_low20":

@@ -890,13 +890,18 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     # Build Sequences and Dataloaders (EOL Models)
     # ===================================================================
     print("\n[2] Building full-trajectory sequences...")
-    past_len = 30
-    max_rul = 125
+    window_cfg_run = config.get("window_cfg", {}) if isinstance(config, dict) else {}
+    target_cfg_run = config.get("target_cfg", {}) if isinstance(config, dict) else {}
+
+    past_len = int(window_cfg_run.get("past_len", 30))
+    horizon = int(window_cfg_run.get("horizon", 40))
+    max_rul = int(target_cfg_run.get("max_rul", 125))
     
     X_full, y_full, unit_ids_full, cond_ids_full, health_phys_seq_full = build_full_eol_sequences_from_df(
         df=df_train,
         feature_cols=feature_cols,
         past_len=past_len,
+        horizon=horizon,
         max_rul=max_rul,
         unit_col="UnitNumber",
         cycle_col="TimeInCycles",
@@ -1455,6 +1460,23 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     rul_head_params = config.get("rul_head_params", {})
     phys_features_cfg = config.get("phys_features", {})
     features_cfg = config.get("features", {})
+
+    # Persist window/target policy (single source of truth for windowing)
+    # EOL models train on scalar targets (current RUL at window end), but we also
+    # build padded horizon targets internally for consistent EOL-near-0 coverage/logs.
+    window_cfg_summary = {
+        "past_len": int(past_len),
+        "horizon": int(config.get("window_cfg", {}).get("horizon", 40)),
+        "stride": int(config.get("window_cfg", {}).get("stride", 1)),
+        "pad_mode": str(config.get("window_cfg", {}).get("pad_mode", "clamp")),
+        "require_full_horizon": bool(config.get("window_cfg", {}).get("require_full_horizon", False)),
+    }
+    target_cfg_summary = {
+        "max_rul": int(max_rul),
+        "cap_targets": True,
+        "eol_target_mode": str(config.get("target_cfg", {}).get("eol_target_mode", "current_from_df")),
+        "clip_eval_y_true": True,
+    }
     summary = {
         "_meta": {
             "generated_git_sha": _get_git_sha(),
@@ -1479,6 +1501,9 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         # Feature configuration (multi-scale etc.) – persisted so diagnostics/inference
         # can exactly mirror the training-time feature pipeline.
         "features": features_cfg,
+        # Window/target policy (shared across pipelines)
+        "window_cfg": window_cfg_summary,
+        "target_cfg": target_cfg_summary,
         # Condition-vector configuration (phys_v2/v3/v4)
         "condition_vector_version": phys_features_cfg.get("condition_vector_version", 2),
         # Persist phys_features so diagnostics can exactly mirror training pipeline
