@@ -189,6 +189,18 @@ class WorldModelTrainingConfig:
     # Optional: initialize EOL head bias close to mean target for faster stable ramp-in.
     init_eol_bias_to_target_mean: bool = False
 
+    # --------------------------------------------------
+    # Horizon target building (padded/clamped) + optional masking
+    # --------------------------------------------------
+    # If True, build horizon targets with padding/clamping at the end of life
+    # so the last windows (near RUL=0) are included even when no full future
+    # horizon exists in the raw dataframe.
+    use_padded_horizon_targets: bool = False
+    # Clamp minimum for horizon targets (usually 0.0).
+    target_clamp_min: float = 0.0
+    # If True, return and use a horizon mask (1=valid, 0=padded) for losses.
+    use_horizon_mask: bool = False
+
     # Stage-1: additional HI shape losses (default off; enable via experiment config)
     hi_early_slope_weight: float = 0.0
     hi_early_slope_epsilon: float = 1e-3
@@ -238,7 +250,11 @@ def build_world_model_dataset_with_cond_ids(
     horizon: int = 20,
     unit_col: str = "UnitNumber",
     cond_col: str = "ConditionID",
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    use_padded_horizon_targets: bool = False,
+    target_clamp_min: float = 0.0,
+    return_horizon_mask: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Build world model dataset with condition IDs.
     
@@ -247,24 +263,84 @@ def build_world_model_dataset_with_cond_ids(
         Y: (N, horizon, 1) - Future RUL trajectories
         cond_ids: (N,) - Condition IDs for each sample
     """
+    from src.data.targets import build_rul_horizon_targets
+
     X_list, Y_list, cond_id_list = [], [], []
+    M_list = []  # optional horizon mask (N, H, 1)
+
+    # Prefer an uncapped source if available; fall back to the requested target_col.
+    rul_source_col = "RUL_raw" if ("RUL_raw" in df.columns) else target_col
 
     for unit_id, df_unit in df.groupby(unit_col):
         # Get condition ID for this unit (should be constant per unit)
         cond_id = int(df_unit[cond_col].iloc[0])
-        
-        X_np, Y_np = build_seq2seq_samples_from_df(
-            df=df_unit,
-            feature_cols=feature_cols,
-            target_cols=[target_col],
-            past_len=past_len,
-            horizon=horizon,
-        )
-        if X_np.shape[0] == 0:
+
+        df_unit = df_unit.sort_values("TimeInCycles")
+
+        if not use_padded_horizon_targets:
+            # Old behavior: only windows with a full future horizon from the dataframe.
+            X_np, Y_np = build_seq2seq_samples_from_df(
+                df=df_unit,
+                feature_cols=feature_cols,
+                target_cols=[target_col],
+                past_len=past_len,
+                horizon=horizon,
+            )
+            if X_np.shape[0] == 0:
+                continue
+            X_list.append(X_np)
+            Y_list.append(Y_np)
+            cond_id_list.extend([cond_id] * X_np.shape[0])
+            if return_horizon_mask:
+                # Full horizon => mask is all ones
+                m = np.ones((X_np.shape[0], horizon, 1), dtype=np.float32)
+                M_list.append(m)
             continue
+
+        # New behavior: include the last windows near EOL by deterministically
+        # building horizon targets from the current RUL value.
+        values_in = df_unit[feature_cols].to_numpy(dtype=np.float32, copy=True)
+        rul_now = df_unit[rul_source_col].to_numpy(dtype=np.float32, copy=True).reshape(-1)
+        T = len(df_unit)
+
+        if T < past_len:
+            continue
+
+        X_u = []
+        Y_u = []
+        M_u = []
+        # allow t_past_end to reach the last row (near EOL)
+        for t_past_end in range(past_len - 1, T):
+            t_past_start = t_past_end + 1 - past_len
+            X_past = values_in[t_past_start : t_past_end + 1]  # (past_len, F)
+
+            r0 = float(rul_now[t_past_end])
+            y_h, m_h = build_rul_horizon_targets(
+                np.array([r0], dtype=np.float32),
+                horizon=horizon,
+                clamp_min=float(target_clamp_min),
+                return_mask=True,
+            )
+            # (1, H) -> (H, 1)
+            y_h = y_h.reshape(horizon, 1)
+            m_h = m_h.reshape(horizon, 1) if m_h is not None else np.ones((horizon, 1), dtype=np.float32)
+
+            X_u.append(X_past)
+            Y_u.append(y_h)
+            M_u.append(m_h)
+
+        if not X_u:
+            continue
+
+        X_np = np.stack(X_u, axis=0).astype(np.float32)
+        Y_np = np.stack(Y_u, axis=0).astype(np.float32)
+        M_np = np.stack(M_u, axis=0).astype(np.float32)  # (N_u, H, 1)
+
         X_list.append(X_np)
         Y_list.append(Y_np)
         cond_id_list.extend([cond_id] * X_np.shape[0])
+        if return_horizon_mask:
+            M_list.append(M_np)
 
     if not X_list:
         raise ValueError("No seq2seq samples could be built from the given DataFrame.")
@@ -272,11 +348,38 @@ def build_world_model_dataset_with_cond_ids(
     X_all = np.concatenate(X_list, axis=0)
     Y_all = np.concatenate(Y_list, axis=0)
     cond_ids_all = np.array(cond_id_list, dtype=np.int64)
+    M_all = np.concatenate(M_list, axis=0) if (return_horizon_mask and M_list) else None
 
     X = torch.tensor(X_all, dtype=torch.float32)
     Y = torch.tensor(Y_all, dtype=torch.float32)
     cond_ids = torch.tensor(cond_ids_all, dtype=torch.long)
-    
+
+    if return_horizon_mask and M_all is not None:
+        M = torch.tensor(M_all, dtype=torch.float32)
+        # Dataset-level logging (critical debug): padding fraction etc.
+        try:
+            rul0 = Y_all[:, 0, 0]
+            pad_frac = 1.0 - float(M_all.mean())
+            near_eol_frac = float(np.mean(rul0 <= float(horizon)))
+            print(
+                f"[targets] rul0: min={float(np.min(rul0)):.2f} mean={float(np.mean(rul0)):.2f} max={float(np.max(rul0)):.2f} "
+                f"| pad_frac={pad_frac:.3f} | near_eol_frac(rul0<=H)={near_eol_frac:.3f} "
+                f"| clamp_min={float(target_clamp_min):.2f} padded={use_padded_horizon_targets}"
+            )
+        except Exception:
+            pass
+        return X, Y, cond_ids, M
+
+    # Logging (even if mask is not returned)
+    try:
+        rul0 = Y_all[:, 0, 0]
+        print(
+            f"[targets] rul0: min={float(np.min(rul0)):.2f} mean={float(np.mean(rul0)):.2f} max={float(np.max(rul0)):.2f} "
+            f"| clamp_min={float(target_clamp_min):.2f} padded={use_padded_horizon_targets}"
+        )
+    except Exception:
+        pass
+
     return X, Y, cond_ids
 
 

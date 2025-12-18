@@ -498,6 +498,7 @@ def monotonic_health_loss(
     target_hi: torch.Tensor,
     alpha: float = 1.0,
     beta: float = 1.0,
+    valid_mask: Optional[torch.Tensor] = None,
     return_components: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
@@ -529,19 +530,47 @@ def monotonic_health_loss(
     if target_hi.dim() == 1:
         target_hi = target_hi.unsqueeze(0)
 
+    if valid_mask is not None:
+        if valid_mask.dim() == 3:
+            valid_mask = valid_mask.squeeze(-1)
+        if valid_mask.dim() == 1:
+            valid_mask = valid_mask.unsqueeze(0)
+        if valid_mask.shape != pred_hi.shape:
+            raise ValueError(
+                f"valid_mask must match pred_hi shape {tuple(pred_hi.shape)}, got {tuple(valid_mask.shape)}"
+            )
+        m = (valid_mask > 0.5).float()
+    else:
+        m = None
+
     # Base MSE between predicted and target HI
-    mse = ((pred_hi - target_hi) ** 2).mean()
+    mse_per = (pred_hi - target_hi) ** 2
+    if m is not None:
+        mse = (mse_per * m).sum() / (m.sum() + 1e-8)
+    else:
+        mse = mse_per.mean()
 
     # First-order differences over time
     if pred_hi.size(1) > 1:
         diff = pred_hi[:, 1:] - pred_hi[:, :-1]  # (B, T-1)
         # Monotonicity: penalize *increases* in HI (ReLU of positive slopes)
-        mono_loss = torch.relu(diff).mean()
+        mono_per = torch.relu(diff)
+        if m is not None:
+            pair_m = (m[:, 1:] * m[:, :-1]).float()
+            mono_loss = (mono_per * pair_m).sum() / (pair_m.sum() + 1e-8)
+        else:
+            mono_loss = mono_per.mean()
 
         # Second-order differences for smoothness
         if diff.size(1) > 1:
             diff2 = diff[:, 1:] - diff[:, :-1]  # (B, T-2)
-            smoothness_loss = (diff2 ** 2).mean()
+            smooth_per = (diff2 ** 2)
+            if m is not None:
+                pair_m = (m[:, 1:] * m[:, :-1]).float()  # (B, T-1)
+                pair2_m = (pair_m[:, 1:] * pair_m[:, :-1]).float()  # (B, T-2)
+                smoothness_loss = (smooth_per * pair2_m).sum() / (pair2_m.sum() + 1e-8)
+            else:
+                smoothness_loss = smooth_per.mean()
         else:
             smoothness_loss = pred_hi.new_tensor(0.0)
     else:

@@ -30,7 +30,7 @@ from src.analysis.plots import (
     plot_nasa_per_engine,
     plot_hi_trajectories_for_selected_engines,
 )
-from src.metrics import compute_eol_errors_and_nasa
+from src.eval.eol_eval import evaluate_eol_metrics
 from src.world_model_training_v3 import evaluate_world_model_v3_eol
 
 # Additional imports for FD004 diagnostics
@@ -340,26 +340,33 @@ def generate_all_diagnostics(
     if max_rul is None:
         max_rul = 125  # Default
     
-    # Compute EOL-based metrics using centralized function
-    # This ensures consistency with evaluate_on_test_data (same RUL capping, same formulas)
-    eol_metrics_dict = compute_eol_errors_and_nasa(y_true_eol, y_pred_eol, max_rul=max_rul)
+    # Compute EOL-based metrics using the single shared evaluator
+    eval0 = evaluate_eol_metrics(
+        y_true=y_true_eol,
+        y_pred=y_pred_eol,
+        max_rul=float(max_rul),
+        clip_y_true=False,
+        clip_y_pred=True,
+        log_prefix="[diag-eval0]",
+    )
+    errors0 = eval0["y_pred"] - eval0["y_true"]
     
     # Build diagnostics summary with EOL-based metrics
     # Include all metrics for consistency with test_metrics structure
     diagnostics_summary = {
-        "num_engines": eol_metrics_dict["num_engines"],
-        "mse": eol_metrics_dict["mse"],
-        "rmse": eol_metrics_dict["rmse"],
-        "mae": eol_metrics_dict["mae"],
-        "bias": eol_metrics_dict["bias"],
-        "mean_error": eol_metrics_dict["mean_error"],  # alias for bias
-        "std_error": eol_metrics_dict["std_error"],
-        "mean_abs_error": eol_metrics_dict["mean_abs_error"],
-        "median_error": eol_metrics_dict["median_error"],
-        "r2": eol_metrics_dict["r2"],
-        "nasa_mean": eol_metrics_dict["nasa_mean"],
-        "nasa_sum": eol_metrics_dict["nasa_sum"],
-        "nasa_median": eol_metrics_dict["nasa_median"],
+        "num_engines": int(len(eval0["y_true"])),
+        "mse": eval0["MSE"],
+        "rmse": eval0["RMSE"],
+        "mae": eval0["MAE"],
+        "bias": eval0["Bias"],
+        "mean_error": eval0["Bias"],  # alias for bias
+        "std_error": float(np.std(errors0)) if errors0.size else 0.0,
+        "mean_abs_error": eval0["MAE"],
+        "median_error": float(np.median(errors0)) if errors0.size else 0.0,
+        "r2": eval0["R2"],
+        "nasa_mean": eval0["nasa_score_mean"],
+        "nasa_sum": eval0["nasa_score_sum"],
+        "nasa_median": float(np.median(eval0["nasa_scores"])) if len(eval0["nasa_scores"]) else 0.0,
         "selected_engines": selected_engines,
         "plots_generated": [
             "eol_error_hist.png",
@@ -389,12 +396,12 @@ def generate_all_diagnostics(
     
     # Log EOL diagnostics with consistent formatting (matching evaluate_on_test_data)
     print(f"\n[4] Diagnostics complete!")
-    print(f"  EOL RMSE:              {eol_metrics_dict['rmse']:.2f} cycles")
-    print(f"  EOL MAE:               {eol_metrics_dict['mae']:.2f} cycles")
-    print(f"  EOL Bias (mean error): {eol_metrics_dict['bias']:.2f} cycles")
-    print(f"  EOL R²:                {eol_metrics_dict['r2']:.4f}")
-    print(f"  EOL NASA Score (sum):  {eol_metrics_dict['nasa_sum']:.2f}")
-    print(f"  EOL NASA Score (mean): {eol_metrics_dict['nasa_mean']:.4f}")
+    print(f"  EOL RMSE:              {diagnostics_summary['rmse']:.2f} cycles")
+    print(f"  EOL MAE:               {diagnostics_summary['mae']:.2f} cycles")
+    print(f"  EOL Bias (mean error): {diagnostics_summary['bias']:.2f} cycles")
+    print(f"  EOL R²:                {diagnostics_summary['r2']:.4f}")
+    print(f"  EOL NASA Score (sum):  {diagnostics_summary['nasa_sum']:.2f}")
+    print(f"  EOL NASA Score (mean): {diagnostics_summary['nasa_mean']:.4f}")
     
     # Robust sanity check: compare with test_metrics if available
     if test_metrics:
@@ -402,7 +409,7 @@ def generate_all_diagnostics(
         
         # Compare bias
         test_bias = test_metrics.get("bias")
-        diagnostics_bias = eol_metrics_dict['bias']
+        diagnostics_bias = diagnostics_summary['bias']
         if test_bias is not None:
             bias_diff = abs(diagnostics_bias - test_bias)
             print(f"    Bias: Test={test_bias:.4f}, Diagnostics={diagnostics_bias:.4f} (diff: {bias_diff:.4f})")
@@ -411,7 +418,7 @@ def generate_all_diagnostics(
         
         # Compare RMSE
         test_rmse = test_metrics.get("rmse")
-        diagnostics_rmse = eol_metrics_dict['rmse']
+        diagnostics_rmse = diagnostics_summary['rmse']
         if test_rmse is not None:
             rmse_diff = abs(diagnostics_rmse - test_rmse)
             print(f"    RMSE: Test={test_rmse:.4f}, Diagnostics={diagnostics_rmse:.4f} (diff: {rmse_diff:.4f})")
@@ -420,7 +427,7 @@ def generate_all_diagnostics(
         
         # Compare NASA mean
         test_nasa_mean = test_metrics.get("nasa_mean")
-        diagnostics_nasa_mean = eol_metrics_dict['nasa_mean']
+        diagnostics_nasa_mean = diagnostics_summary['nasa_mean']
         if test_nasa_mean is not None:
             nasa_diff = abs(diagnostics_nasa_mean - test_nasa_mean)
             print(f"    NASA Mean: Test={test_nasa_mean:.4f}, Diagnostics={diagnostics_nasa_mean:.4f} (diff: {nasa_diff:.4f})")
@@ -1875,6 +1882,10 @@ def run_diagnostics_for_run(
     #   evaluate_on_test_data
     print("[3] Evaluating EOL metrics via training helpers...")
     if is_world_model:
+        clip_true = bool(
+            config.get("eval_clip_y_true_to_max_rul", False)
+            or config.get("world_model_config", {}).get("eval_clip_y_true_to_max_rul", False)
+        )
         test_metrics_diag = evaluate_world_model_v3_eol(
             model=model,
             df_test=df_test_fe,
@@ -1885,6 +1896,7 @@ def run_diagnostics_for_run(
             max_rul=max_rul,
             num_conditions=config.get("num_conditions", 1),
             device=device,
+            clip_y_true_to_max_rul=clip_true,
         )
 
         # Extract predictions and targets in the exact engine order used by evaluation
@@ -1897,8 +1909,14 @@ def run_diagnostics_for_run(
         
         # Get nasa_scores - evaluate_world_model_v3_eol uses compute_eol_errors_and_nasa internally
         # but doesn't return nasa_scores, so we compute them here for consistency
-        from src.metrics import compute_eol_errors_and_nasa
-        nasa_stats_computed = compute_eol_errors_and_nasa(y_true_eol, rul_pred_full_np, max_rul=max_rul)
+        eval_metrics = evaluate_eol_metrics(
+            y_true=y_true_eol,
+            y_pred=rul_pred_full_np,
+            max_rul=float(max_rul),
+            clip_y_true=clip_true,
+            clip_y_pred=True,
+            log_prefix="[diag-eval]",
+        )
         
         # Create eol_metrics_dict with same structure as EOL model path
         # Use metrics directly from evaluate_world_model_v3_eol (100% consistent with training)
@@ -1913,10 +1931,10 @@ def run_diagnostics_for_run(
             "mae": test_metrics_diag["MAE"],
             "bias": test_metrics_diag["Bias"],
             "r2": test_metrics_diag.get("R2", 0.0),
-            "nasa_scores": nasa_stats_computed["nasa_scores"],
-            "nasa_mean": test_metrics_diag["nasa_score_mean"],  # Use from evaluate_world_model_v3_eol
-            "nasa_sum": test_metrics_diag.get("nasa_score_sum", test_metrics_diag["nasa_score_mean"] * len(y_true_eol)),
-            "nasa_median": float(np.median(nasa_stats_computed["nasa_scores"])),
+            "nasa_scores": eval_metrics["nasa_scores"],
+            "nasa_mean": eval_metrics["nasa_score_mean"],
+            "nasa_sum": eval_metrics["nasa_score_sum"],
+            "nasa_median": float(np.median(eval_metrics["nasa_scores"])) if len(eval_metrics["nasa_scores"]) else 0.0,
             "num_engines": len(y_true_eol),
         }
 

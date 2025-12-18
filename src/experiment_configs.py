@@ -3518,6 +3518,10 @@ def get_world_model_phase5_universal_v3_residual_config(
                 "eval_clip_y_true_to_max_rul": True,
                 # Optional: initialize EOL head bias near mean target
                 "init_eol_bias_to_target_mean": True,
+                # Horizon targets: include near-EOL windows via padded/clamped targets
+                "use_padded_horizon_targets": True,
+                "target_clamp_min": 0.0,
+                "use_horizon_mask": True,
             }
         )
     

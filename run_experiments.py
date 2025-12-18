@@ -718,6 +718,10 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 cap_rul_targets_to_max_rul=bool(world_model_params.get("cap_rul_targets_to_max_rul", False)),
                 eval_clip_y_true_to_max_rul=bool(world_model_params.get("eval_clip_y_true_to_max_rul", False)),
                 init_eol_bias_to_target_mean=bool(world_model_params.get("init_eol_bias_to_target_mean", False)),
+                # Padded/clamped horizon target building + optional masking
+                use_padded_horizon_targets=bool(world_model_params.get("use_padded_horizon_targets", False)),
+                target_clamp_min=float(world_model_params.get("target_clamp_min", 0.0)),
+                use_horizon_mask=bool(world_model_params.get("use_horizon_mask", False)),
                 hi_early_slope_weight=world_model_params.get('hi_early_slope_weight', 0.0),
                 hi_early_slope_epsilon=world_model_params.get('hi_early_slope_epsilon', 1e-3),
                 hi_early_slope_rul_threshold=world_model_params.get('hi_early_slope_rul_threshold', None),

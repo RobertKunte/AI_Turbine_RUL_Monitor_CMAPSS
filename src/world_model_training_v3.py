@@ -58,7 +58,7 @@ from src.loss import (
     hi_eol_consistency_loss,
 )
 from src.training_utils import compute_global_trend_loss
-from src.metrics import compute_eol_errors_and_nasa
+from src.eval.eol_eval import evaluate_eol_metrics
 from src.models.transformer_eol import EOLFullTransformerEncoder
 from src.models.transformer_world_model_v1 import TransformerWorldModelV1
 
@@ -206,7 +206,11 @@ def train_world_model_universal_v3(
     # 1. Build sequences with condition IDs
     # ===================================================================
     print("[1] Building seq2seq sequences...")
-    X_train, Y_train, cond_ids_train = build_world_model_dataset_with_cond_ids(
+    use_padded_horizon_targets = bool(getattr(world_model_config, "use_padded_horizon_targets", False))
+    target_clamp_min = float(getattr(world_model_config, "target_clamp_min", 0.0))
+    use_horizon_mask = bool(getattr(world_model_config, "use_horizon_mask", False))
+
+    seq_out = build_world_model_dataset_with_cond_ids(
         df=df_train,
         feature_cols=feature_cols,
         target_col="RUL",
@@ -214,10 +218,21 @@ def train_world_model_universal_v3(
         horizon=horizon,
         unit_col="UnitNumber",
         cond_col="ConditionID",
+        use_padded_horizon_targets=use_padded_horizon_targets,
+        target_clamp_min=target_clamp_min,
+        return_horizon_mask=use_horizon_mask,
     )
+
+    if isinstance(seq_out, tuple) and len(seq_out) == 4:
+        X_train, Y_train, cond_ids_train, horizon_mask_train = seq_out
+    else:
+        X_train, Y_train, cond_ids_train = seq_out  # type: ignore[misc]
+        horizon_mask_train = None
     
     print(f"  Train sequences: {X_train.shape[0]}")
     print(f"  Input shape: {X_train.shape}, Target shape: {Y_train.shape}")
+    if horizon_mask_train is not None:
+        print(f"  Horizon mask shape: {horizon_mask_train.shape} (use_horizon_mask={use_horizon_mask})")
     
     # Determine number of conditions
     unique_conditions = torch.unique(cond_ids_train).cpu().numpy()
@@ -239,10 +254,12 @@ def train_world_model_universal_v3(
     X_train_split = X_train[train_indices]
     Y_train_split = Y_train[train_indices]
     cond_ids_train_split = cond_ids_train[train_indices]
+    horizon_mask_train_split = horizon_mask_train[train_indices] if horizon_mask_train is not None else None
     
     X_val = X_train[val_indices]
     Y_val = Y_train[val_indices]
     cond_ids_val = cond_ids_train[val_indices]
+    horizon_mask_val = horizon_mask_train[val_indices] if horizon_mask_train is not None else None
     
     print(f"  Train samples: {len(X_train_split)}, Val samples: {len(X_val)}")
     
@@ -315,8 +332,12 @@ def train_world_model_universal_v3(
     # 4. Create dataloaders
     # ===================================================================
     print("\n[4] Creating dataloaders...")
-    train_dataset = TensorDataset(X_train_scaled, Y_train_split, cond_ids_train_split)
-    val_dataset = TensorDataset(X_val_scaled, Y_val, cond_ids_val)
+    if horizon_mask_train_split is not None:
+        train_dataset = TensorDataset(X_train_scaled, Y_train_split, cond_ids_train_split, horizon_mask_train_split)
+        val_dataset = TensorDataset(X_val_scaled, Y_val, cond_ids_val, horizon_mask_val)
+    else:
+        train_dataset = TensorDataset(X_train_scaled, Y_train_split, cond_ids_train_split)
+        val_dataset = TensorDataset(X_val_scaled, Y_val, cond_ids_val)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -585,10 +606,19 @@ def train_world_model_universal_v3(
         running_grad_norm = 0.0
         n_grad_norm = 0
         
-        for batch_idx, (X_batch, Y_batch, cond_batch) in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_loader):
+            # Backward-compatible unpacking: (X,Y,cond) or (X,Y,cond,mask)
+            if isinstance(batch, (tuple, list)) and len(batch) == 4:
+                X_batch, Y_batch, cond_batch, mask_batch = batch
+            else:
+                X_batch, Y_batch, cond_batch = batch
+                mask_batch = None
+
             X_batch = X_batch.to(device)
             Y_batch = Y_batch.to(device)
             cond_batch = cond_batch.to(device)
+            if mask_batch is not None:
+                mask_batch = mask_batch.to(device)
             
             optimizer.zero_grad()
             
@@ -608,32 +638,32 @@ def train_world_model_universal_v3(
             # ------------------------------------------------------------------
             # Targets
             # ------------------------------------------------------------------
-            target_traj_rul = Y_batch              # (B, H, 1) - future RUL trajectory (may be raw)
+            target_traj_rul = Y_batch              # (B, H, 1) - future RUL trajectory (may be raw/padded)
             if cap_rul_targets:
                 max_rul_f = float(max_rul if max_rul is not None else 125.0)
                 target_traj_rul = target_traj_rul.clamp(0.0, max_rul_f)
 
             # Scalar EOL target (explicit definition; must match eval units)
             if eol_target_mode in {"future0", "t0", "start"}:
-                target_eol = target_traj_rul[:, 0, 0]
+                eol_scalar_target = target_traj_rul[:, 0, 0]
                 target_def = "target_traj[:,0] (future0)"
             elif eol_target_mode in {"future_last", "last"}:
-                target_eol = target_traj_rul[:, -1, 0]
+                eol_scalar_target = target_traj_rul[:, -1, 0]
                 target_def = "target_traj[:,-1] (future_last)"
             elif eol_target_mode in {"current", "now"}:
                 # Approximate current-step RUL from the next-step target (+1),
                 # then re-apply the cap (plateau region stays at max_rul).
                 max_rul_f = float(max_rul if max_rul is not None else 125.0)
-                target_eol = (target_traj_rul[:, 0, 0] + 1.0).clamp(0.0, max_rul_f)
+                eol_scalar_target = (target_traj_rul[:, 0, 0] + 1.0).clamp(0.0, max_rul_f)
                 target_def = "min(max_rul, target_traj[:,0] + 1) (current approx)"
             else:
-                target_eol = target_traj_rul[:, 0, 0]
+                eol_scalar_target = target_traj_rul[:, 0, 0]
                 target_def = f"unknown({eol_target_mode}) -> fallback future0"
 
             # Runtime range check (first epoch / first batch)
             if epoch == 0 and batch_idx == 0:
                 with torch.no_grad():
-                    te = target_eol.detach()
+                    te = eol_scalar_target.detach()
                     te_max = float(te.max().cpu().item())
                     te_min = float(te.min().cpu().item())
                     mr = float(max_rul if max_rul is not None else 125.0)
@@ -675,28 +705,28 @@ def train_world_model_universal_v3(
                 thr = float(world_model_config.eol_tail_rul_threshold)
                 tail_w = float(world_model_config.eol_tail_weight)
                 weights_eol = torch.where(
-                    target_eol < thr,
-                    torch.full_like(target_eol, tail_w),
-                    torch.ones_like(target_eol),
+                    eol_scalar_target < thr,
+                    torch.full_like(eol_scalar_target, tail_w),
+                    torch.ones_like(eol_scalar_target),
                 )
             else:
-                weights_eol = torch.ones_like(target_eol)
+                weights_eol = torch.ones_like(eol_scalar_target)
 
             if normalize_eol:
                 # Normalize only inside loss
                 scale = float(max(1e-6, eol_scale_value))
                 eol_pred_n = eol_pred / scale
-                eol_true_n = target_eol / scale
+                eol_true_n = eol_scalar_target / scale
                 per = _eol_loss_per_sample(eol_pred_n, eol_true_n)
                 loss_eol = (per * weights_eol).mean()
             else:
                 # Old behavior (raw scale, pure MSE)
-                loss_eol = ((eol_pred - target_eol) ** 2 * weights_eol).mean()
+                loss_eol = ((eol_pred - eol_scalar_target) ** 2 * weights_eol).mean()
 
             # Logging once per epoch (first batch)
             if not printed_epoch_stats and batch_idx == 0:
                 with torch.no_grad():
-                    te = target_eol.detach()
+                    te = eol_scalar_target.detach()
                     pe = eol_pred.detach()
                     msg = (
                         f"[EOL stats][epoch {epoch+1}] active={eol_active} mult={eol_mult:.3f} "
@@ -731,11 +761,13 @@ def train_world_model_universal_v3(
 
             # 3) Trajectory head: full HI trajectory with monotonic + smoothness regularization
             hi_seq_pred = traj_pred.squeeze(-1)  # (B, H)
+            valid_mask_seq = mask_batch.squeeze(-1) if (use_horizon_mask and mask_batch is not None) else None
             loss_traj, base_hi_mse, mono_raw, smooth_raw = monotonic_health_loss(
                 pred_hi=hi_seq_pred,
                 target_hi=target_hi_seq,
                 alpha=world_model_config.mono_late_weight,
                 beta=world_model_config.mono_global_weight,
+                valid_mask=valid_mask_seq,
                 return_components=True,
             )
 
@@ -743,6 +775,7 @@ def train_world_model_universal_v3(
             early_slope_raw = hi_early_slope_regularizer(
                 pred_hi=hi_seq_pred,
                 rul_seq=rul_future,
+                valid_mask=valid_mask_seq,
                 epsilon=float(getattr(world_model_config, "hi_early_slope_epsilon", 1e-3)),
                 early_rul_threshold=getattr(world_model_config, "hi_early_slope_rul_threshold", None),
             )
@@ -762,7 +795,7 @@ def train_world_model_universal_v3(
                 hi_threshold=float(getattr(world_model_config, "eol_hi_threshold", 0.2)),
                 temperature=float(getattr(world_model_config, "eol_hi_temperature", 0.05)),
                 p_min=float(getattr(world_model_config, "eol_hi_p_min", 0.2)),
-                valid_mask=None,  # seq windows have no padding in this training path
+                valid_mask=valid_mask_seq,
             )
             eol_hi_loss = float(getattr(world_model_config, "w_eol_hi", 0.0)) * eol_hi_raw
 
@@ -836,10 +869,18 @@ def train_world_model_universal_v3(
         n_val_samples = 0
         
         with torch.no_grad():
-            for X_batch, Y_batch, cond_batch in val_loader:
+            for batch in val_loader:
+                if isinstance(batch, (tuple, list)) and len(batch) == 4:
+                    X_batch, Y_batch, cond_batch, mask_batch = batch
+                else:
+                    X_batch, Y_batch, cond_batch = batch
+                    mask_batch = None
+
                 X_batch = X_batch.to(device)
                 Y_batch = Y_batch.to(device)
                 cond_batch = cond_batch.to(device)
+                if mask_batch is not None:
+                    mask_batch = mask_batch.to(device)
                 
                 # Forward pass
                 outputs = model(
@@ -861,14 +902,14 @@ def train_world_model_universal_v3(
                     target_traj_rul = target_traj_rul.clamp(0.0, max_rul_f)
 
                 if eol_target_mode in {"future0", "t0", "start"}:
-                    target_eol = target_traj_rul[:, 0, 0]
+                    eol_scalar_target = target_traj_rul[:, 0, 0]
                 elif eol_target_mode in {"future_last", "last"}:
-                    target_eol = target_traj_rul[:, -1, 0]
+                    eol_scalar_target = target_traj_rul[:, -1, 0]
                 elif eol_target_mode in {"current", "now"}:
                     max_rul_f = float(max_rul if max_rul is not None else 125.0)
-                    target_eol = (target_traj_rul[:, 0, 0] + 1.0).clamp(0.0, max_rul_f)
+                    eol_scalar_target = (target_traj_rul[:, 0, 0] + 1.0).clamp(0.0, max_rul_f)
                 else:
-                    target_eol = target_traj_rul[:, 0, 0]
+                    eol_scalar_target = target_traj_rul[:, 0, 0]
 
                 # Physics-informed HI targets (same as training loop)
                 MAX_VISIBLE_RUL = float(max_rul if max_rul is not None else 125.0)
@@ -880,9 +921,9 @@ def train_world_model_universal_v3(
                     hi_linear_seq,
                 )  # (B, H)
 
-                hi_linear = (target_eol / MAX_VISIBLE_RUL).clamp(0.0, 1.0)
+                hi_linear = (eol_scalar_target / MAX_VISIBLE_RUL).clamp(0.0, 1.0)
                 target_hi_last = torch.where(
-                    target_eol > MAX_VISIBLE_RUL,
+                    eol_scalar_target > MAX_VISIBLE_RUL,
                     torch.ones_like(hi_linear),
                     hi_linear,
                 )  # (B,)
@@ -897,35 +938,38 @@ def train_world_model_universal_v3(
                     thr = float(world_model_config.eol_tail_rul_threshold)
                     tail_w = float(world_model_config.eol_tail_weight)
                     weights_eol = torch.where(
-                        target_eol < thr,
-                        torch.full_like(target_eol, tail_w),
-                        torch.ones_like(target_eol),
+                        eol_scalar_target < thr,
+                        torch.full_like(eol_scalar_target, tail_w),
+                        torch.ones_like(eol_scalar_target),
                     )
                 else:
-                    weights_eol = torch.ones_like(target_eol)
+                    weights_eol = torch.ones_like(eol_scalar_target)
 
                 if normalize_eol:
                     scale = float(max(1e-6, eol_scale_value))
                     eol_pred_n = eol_pred / scale
-                    eol_true_n = target_eol / scale
+                    eol_true_n = eol_scalar_target / scale
                     per = _eol_loss_per_sample(eol_pred_n, eol_true_n)
                     loss_eol = (per * weights_eol).mean()
                 else:
-                    loss_eol = ((eol_pred - target_eol) ** 2 * weights_eol).mean()
+                    loss_eol = ((eol_pred - eol_scalar_target) ** 2 * weights_eol).mean()
                 loss_hi_last = mse_loss(hi_pred, target_hi_last)
 
                 hi_seq_pred = traj_pred.squeeze(-1)  # (B, H)
+                valid_mask_seq = mask_batch.squeeze(-1) if (use_horizon_mask and mask_batch is not None) else None
                 loss_traj, base_hi_mse, mono_raw, smooth_raw = monotonic_health_loss(
                     pred_hi=hi_seq_pred,
                     target_hi=target_hi_seq,
                     alpha=world_model_config.mono_late_weight,
                     beta=world_model_config.mono_global_weight,
+                    valid_mask=valid_mask_seq,
                     return_components=True,
                 )
 
                 early_slope_raw = hi_early_slope_regularizer(
                     pred_hi=hi_seq_pred,
                     rul_seq=rul_future,
+                    valid_mask=valid_mask_seq,
                     epsilon=float(getattr(world_model_config, "hi_early_slope_epsilon", 1e-3)),
                     early_rul_threshold=getattr(world_model_config, "hi_early_slope_rul_threshold", None),
                 )
@@ -944,7 +988,7 @@ def train_world_model_universal_v3(
                     hi_threshold=float(getattr(world_model_config, "eol_hi_threshold", 0.2)),
                     temperature=float(getattr(world_model_config, "eol_hi_temperature", 0.05)),
                     p_min=float(getattr(world_model_config, "eol_hi_p_min", 0.2)),
-                    valid_mask=None,
+                    valid_mask=valid_mask_seq,
                 )
                 eol_hi_loss = float(getattr(world_model_config, "w_eol_hi", 0.0)) * eol_hi_raw
                 
@@ -1214,6 +1258,10 @@ def train_world_model_universal_v3(
             "eol_target_mode": str(getattr(world_model_config, "eol_target_mode", "future0")),
             "eval_clip_y_true_to_max_rul": bool(getattr(world_model_config, "eval_clip_y_true_to_max_rul", False)),
             "init_eol_bias_to_target_mean": bool(getattr(world_model_config, "init_eol_bias_to_target_mean", False)),
+            # Horizon targets
+            "use_padded_horizon_targets": bool(getattr(world_model_config, "use_padded_horizon_targets", False)),
+            "target_clamp_min": float(getattr(world_model_config, "target_clamp_min", 0.0)),
+            "use_horizon_mask": bool(getattr(world_model_config, "use_horizon_mask", False)),
             "hi_early_slope_weight": float(getattr(world_model_config, "hi_early_slope_weight", 0.0)),
             "hi_early_slope_epsilon": float(getattr(world_model_config, "hi_early_slope_epsilon", 1e-3)),
             "hi_early_slope_rul_threshold": getattr(world_model_config, "hi_early_slope_rul_threshold", None),
@@ -2085,28 +2133,23 @@ def evaluate_transformer_world_model_v1_on_test(
     y_true = np.concatenate(all_true_rul_last, axis=0)
     y_pred = np.concatenate(all_pred_rul_last, axis=0)
 
-    # Compute classic EOL metrics
-    errors = y_pred - y_true
-    mse = float(np.mean(errors**2))
-    rmse = float(np.sqrt(mse))
-    mae = float(np.mean(np.abs(errors)))
-    bias = float(np.mean(errors))
-
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    r2 = float(1 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
-
-    # NASA PHM08-style score via existing helper
-    nasa_stats = compute_eol_errors_and_nasa(y_true, y_pred, max_rul=max_rul)
+    m = evaluate_eol_metrics(
+        y_true=y_true,
+        y_pred=y_pred,
+        max_rul=float(max_rul),
+        clip_y_true=False,
+        clip_y_pred=True,
+        log_prefix="[WorldModelV1-eval]",
+    )
 
     metrics = {
-        "rmse": rmse,
-        "mae": mae,
-        "bias": bias,
-        "r2": r2,
-        "nasa_mean": float(nasa_stats["nasa_mean"]),
-        "nasa_sum": float(nasa_stats["nasa_sum"]),
-        "num_samples": int(len(y_true)),
+        "rmse": float(m["RMSE"]),
+        "mae": float(m["MAE"]),
+        "bias": float(m["Bias"]),
+        "r2": float(m["R2"]),
+        "nasa_mean": float(m["nasa_score_mean"]),
+        "nasa_sum": float(m["nasa_score_sum"]),
+        "num_samples": int(len(m["y_true"])),
     }
 
     return metrics
@@ -2245,45 +2288,27 @@ def evaluate_world_model_v3_eol(
     y_true = np.array(y_true_all)
     y_pred = np.array(y_pred_all)
 
-    # Optional: clip y_true to the same range as y_pred (evaluation alignment)
-    if clip_y_true_to_max_rul:
-        y_true = np.clip(y_true, 0.0, float(max_rul))
+    metrics = evaluate_eol_metrics(
+        y_true=y_true,
+        y_pred=y_pred,
+        max_rul=float(max_rul),
+        clip_y_true=bool(clip_y_true_to_max_rul),
+        clip_y_pred=True,
+        log_prefix="[eval]",
+    )
 
-    # One-time range log (helps catch unit mismatch early)
-    try:
-        print(
-            f"[eval] y_true: min={float(np.min(y_true)):.2f} max={float(np.max(y_true)):.2f} "
-            f"| y_pred: min={float(np.min(y_pred)):.2f} max={float(np.max(y_pred)):.2f} "
-            f"(max_rul={float(max_rul):.2f}, clip_y_true={clip_y_true_to_max_rul})"
-        )
-    except Exception:
-        pass
-    
-    # Compute metrics
-    errors = y_pred - y_true
-    mse = float(np.mean(errors**2))
-    rmse = float(np.sqrt(mse))
-    mae = float(np.mean(np.abs(errors)))
-    bias = float(np.mean(errors))
-    
-    # R²
-    ss_res = np.sum((y_true - y_pred)**2)
-    ss_tot = np.sum((y_true - np.mean(y_true))**2)
-    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-    
-    # NASA score using compute_eol_errors_and_nasa
-    nasa_stats = compute_eol_errors_and_nasa(y_true, y_pred, max_rul=max_rul)
-    
     return {
-        "MSE": mse,
-        "RMSE": rmse,
-        "MAE": mae,
-        "Bias": bias,
-        "R2": r2,
-        "nasa_score_sum": nasa_stats["nasa_sum"],
-        "nasa_score_mean": nasa_stats["nasa_mean"],
-        "num_engines": len(y_true),
-        "y_pred_eol": y_pred.tolist(),
-        "y_true_eol": y_true.tolist(),
+        "MSE": metrics["MSE"],
+        "RMSE": metrics["RMSE"],
+        "MAE": metrics["MAE"],
+        "Bias": metrics["Bias"],
+        "R2": metrics["R2"],
+        "nasa_score_sum": metrics["nasa_score_sum"],
+        "nasa_score_mean": metrics["nasa_score_mean"],
+        "num_engines": int(len(metrics["y_true"])),
+        "y_pred_eol": metrics["y_pred"].tolist(),
+        "y_true_eol": metrics["y_true"].tolist(),
+        # Expose nasa_scores for diagnostics plots
+        "nasa_scores": metrics["nasa_scores"].tolist(),
     }
 
