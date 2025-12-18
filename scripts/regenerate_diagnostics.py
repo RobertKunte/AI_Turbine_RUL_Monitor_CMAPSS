@@ -187,7 +187,9 @@ def main() -> None:
         return out
 
     def _pick_metrics_from_summary(s: dict) -> dict:
-        tm = s.get("test_metrics", {})
+        # Diagnostics no longer overwrites training-time test_metrics.
+        # Prefer diagnostics_test_metrics for diagnostics consistency checks.
+        tm = s.get("diagnostics_test_metrics") or s.get("test_metrics_diagnostics") or {}
         out = dict(tm) if isinstance(tm, dict) else {}
         dm = s.get("diagnostics_meta")
         if isinstance(dm, dict):
@@ -203,19 +205,19 @@ def main() -> None:
 
     print("\n=== regenerate_diagnostics (post-check) ===")
     print("eol_metrics.json:", eol_m)
-    print("summary.json:test_metrics:", sum_m)
+    print("summary.json:diagnostics_test_metrics:", sum_m)
 
-    # Hard check for the core metrics (tolerate float formatting)
+    # Hard check for the core diagnostics metrics (tolerate float formatting)
     for k in ["rmse", "mae", "bias", "r2", "nasa_mean", "nasa_sum"]:
         a = eol_after.get(k)
-        b = (summary_after.get("test_metrics") or {}).get(k)
+        b = (summary_after.get("diagnostics_test_metrics") or summary_after.get("test_metrics_diagnostics") or {}).get(k)
         if a is None or b is None:
             continue
         try:
             if abs(float(a) - float(b)) > 1e-6:
                 raise SystemExit(
                     f"[ERROR] Metrics mismatch after regeneration for key '{k}': "
-                    f"eol_metrics.json={a} vs summary.json:test_metrics={b}. "
+                    f"eol_metrics.json={a} vs summary.json:diagnostics_test_metrics={b}. "
                     f"Run dir: {run_dir}"
                 )
         except Exception:

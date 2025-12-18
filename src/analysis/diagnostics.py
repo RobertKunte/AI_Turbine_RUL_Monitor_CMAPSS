@@ -2137,16 +2137,51 @@ def run_diagnostics_for_run(
     )
 
     try:
+        # Compute risk_q on the same EOL test windows and scaling used by evaluate_on_test_data.
+        # NOTE: X_test_scaled returned by build_eval_data may have been computed using a
+        # diagnostics-fitted scaler before we swapped in scaler.pkl. Rebuild the scaled
+        # tensor using the final scaler_dict to avoid "safe plot looks wrong" issues.
         safe_pred_np = None
 
-        # Compute risk_q on the same EOL test windows used by diagnostics (one window per engine).
-        # X_test_scaled/cond_ids_test come from build_eval_data and match the engine order of y_true_eol.
-        # If the model does not expose a residual-risk head, we fallback to safe=μ.
-        X_t = torch.as_tensor(X_test_scaled, dtype=torch.float32, device=device)
+        from src.eol_full_lstm import build_test_sequences_from_df
+
+        # Build the same EOL windows in the same engine order
+        X_eol, unit_ids_eol, cond_ids_eol = build_test_sequences_from_df(
+            df_test_fe,
+            feature_cols=feature_cols,
+            past_len=past_len,
+            unit_col="UnitNumber",
+            cycle_col="TimeInCycles",
+        )
+
+        # Apply the final scaler_dict (prefer loaded scaler.pkl when available)
+        X_np = X_eol.numpy()
+        B, T, F = X_np.shape
+        X_scaled = X_np
+        if scaler_dict is not None:
+            if isinstance(scaler_dict, dict):
+                out = []
+                for i in range(B):
+                    cid = int(cond_ids_eol[i])
+                    sc = scaler_dict.get(cid) if scaler_dict else None
+                    if sc is None and scaler_dict:
+                        sc = list(scaler_dict.values())[0]
+                    if sc is None:
+                        out.append(torch.from_numpy(X_np[i]))
+                    else:
+                        out.append(torch.from_numpy(sc.transform(X_np[i])))
+                X_scaled = torch.stack(out).numpy()
+            else:
+                flat = X_np.reshape(-1, F)
+                X_scaled = scaler_dict.transform(flat).reshape(B, T, F)
+
+        X_t = torch.as_tensor(X_scaled, dtype=torch.float32, device=device)
+
+        # cond_ids for condition embeddings (NOT the Cond_* vector)
         cond_t = None
         try:
-            if cond_ids_test is not None:
-                cond_t = torch.as_tensor(cond_ids_test, dtype=torch.long, device=device)
+            if cond_ids_eol is not None:
+                cond_t = torch.as_tensor(cond_ids_eol.numpy(), dtype=torch.long, device=device)
         except Exception:
             cond_t = None
 
@@ -2155,29 +2190,23 @@ def run_diagnostics_for_run(
             try:
                 outputs = model(X_t, cond_ids=cond_t) if cond_t is not None else model(X_t)
             except TypeError:
-                # Some models don't accept cond_ids kwarg (or don't need it).
                 outputs = model(X_t)
 
         rul_risk_q_pred = None
         if isinstance(outputs, (tuple, list)):
-            # Mirror the inference disambiguation logic for the common return contracts.
             if len(outputs) == 7:
-                # Either (rul_pred, hi_last, hi_seq, rul_sigma, rul_quantiles, bucket_logits, rul_risk_q)
-                # or older aux contract; disambiguate by checking outputs[3] shape.
                 if not (torch.is_tensor(outputs[3]) and outputs[3].dim() == 2):
                     rul_risk_q_pred = outputs[6]
             elif len(outputs) >= 9:
-                # (rul_pred, hi_last, hi_seq, cond_seq_avg, cond_recon, rul_sigma, rul_quantiles, bucket_logits, rul_risk_q)
                 rul_risk_q_pred = outputs[8]
 
+        mu_np = np.asarray(rul_pred_full_np, dtype=np.float32).reshape(-1)
         if rul_risk_q_pred is not None and torch.is_tensor(rul_risk_q_pred):
             risk_q_np = rul_risk_q_pred.detach().cpu().numpy().reshape(-1).astype(np.float32)
             risk_q_np = np.maximum(0.0, risk_q_np)
-            mu_np = np.asarray(rul_pred_full_np, dtype=np.float32).reshape(-1)
             safe_pred_np = np.clip(mu_np - risk_q_np, 0.0, float(max_rul))
         else:
-            # No residual risk head available → safe == μ.
-            safe_pred_np = np.asarray(rul_pred_full_np, dtype=np.float32).reshape(-1)
+            safe_pred_np = mu_np
 
         plot_true_vs_pred_scatter(
             y_true=y_true_eol,

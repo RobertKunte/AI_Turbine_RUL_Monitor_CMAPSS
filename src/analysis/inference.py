@@ -695,11 +695,45 @@ def load_model_from_experiment(
         cond_in_dim = int(cond_in_dim_cfg) if cond_in_dim_cfg is not None else 0
         cond_encoder_dim = config.get("cond_encoder_dim", None)
         use_cond_recon_head = bool(config.get("use_cond_recon_head", False))
+
+        # ------------------------------------------------------------------
+        # CRITICAL: strict-load reconstruction gate for continuous condition encoder
+        # ------------------------------------------------------------------
+        # Some runs infer cond_in_dim at training time (from Cond_* columns) and may
+        # not persist it reliably in summary.json. If we instantiate with cond_in_dim=0,
+        # the model will not create cond_encoder modules, leading to different forward
+        # behavior and mismatched metrics vs training.
+        if use_cond_encoder and cond_in_dim <= 0:
+            try:
+                if "cond_encoder.0.weight" in state_dict:
+                    # nn.Linear(cond_in_dim -> cond_encoder_dim)
+                    w = state_dict["cond_encoder.0.weight"]
+                    cond_in_dim = int(w.shape[1])
+                    if cond_encoder_dim is None:
+                        cond_encoder_dim = int(w.shape[0])
+                    print(f"Inferred cond_in_dim={cond_in_dim} from checkpoint (cond_encoder.0.weight)")
+                elif "fc_cond_recon.2.weight" in state_dict:
+                    # nn.Linear(d_model -> cond_in_dim)
+                    w = state_dict["fc_cond_recon.2.weight"]
+                    cond_in_dim = int(w.shape[0])
+                    print(f"Inferred cond_in_dim={cond_in_dim} from checkpoint (fc_cond_recon.2.weight)")
+            except Exception as e:
+                print(f"[WARNING] Failed to infer cond_in_dim from checkpoint: {e}")
+
+        # Persist inferred dims back into config for downstream helpers.
+        try:
+            config["cond_in_dim"] = int(cond_in_dim)
+            if cond_encoder_dim is not None:
+                config["cond_encoder_dim"] = int(cond_encoder_dim)
+        except Exception:
+            pass
         
         # Damage head parameters (must match training configuration exactly)
         use_damage_head = bool(config.get("use_damage_head", False))
-        damage_L_ref = float(config.get("L_ref", 300.0))
-        damage_alpha_base = float(config.get("alpha_base", 0.1))
+        # Prefer the canonical keys written by run_experiments (**encoder_kwargs),
+        # but keep backward compatibility with older "L_ref"/"alpha_base" names.
+        damage_L_ref = float(config.get("damage_L_ref", config.get("L_ref", 300.0)))
+        damage_alpha_base = float(config.get("damage_alpha_base", config.get("alpha_base", 0.1)))
         damage_hidden_dim = int(config.get("damage_hidden_dim", 64))
         # NEW (v3c): optional MLP-based damage head configuration
         damage_use_mlp = bool(config.get("damage_use_mlp", False))
