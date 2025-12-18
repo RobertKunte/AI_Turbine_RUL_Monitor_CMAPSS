@@ -685,9 +685,9 @@ def train_world_model_universal_v3(
             )  # (B, H)
 
             # HI target at current step (use first horizon step)
-            hi_linear = (target_eol / MAX_VISIBLE_RUL).clamp(0.0, 1.0)
+            hi_linear = (eol_scalar_target / MAX_VISIBLE_RUL).clamp(0.0, 1.0)
             target_hi_last = torch.where(
-                target_eol > MAX_VISIBLE_RUL,
+                eol_scalar_target > MAX_VISIBLE_RUL,
                 torch.ones_like(hi_linear),
                 hi_linear,
             )  # (B,)
