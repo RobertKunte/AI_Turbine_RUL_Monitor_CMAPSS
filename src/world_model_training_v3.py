@@ -1505,15 +1505,7 @@ def train_transformer_world_model_v1(
     df_train_scaled = df_train.copy()
     df_train_scaled[target_sensor_cols] = sensor_scaler.transform(sensor_values)
 
-    # We build samples per engine (UnitNumber) with sliding windows, similar to
-    # build_seq2seq_samples_from_df in src/world_model_training.py, but we
-    # additionally construct future RUL and HI trajectories.
-    X_list: list[np.ndarray] = []
-    Y_sens_list: list[np.ndarray] = []
-    Y_rul_list: list[np.ndarray] = []
-    Y_hi_list: list[np.ndarray] = []
-    future_cond_list: list[np.ndarray] = []
-    cond_id_list: list[int] = []
+    from src.data.windowing import WindowConfig, TargetConfig, build_sliding_windows
 
     max_rul = world_model_config.max_rul
     max_visible_rul = float(max_rul if max_rul is not None else 125.0)
@@ -1521,75 +1513,68 @@ def train_transformer_world_model_v1(
     # Continuous condition-feature columns (Cond_*) used for optional future_conds.
     cond_cols = [c for c in feature_cols if c.startswith("Cond_")]
     cond_dim_actual = len(cond_cols)
+    cond_dim_model = int(cond_dim_actual) if cond_dim_actual > 0 else int(cond_dim)
     if cond_dim_actual > 0 and cond_dim_actual != cond_dim:
         print(
             f"[WorldModelV1] Warning: cond_dim={cond_dim} but found {cond_dim_actual} Cond_* columns "
             f"in feature_cols. Using {cond_dim_actual} for future_conds."
         )
 
-    for unit_id, df_unit in df_train_scaled.groupby("UnitNumber"):
-        cond_id = int(df_unit["ConditionID"].iloc[0])
+    # Central window builder with end-padding (includes near-EOL samples)
+    wc = WindowConfig(
+        past_len=int(past_len),
+        horizon=int(horizon),
+        stride=1,
+        require_full_horizon=False,
+        pad_mode="clamp",
+    )
+    tc = TargetConfig(
+        max_rul=int(max_rul if max_rul is not None else 125),
+        cap_targets=True,
+        # For WM-V1 training, the scalar used for init/anchors comes from future[0]
+        # (consistent with the pre-existing code).
+        eol_target_mode="future0",
+        clip_eval_y_true=False,
+    )
 
-        values_in = df_unit[feature_cols].to_numpy(dtype=np.float32, copy=True)
-        # Sensors are already scaled in df_train_scaled for target_sensor_cols.
-        values_sens = df_unit[target_sensor_cols].to_numpy(dtype=np.float32, copy=True)
-        # We assume a precomputed RUL column (capped) exists in the training df.
-        if "RUL" not in df_unit.columns:
-            raise KeyError("Expected 'RUL' column in df_train for world model targets.")
-        values_rul = df_unit["RUL"].to_numpy(dtype=np.float32, copy=True)
-        # Continuous condition vectors for each time step (if available)
-        values_cond = None
-        if cond_dim_actual > 0:
-            values_cond = df_unit[cond_cols].to_numpy(dtype=np.float32, copy=True)
-        # Clip RUL to [0, max_rul] for safety
-        values_rul = np.clip(values_rul, 0.0, float(max_rul))
+    # One call returns padded future RUL targets AND (optionally) future sensor + cond sequences.
+    future_cols = target_sensor_cols + (cond_cols if cond_dim_actual > 0 else [])
+    built = build_sliding_windows(
+        df=df_train_scaled,
+        feature_cols=feature_cols,
+        target_col="RUL",
+        future_feature_cols=future_cols if future_cols else None,
+        unit_col="UnitNumber",
+        time_col="TimeInCycles",
+        cond_col="ConditionID",
+        window_cfg=wc,
+        target_cfg=tc,
+        return_mask=True,
+    )
 
-        T = len(df_unit)
-        if T < past_len + horizon:
-            continue
+    X_train_np = built["X"]  # (N,past_len,F)
+    # Future RUL (capped/padded) in cycles:
+    future_rul = built["Y_seq"].squeeze(-1)  # (N,H)
+    # Normalize RUL future trajectory to [0,1]
+    Y_rul_np = (future_rul / float(max_rul if max_rul is not None else 1.0)).astype(np.float32)
 
-        for t_past_end in range(past_len - 1, T - horizon):
-            t_past_start = t_past_end + 1 - past_len
-            t_future_start = t_past_end + 1
-            t_future_end = t_future_start + horizon
+    # HI mapping from future_rul (cycles)
+    hi_linear = np.clip(future_rul / max_visible_rul, 0.0, 1.0)
+    Y_hi_np = np.where(future_rul > max_visible_rul, 1.0, hi_linear).astype(np.float32)
 
-            X_past = values_in[t_past_start : t_past_end + 1]  # (past_len, F)
-            Y_future_sens = values_sens[t_future_start:t_future_end]  # (H, num_sensors_out)
+    # Future sensor/cond sequences
+    fut = built.get("future_features")
+    if fut is None:
+        raise ValueError("[WorldModelV1] build_sliding_windows did not return future_features; check future_feature_cols.")
+    n_sens = len(target_sensor_cols)
+    Y_sens_np = fut[:, :, :n_sens].astype(np.float32)
+    if cond_dim_actual > 0:
+        future_cond_np = fut[:, :, n_sens:].astype(np.float32)
+    else:
+        future_cond_np = np.zeros((X_train_np.shape[0], horizon, cond_dim_model), dtype=np.float32)
 
-            future_rul = values_rul[t_future_start:t_future_end]  # (H,)
-
-            # Physics-informed HI mapping (same piecewise linear mapping as v3):
-            # HI = 1 for RUL > MAX_VISIBLE_RUL, else HI = RUL / MAX_VISIBLE_RUL,
-            # clipped to [0, 1].
-            hi_linear = np.clip(future_rul / max_visible_rul, 0.0, 1.0)
-            future_hi = np.where(future_rul > max_visible_rul, 1.0, hi_linear).astype(
-                np.float32
-            )  # (H,)
-
-            # Normalize RUL future trajectory to [0, 1] for the model.
-            future_rul_norm = future_rul / float(max_rul if max_rul is not None else 1.0)
-
-            # Future continuous condition vectors [H, cond_dim_actual] (or zeros if not available)
-            if cond_dim_actual > 0 and values_cond is not None:
-                future_conds = values_cond[t_future_start:t_future_end]  # (H, cond_dim_actual)
-            else:
-                future_conds = np.zeros((horizon, cond_dim), dtype=np.float32)
-
-            X_list.append(X_past.astype(np.float32))
-            Y_sens_list.append(Y_future_sens.astype(np.float32))
-            Y_rul_list.append(future_rul_norm.astype(np.float32))
-            Y_hi_list.append(future_hi)
-            future_cond_list.append(future_conds.astype(np.float32))
-            cond_id_list.append(cond_id)
-
-    if not X_list:
-        raise ValueError("No seq2seq samples could be built for TransformerWorldModelV1.")
-
-    X_train_np = np.stack(X_list, axis=0)  # (N, past_len, F)
-    Y_sens_np = np.stack(Y_sens_list, axis=0)  # (N, horizon, num_sensors_out)
-    Y_rul_np = np.stack(Y_rul_list, axis=0)  # (N, horizon)
-    Y_hi_np = np.stack(Y_hi_list, axis=0)  # (N, horizon)
-    future_cond_np = np.stack(future_cond_list, axis=0)  # (N, horizon, cond_dim_actual or cond_dim)
+    cond_id_list = built["cond_ids"].tolist()
+    unit_ids_np = built["unit_ids"]
 
     # ------------------------------------------------------------------
     # Debug: dataset-level normalization statistics
@@ -1640,11 +1625,19 @@ def train_transformer_world_model_v1(
     future_cond_train = torch.from_numpy(future_cond_np).float()
     cond_ids = torch.tensor(cond_id_list, dtype=torch.long)
 
-    # Simple train/val split on sample-level (could be improved to engine-level)
+    # Engine-level train/val split (no leakage across engines)
     N = X_train.shape[0]
-    n_train = int(0.8 * N)
-    train_indices = np.arange(0, n_train)
-    val_indices = np.arange(n_train, N)
+    unit_ids_t = torch.from_numpy(unit_ids_np.astype(np.int64))
+    uniq = torch.unique(unit_ids_t)
+    gen = torch.Generator().manual_seed(42)
+    perm = uniq[torch.randperm(len(uniq), generator=gen)]
+    n_val_units = max(1, int(0.2 * len(uniq)))
+    val_units = perm[:n_val_units]
+    train_units = perm[n_val_units:]
+    train_mask = torch.isin(unit_ids_t, train_units)
+    val_mask = torch.isin(unit_ids_t, val_units)
+    train_indices = torch.nonzero(train_mask, as_tuple=False).view(-1).cpu().numpy()
+    val_indices = torch.nonzero(val_mask, as_tuple=False).view(-1).cpu().numpy()
 
     X_tr = X_train[train_indices]
     Y_sens_tr = Y_sens_train[train_indices]
@@ -1721,12 +1714,24 @@ def train_transformer_world_model_v1(
     use_latent_history = bool(getattr(world_model_config, "use_latent_history", False))
     use_hi_anchor = bool(getattr(world_model_config, "use_hi_anchor", False))
     use_future_conds = bool(getattr(world_model_config, "use_future_conds", False))
+    use_eol_fusion = bool(getattr(world_model_config, "use_eol_fusion", False))
+    eol_fusion_mode = str(getattr(world_model_config, "eol_fusion_mode", "token"))
+    predict_latent = bool(getattr(world_model_config, "predict_latent", False))
+    latent_decoder_type = str(getattr(world_model_config, "latent_decoder_type", "gru"))
+    latent_decoder_num_layers = int(getattr(world_model_config, "latent_decoder_num_layers", 2))
+    latent_decoder_nhead = int(getattr(world_model_config, "latent_decoder_nhead", 4))
+
+    # Staged training (default OFF)
+    freeze_encoder_epochs = int(getattr(world_model_config, "freeze_encoder_epochs", 0) or 0)
+    unfreeze_encoder_layers = int(getattr(world_model_config, "unfreeze_encoder_layers", 0) or 0)
+    encoder_lr_mult = float(getattr(world_model_config, "encoder_lr_mult", 0.1) or 0.1)
+    eol_scalar_loss_weight = float(getattr(world_model_config, "eol_scalar_loss_weight", 0.0) or 0.0)
 
     world_model = TransformerWorldModelV1(
         encoder=encoder,
         input_dim=input_dim,
         num_sensors_out=num_sensors_out,
-        cond_dim=cond_dim,
+        cond_dim=cond_dim_model,
         future_horizon=horizon,
         decoder_hidden_dim=decoder_hidden_dim,
         num_layers_decoder=num_layers_decoder,
@@ -1738,26 +1743,69 @@ def train_transformer_world_model_v1(
         use_latent_history=use_latent_history,
         use_hi_anchor=use_hi_anchor,
         use_future_conds=use_future_conds,
+        use_eol_fusion=use_eol_fusion,
+        eol_fusion_mode=eol_fusion_mode,
+        predict_latent=predict_latent,
+        latent_decoder_type=latent_decoder_type,
+        latent_decoder_num_layers=latent_decoder_num_layers,
+        latent_decoder_nhead=latent_decoder_nhead,
     ).to(device)
 
-    # Optionally freeze encoder (latent dynamics world model)
-    if freeze_encoder:
-        print("[WorldModelV1] Freezing encoder parameters (no gradient updates).")
+    def _set_encoder_trainability(*, frozen: bool, unfreeze_last_k: int = 0) -> None:
+        # Freeze everything first
         for p in world_model.encoder.parameters():
-            p.requires_grad = False
-        world_model.encoder.eval()
+            p.requires_grad = not frozen
+        if frozen:
+            world_model.encoder.eval()
+            return
+
+        # Partial unfreeze: freeze all then unfreeze last K transformer layers if possible
+        if unfreeze_last_k > 0:
+            for p in world_model.encoder.parameters():
+                p.requires_grad = False
+            # Common structure: encoder.transformer.layers is a ModuleList
+            layers = None
+            if hasattr(world_model.encoder, "transformer") and hasattr(world_model.encoder.transformer, "layers"):
+                layers = world_model.encoder.transformer.layers
+            if layers is not None:
+                k = min(int(unfreeze_last_k), len(layers))
+                for layer in list(layers)[-k:]:
+                    for p in layer.parameters():
+                        p.requires_grad = True
+            else:
+                # Fallback: unfreeze whole encoder if we can't identify layers
+                for p in world_model.encoder.parameters():
+                    p.requires_grad = True
+        world_model.encoder.train()
+
+    # Stage A: freeze encoder (either explicit freeze_encoder, or for first N epochs)
+    if freeze_encoder or freeze_encoder_epochs > 0:
+        print(
+            f"[WorldModelV1] Stage-A encoder freeze enabled (freeze_encoder={freeze_encoder}, "
+            f"freeze_encoder_epochs={freeze_encoder_epochs})"
+        )
+        _set_encoder_trainability(frozen=True)
     print(
         f"[WorldModelV1] Encoder configuration -> "
         f"checkpoint: {encoder_ckpt_path if encoder_ckpt_path else 'None'}, "
-        f"freeze_encoder: {freeze_encoder}"
+        f"freeze_encoder: {freeze_encoder}, freeze_encoder_epochs: {freeze_encoder_epochs}, "
+        f"unfreeze_encoder_layers: {unfreeze_encoder_layers}, encoder_lr_mult: {encoder_lr_mult}"
     )
 
-    # Optimizer: only train parameters that require gradients
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, world_model.parameters()),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
+    def _make_optimizer() -> torch.optim.Optimizer:
+        enc_params = [p for p in world_model.encoder.parameters() if p.requires_grad]
+        other_params = [p for n, p in world_model.named_parameters() if (not n.startswith("encoder.")) and p.requires_grad]
+        if enc_params:
+            return torch.optim.Adam(
+                [
+                    {"params": other_params, "lr": lr},
+                    {"params": enc_params, "lr": lr * float(encoder_lr_mult)},
+                ],
+                weight_decay=weight_decay,
+            )
+        return torch.optim.Adam(other_params, lr=lr, weight_decay=weight_decay)
+
+    optimizer = _make_optimizer()
 
     best_val_loss = float("inf")
     best_state = None
@@ -1768,6 +1816,12 @@ def train_transformer_world_model_v1(
     rul_w = world_model_config.__dict__.get("rul_future_loss_weight", 0.0)
 
     for epoch in range(num_epochs):
+        # Stage B: unfreeze encoder after N epochs (if configured and not permanently frozen)
+        if (not freeze_encoder) and freeze_encoder_epochs > 0 and epoch == freeze_encoder_epochs:
+            print(f"[WorldModelV1] Stage-B unfreeze at epoch {epoch+1}: unfreeze_last_k={unfreeze_encoder_layers}")
+            _set_encoder_trainability(frozen=False, unfreeze_last_k=unfreeze_encoder_layers)
+            optimizer = _make_optimizer()
+
         world_model.train()
         running_train = 0.0
         n_train_samples = 0
@@ -1810,7 +1864,7 @@ def train_transformer_world_model_v1(
 
             # For now we don't pass a continuous condition vector – caller should
             # precompute Cond_* and pass here; as a first version we use zeros.
-            cond_vec = torch.zeros(X_b.size(0), cond_dim, device=device)
+            cond_vec = torch.zeros(X_b.size(0), cond_dim_model, device=device)
 
             # Use the first future step as "current" RUL/HI for decoder init
             current_rul_b = Y_rul_b[:, 0]  # (B,)
@@ -1818,7 +1872,7 @@ def train_transformer_world_model_v1(
 
             if target_mode in ["latent_hi_rul", "latent_hi_rul_dynamic_delta_v2"]:
                 # Dynamic latent world model: no sensor teacher forcing, optional future_conds + HI anchor.
-                pred_sensors, pred_hi, pred_rul = world_model(
+                out = world_model(
                     past_seq=X_b,
                     cond_vec=cond_vec,
                     cond_ids=cond_b,
@@ -1828,9 +1882,21 @@ def train_transformer_world_model_v1(
                     current_hi=current_hi_b if use_hi_anchor else None,
                     future_conds=future_cond_b if use_future_conds else None,
                 )
+                if isinstance(out, (tuple, list)) and len(out) == 4:
+                    pred_sensors, pred_hi, pred_rul, pred_eol = out
+                else:
+                    pred_sensors, pred_hi, pred_rul = out
+                    pred_eol = None
+                if epoch == 0 and batch_idx == 0:
+                    print(
+                        f"[WorldModelV1][shapes] X_b={tuple(X_b.shape)} future_cond_b={tuple(future_cond_b.shape)} "
+                        f"pred_hi={(tuple(pred_hi.shape) if pred_hi is not None else None)} "
+                        f"pred_rul={(tuple(pred_rul.shape) if pred_rul is not None else None)} "
+                        f"pred_eol={(tuple(pred_eol.shape) if pred_eol is not None else None)}"
+                    )
             else:
                 # Original sensor-autoregressive world model path.
-                pred_sensors, pred_hi, pred_rul = world_model(
+                out = world_model(
                     past_seq=X_b,
                     cond_vec=cond_vec,
                     cond_ids=cond_b,
@@ -1839,6 +1905,11 @@ def train_transformer_world_model_v1(
                     current_rul=current_rul_b,
                     current_hi=current_hi_b,
                 )
+                if isinstance(out, (tuple, list)) and len(out) == 4:
+                    pred_sensors, pred_hi, pred_rul, pred_eol = out
+                else:
+                    pred_sensors, pred_hi, pred_rul = out
+                    pred_eol = None
 
             # Sensor trajectory loss
             loss_sensors = F.mse_loss(pred_sensors, Y_sens_b)
@@ -1855,6 +1926,12 @@ def train_transformer_world_model_v1(
                 # pred_rul: (B, H, 1), Y_rul_b: (B, H)
                 rul_loss = F.l1_loss(pred_rul.squeeze(-1), Y_rul_b)
                 loss = loss + rul_w * rul_loss
+
+            # Optional: supervise the predicted EOL scalar (in [0,1]) against normalized current RUL
+            if eol_scalar_loss_weight > 0.0 and pred_eol is not None:
+                # current_rul_b is already normalized in Y_rul_b[:,0]
+                eol_loss = F.mse_loss(pred_eol.view(-1), current_rul_b.view(-1))
+                loss = loss + eol_scalar_loss_weight * eol_loss
 
             loss.backward()
             optimizer.step()
@@ -1882,7 +1959,7 @@ def train_transformer_world_model_v1(
                 current_hi_b = Y_hi_b[:, 0]
 
                 if target_mode in ["latent_hi_rul", "latent_hi_rul_dynamic_delta_v2"]:
-                    pred_sensors, pred_hi, pred_rul = world_model(
+                    out = world_model(
                         past_seq=X_b,
                         cond_vec=cond_vec,
                         cond_ids=cond_b,
@@ -1892,8 +1969,13 @@ def train_transformer_world_model_v1(
                         current_hi=current_hi_b if use_hi_anchor else None,
                         future_conds=future_cond_b if use_future_conds else None,
                     )
+                    if isinstance(out, (tuple, list)) and len(out) == 4:
+                        pred_sensors, pred_hi, pred_rul, pred_eol = out
+                    else:
+                        pred_sensors, pred_hi, pred_rul = out
+                        pred_eol = None
                 else:
-                    pred_sensors, pred_hi, pred_rul = world_model(
+                    out = world_model(
                         past_seq=X_b,
                         cond_vec=cond_vec,
                         cond_ids=cond_b,
@@ -1902,6 +1984,11 @@ def train_transformer_world_model_v1(
                         current_rul=current_rul_b,
                         current_hi=current_hi_b,
                     )
+                    if isinstance(out, (tuple, list)) and len(out) == 4:
+                        pred_sensors, pred_hi, pred_rul, pred_eol = out
+                    else:
+                        pred_sensors, pred_hi, pred_rul = out
+                        pred_eol = None
 
                 loss_sensors = F.mse_loss(pred_sensors, Y_sens_b)
                 loss = sensor_w * loss_sensors
@@ -1913,6 +2000,10 @@ def train_transformer_world_model_v1(
                 if rul_w > 0.0 and pred_rul is not None:
                     rul_loss = F.l1_loss(pred_rul.squeeze(-1), Y_rul_b)
                     loss = loss + rul_w * rul_loss
+
+                if eol_scalar_loss_weight > 0.0 and pred_eol is not None:
+                    eol_loss = F.mse_loss(pred_eol.view(-1), current_rul_b.view(-1))
+                    loss = loss + eol_scalar_loss_weight * eol_loss
 
                 running_val += loss.item() * X_b.size(0)
                 n_val_samples += X_b.size(0)

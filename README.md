@@ -91,6 +91,28 @@ The run’s `summary.json` stores only stable pointers:
 - `dynamics_kpis_path`
 - `dynamics_kpis_version`
 
+---
+
+## Dynamic Latent World Model (Branch A+): Latent History + Future Conditions + EOL Fusion
+
+The **Transformer World Model V1** supports a **dynamic latent mode** (Branch A+) that conditions the decoder on:
+
+- **latent history**: encoder sequence output as cross-attention memory
+- **future conditions**: `Cond_*` vectors per horizon step as query tokens (with a horizon position embedding)
+- optional **EOL fusion**: predicted from past only, fused as `"token"` or `"feature"`
+
+Training can be staged:
+
+- **Stage A**: freeze encoder for `freeze_encoder_epochs` epochs
+- **Stage B**: unfreeze last `unfreeze_encoder_layers` encoder blocks with a smaller LR via `encoder_lr_mult`
+
+Example commands:
+
+```bash
+python run_experiments.py --experiments fd004_transformer_latent_worldmodel_dynamic_v1 --device cuda
+python run_experiments.py --experiments fd004_transformer_latent_worldmodel_dynamic_delta_v2 --device cuda
+```
+
 ### 0.3 Relation to literature (FD001 perspective)
 
 Recent works on FD001 (EOL RMSE):

@@ -46,6 +46,9 @@ def build_sliding_windows(
     feature_cols: list[str],
     *,
     target_col: str = "RUL",
+    # Optional: additionally return future sequences for these columns
+    # using the SAME window indices and pad policy.
+    future_feature_cols: Optional[list[str]] = None,
     unit_col: str = "UnitNumber",
     time_col: str = "TimeInCycles",
     cond_col: Optional[str] = "ConditionID",
@@ -87,6 +90,7 @@ def build_sliding_windows(
     Yseq_list: list[np.ndarray] = []
     Yeol_list: list[float] = []
     M_list: list[np.ndarray] = []
+    Fut_list: list[np.ndarray] = []
     unit_ids_list: list[int] = []
     cond_ids_list: list[int] = []
     t_end_pos_list: list[int] = []
@@ -97,6 +101,9 @@ def build_sliding_windows(
             continue
 
         values = df_u[feature_cols].to_numpy(dtype=np.float32, copy=True)
+        values_future = None
+        if future_feature_cols:
+            values_future = df_u[future_feature_cols].to_numpy(dtype=np.float32, copy=True)
         rul = df_u[target_col].to_numpy(dtype=np.float32, copy=True).reshape(-1)
         rul = np.maximum(rul, 0.0)
         rul = _cap(rul, target_cfg.max_rul, target_cfg.cap_targets)
@@ -120,6 +127,7 @@ def build_sliding_windows(
             if H <= 0:
                 y_full = np.zeros((0,), dtype=np.float32)
                 m = np.zeros((0,), dtype=np.float32)
+                fut_full = None
             else:
                 if n_obs > 0:
                     if pad_mode == "clamp":
@@ -141,6 +149,23 @@ def build_sliding_windows(
                 else:
                     m = np.ones((H,), dtype=np.float32)
 
+                # Optional future feature sequences (padded identically)
+                fut_full = None
+                if values_future is not None:
+                    f_obs = values_future[f0:f1]  # (<=H, Ff)
+                    Ff = int(values_future.shape[1])
+                    if n_obs > 0:
+                        if pad_mode == "clamp":
+                            pad_vec = f_obs[-1]
+                        else:
+                            pad_vec = np.zeros((Ff,), dtype=np.float32)
+                    else:
+                        pad_vec = values_future[t_end] if pad_mode == "clamp" else np.zeros((Ff,), dtype=np.float32)
+
+                    fut_full = np.repeat(pad_vec.reshape(1, Ff), H, axis=0).astype(np.float32)
+                    if n_obs > 0:
+                        fut_full[:n_obs] = f_obs.astype(np.float32, copy=False)
+
             # Scalar EOL target
             if eol_mode == "future0":
                 y_eol = float(y_full[0]) if H > 0 else float(rul[t_end])
@@ -159,6 +184,8 @@ def build_sliding_windows(
             Yseq_list.append(y_full.reshape(H, 1))
             Yeol_list.append(y_eol)
             M_list.append(m.reshape(H, 1))
+            if values_future is not None and fut_full is not None:
+                Fut_list.append(fut_full)  # (H, Ff)
             unit_ids_list.append(int(uid))
             cond_ids_list.append(cond_id)
             t_end_pos_list.append(int(t_end))
@@ -170,6 +197,7 @@ def build_sliding_windows(
     Y_seq = np.stack(Yseq_list, axis=0).astype(np.float32)
     Y_eol = np.asarray(Yeol_list, dtype=np.float32)
     mask = np.stack(M_list, axis=0).astype(np.float32) if return_mask else None
+    future_features = np.stack(Fut_list, axis=0).astype(np.float32) if Fut_list else None
     unit_ids = np.asarray(unit_ids_list, dtype=np.int64)
     cond_ids = np.asarray(cond_ids_list, dtype=np.int64)
     t_end_pos = np.asarray(t_end_pos_list, dtype=np.int64)
@@ -184,6 +212,8 @@ def build_sliding_windows(
         "y_seq_shape": tuple(Y_seq.shape),
         "y_eol_shape": tuple(Y_eol.shape),
     }
+    if future_features is not None:
+        meta["future_features_shape"] = tuple(future_features.shape)
     try:
         meta["y_eol_min"] = float(np.min(Y_eol))
         meta["y_eol_mean"] = float(np.mean(Y_eol))
@@ -210,6 +240,7 @@ def build_sliding_windows(
         "Y_seq": Y_seq,
         "Y_eol": Y_eol,
         "mask": mask,
+        "future_features": future_features,
         "unit_ids": unit_ids,
         "cond_ids": cond_ids,
         "t_end_pos": t_end_pos,

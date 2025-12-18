@@ -201,6 +201,23 @@ class WorldModelTrainingConfig:
     # If True, return and use a horizon mask (1=valid, 0=padded) for losses.
     use_horizon_mask: bool = False
 
+    # --------------------------------------------------
+    # Transformer World Model V1 (Dynamic Latent WM A+) knobs
+    # Stored on the shared config for convenience; default OFF.
+    # --------------------------------------------------
+    # Stage A/B training for TransformerWorldModelV1 encoder
+    freeze_encoder_epochs: int = 0
+    unfreeze_encoder_layers: int = 0
+    encoder_lr_mult: float = 0.1
+    # EOL fusion / latent transformer decoder knobs (used by TransformerWorldModelV1)
+    use_eol_fusion: bool = False
+    eol_fusion_mode: Literal["token", "feature"] = "token"
+    predict_latent: bool = False
+    latent_decoder_type: Literal["gru", "transformer"] = "gru"
+    latent_decoder_num_layers: int = 2
+    latent_decoder_nhead: int = 4
+    eol_scalar_loss_weight: float = 0.0
+
     # Stage-1: additional HI shape losses (default off; enable via experiment config)
     hi_early_slope_weight: float = 0.0
     hi_early_slope_epsilon: float = 1e-3

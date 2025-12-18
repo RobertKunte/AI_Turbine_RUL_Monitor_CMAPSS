@@ -38,6 +38,14 @@ class TransformerWorldModelV1(nn.Module):
         use_latent_history: bool = False,
         use_hi_anchor: bool = False,
         use_future_conds: bool = False,
+        # Dynamic latent WM + EOL fusion (A+) – backward-compatible defaults
+        use_future_conditions: bool = False,
+        use_eol_fusion: bool = False,
+        eol_fusion_mode: str = "token",   # "token" | "feature"
+        predict_latent: bool = False,     # if True: decoder produces z_future_seq first
+        latent_decoder_type: str = "gru", # "gru" | "transformer"
+        latent_decoder_num_layers: int = 2,
+        latent_decoder_nhead: int = 4,
     ) -> None:
         super().__init__()
 
@@ -55,7 +63,16 @@ class TransformerWorldModelV1(nn.Module):
         # Dynamic latent flags
         self.use_latent_history = bool(use_latent_history)
         self.use_hi_anchor = bool(use_hi_anchor)
-        self.use_future_conds = bool(use_future_conds)
+        # Back-compat alias: use_future_conditions mirrors use_future_conds
+        self.use_future_conds = bool(use_future_conds or use_future_conditions)
+
+        # A+ extensions
+        self.use_eol_fusion = bool(use_eol_fusion)
+        self.eol_fusion_mode = str(eol_fusion_mode).lower()
+        self.predict_latent = bool(predict_latent)
+        self.latent_decoder_type = str(latent_decoder_type).lower()
+        self.latent_decoder_num_layers = int(latent_decoder_num_layers)
+        self.latent_decoder_nhead = int(latent_decoder_nhead)
 
         # Try to infer encoder hidden size (d_model) from common attributes.
         if hasattr(encoder, "d_model"):
@@ -136,6 +153,52 @@ class TransformerWorldModelV1(nn.Module):
             self.latent_dec_input_dim = None
             self.latent_decoder_rnn = None
 
+        # ------------------------------------------------------------------
+        # Transformer latent decoder (A+): Cross-attn to latent history z_seq,
+        # query tokens built from future conditions (+ pos emb) and optional EOL fusion.
+        # This stays OFF unless latent_decoder_type="transformer" or predict_latent=True.
+        # ------------------------------------------------------------------
+        self.future_cond_proj: Optional[nn.Module] = None
+        self.future_pos_emb: Optional[nn.Embedding] = None
+        self.eol_ctx_to_token: Optional[nn.Module] = None
+        self.eol_ctx_to_feature: Optional[nn.Module] = None
+        self.latent_transformer_decoder: Optional[nn.Module] = None
+        self.latent_to_delta_hi: Optional[nn.Module] = None
+        self.latent_to_delta_rul: Optional[nn.Module] = None
+        self.eol_scalar_head: Optional[nn.Module] = None
+
+        use_transformer_latent = (
+            self.latent_decoder_type == "transformer"
+            or self.predict_latent
+            or self.use_eol_fusion
+        ) and (self.target_mode in ["latent_hi_rul", "latent_hi_rul_dynamic_delta_v2"])
+
+        if use_transformer_latent:
+            # Project future conditions -> d_model query tokens
+            self.future_cond_proj = nn.Linear(self.cond_dim, self.d_model)
+            # Horizon positional embedding (supports up to future_horizon tokens)
+            self.future_pos_emb = nn.Embedding(self.future_horizon + 2, self.d_model)
+
+            # EOL context derived from past (encoder output): predicted scalar + embedding for fusion.
+            self.eol_scalar_head = nn.Linear(self.d_model, 1)
+            self.eol_ctx_to_token = nn.Linear(1, self.d_model)
+            self.eol_ctx_to_feature = nn.Linear(1, self.d_model)
+
+            dec_layer = nn.TransformerDecoderLayer(
+                d_model=self.d_model,
+                nhead=max(1, self.latent_decoder_nhead),
+                dim_feedforward=4 * self.d_model,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.latent_transformer_decoder = nn.TransformerDecoder(
+                dec_layer, num_layers=max(1, self.latent_decoder_num_layers)
+            )
+
+            # Delta heads from latent tokens (dynamic delta semantics)
+            self.latent_to_delta_hi = nn.Linear(self.d_model, 1)
+            self.latent_to_delta_rul = nn.Linear(self.d_model, 1)
+
     def forward(
         self,
         past_seq: torch.Tensor,
@@ -147,7 +210,7 @@ class TransformerWorldModelV1(nn.Module):
         current_rul: Optional[torch.Tensor] = None,
         current_hi: Optional[torch.Tensor] = None,
         future_conds: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Args:
             past_seq: (B, T_in, input_dim)   – past window (same features as encoder).
@@ -164,6 +227,7 @@ class TransformerWorldModelV1(nn.Module):
             pred_sensors: (B, T_out, num_sensors_out)
             pred_hi:      (B, T_out, 1) or None
             pred_rul:     (B, T_out, 1) or None
+            pred_eol:     (B, 1) normalized RUL proxy (optional, for A+)
         """
         B, T_in, D = past_seq.shape
         if D != self.input_dim:
@@ -205,6 +269,46 @@ class TransformerWorldModelV1(nn.Module):
             # 2a) Latent context for simple latent mode ("latent_hi_rul")
             # ------------------------------------------------------------------
             if self.target_mode == "latent_hi_rul":
+                # If the transformer latent decoder is enabled, prefer it (A+).
+                use_tf_latent = self.latent_transformer_decoder is not None and self.future_cond_proj is not None
+                if use_tf_latent and self.use_future_conds:
+                    H = int(future_horizon)
+                    if future_conds is None:
+                        future_conds = past_seq.new_zeros(B, H, self.cond_dim)
+                    # Build query tokens from future conditions + pos emb
+                    q = self.future_cond_proj(future_conds)
+                    pos = self.future_pos_emb(
+                        torch.arange(H, device=past_seq.device, dtype=torch.long)
+                    ).unsqueeze(0)
+                    q = q + pos
+
+                    # EOL context (predicted scalar from past)
+                    z0 = enc_seq[:, -1, :]  # (B, d_model)
+                    eol_scalar = torch.sigmoid(self.eol_scalar_head(z0))  # (B,1) in [0,1]
+                    if self.use_eol_fusion:
+                        if self.eol_fusion_mode == "token":
+                            eol_tok = self.eol_ctx_to_token(eol_scalar).unsqueeze(1)  # (B,1,d_model)
+                            q_full = torch.cat([eol_tok, q], dim=1)  # (B,1+H,d_model)
+                            dec = self.latent_transformer_decoder(tgt=q_full, memory=enc_seq)  # (B,1+H,d_model)
+                            z_future = dec[:, 1:, :]  # (B,H,d_model)
+                        else:
+                            # feature fusion
+                            eol_feat = self.eol_ctx_to_feature(eol_scalar).unsqueeze(1)  # (B,1,d_model)
+                            q = q + eol_feat
+                            z_future = self.latent_transformer_decoder(tgt=q, memory=enc_seq)  # (B,H,d_model)
+                    else:
+                        z_future = self.latent_transformer_decoder(tgt=q, memory=enc_seq)  # (B,H,d_model)
+
+                    # Predict HI/RUL directly from latent tokens (no sensor forecasts)
+                    pred_sensors = past_seq.new_zeros(B, H, self.num_sensors_out)
+                    pred_hi = None
+                    pred_rul = None
+                    if self.predict_hi and self.hi_head is not None:
+                        pred_hi = torch.sigmoid(self.hi_head(z_future)).view(B, H, 1)
+                    if self.predict_rul and self.rul_head is not None:
+                        pred_rul = torch.sigmoid(self.rul_head(z_future)).view(B, H, 1)
+                    return pred_sensors, pred_hi, pred_rul, eol_scalar
+
                 if self.use_latent_history:
                     steps = min(self.latent_history_steps, T_enc)
                     z_hist = enc_seq[:, -steps:, :]  # [B, steps, D]
@@ -291,12 +395,14 @@ class TransformerWorldModelV1(nn.Module):
                 if self.predict_rul and len(preds_rul) > 0:
                     pred_rul = torch.cat(preds_rul, dim=1)  # [B, H, 1]
 
-                return pred_sensors, pred_hi, pred_rul
+                return pred_sensors, pred_hi, pred_rul, None
 
             # ------------------------------------------------------------------
             # 2b) Dynamic delta world model v2 ("latent_hi_rul_dynamic_delta_v2")
             # ------------------------------------------------------------------
             if self.target_mode == "latent_hi_rul_dynamic_delta_v2":
+                # If transformer latent decoder is enabled, decode z_future_seq using cross-attn:
+                use_tf_latent = self.latent_transformer_decoder is not None and self.future_cond_proj is not None
                 # Latent history: z_t, v1 = z_t - z_{t-1}, v2 = z_t - z_{t-2}
                 if T_enc >= 3:
                     z_t = enc_seq[:, -1, :]
@@ -369,31 +475,59 @@ class TransformerWorldModelV1(nn.Module):
                         "but target_mode='latent_hi_rul_dynamic_delta_v2' was requested."
                     )
 
-                # Build full decoder input sequence [B, H, latent_dec_input_dim]
-                z_ctx_rep = z_ctx.unsqueeze(1).repeat(1, H, 1)  # [B,H,3D]
-                inputs = [z_ctx_rep]
+                if use_tf_latent:
+                    # Query tokens: future conditions (+ pos emb)
+                    q = self.future_cond_proj(future_conds)  # (B,H,d_model)
+                    pos = self.future_pos_emb(
+                        torch.arange(int(H), device=past_seq.device, dtype=torch.long)
+                    ).unsqueeze(0)
+                    q = q + pos
 
-                if self.use_future_conds:
-                    inputs.append(future_conds)  # [B,H,cond_dim]
+                    # Predicted EOL scalar from past (for fusion + optional supervision)
+                    z0 = enc_seq[:, -1, :]  # (B,d_model)
+                    eol_scalar = torch.sigmoid(self.eol_scalar_head(z0)) if self.eol_scalar_head is not None else None
 
-                if self.use_hi_anchor and hi_anchor_vec is not None:
-                    hi_rep = hi_anchor_vec.unsqueeze(1).expand(B_enc, H, 1)  # [B,H,1]
-                    inputs.append(hi_rep)
+                    if self.use_eol_fusion and eol_scalar is not None:
+                        if self.eol_fusion_mode == "token":
+                            eol_tok = self.eol_ctx_to_token(eol_scalar).unsqueeze(1)  # (B,1,d_model)
+                            q_full = torch.cat([eol_tok, q], dim=1)
+                            dec = self.latent_transformer_decoder(tgt=q_full, memory=enc_seq)  # (B,1+H,d_model)
+                            z_future_seq = dec[:, 1:, :]  # (B,H,d_model)
+                        else:
+                            eol_feat = self.eol_ctx_to_feature(eol_scalar).unsqueeze(1)  # (B,1,d_model)
+                            q = q + eol_feat
+                            z_future_seq = self.latent_transformer_decoder(tgt=q, memory=enc_seq)  # (B,H,d_model)
+                    else:
+                        z_future_seq = self.latent_transformer_decoder(tgt=q, memory=enc_seq)  # (B,H,d_model)
 
-                if self.use_hi_anchor and rul_anchor_vec is not None:
-                    # We overload the same flag to include RUL anchor as well (delta mode only).
-                    rul_rep = rul_anchor_vec.unsqueeze(1).expand(B_enc, H, 1)  # [B,H,1]
-                    inputs.append(rul_rep)
+                    raw_delta_hi = self.latent_to_delta_hi(z_future_seq).squeeze(-1) if self.latent_to_delta_hi is not None else self.hi_head(z_future_seq).squeeze(-1)
+                    raw_delta_rul = self.latent_to_delta_rul(z_future_seq).squeeze(-1) if self.latent_to_delta_rul is not None else self.rul_head(z_future_seq).squeeze(-1)
+                else:
+                    # Build full GRU decoder input sequence [B, H, latent_dec_input_dim]
+                    z_ctx_rep = z_ctx.unsqueeze(1).repeat(1, H, 1)  # [B,H,3D]
+                    inputs = [z_ctx_rep]
 
-                decoder_in = torch.cat(inputs, dim=-1)  # [B,H,input_dim]
+                    if self.use_future_conds:
+                        inputs.append(future_conds)  # [B,H,cond_dim]
 
-                # GRU decoding with zero initial hidden state
-                dec_out, _ = self.latent_decoder_rnn(decoder_in)  # [B,H,d_dec]
-                dec_out = self.dropout(dec_out)
+                    if self.use_hi_anchor and hi_anchor_vec is not None:
+                        hi_rep = hi_anchor_vec.unsqueeze(1).expand(B_enc, H, 1)  # [B,H,1]
+                        inputs.append(hi_rep)
 
-                # Delta predictions
-                raw_delta_hi = self.hi_head(dec_out).squeeze(-1)   # [B,H]
-                raw_delta_rul = self.rul_head(dec_out).squeeze(-1) # [B,H]
+                    if self.use_hi_anchor and rul_anchor_vec is not None:
+                        # We overload the same flag to include RUL anchor as well (delta mode only).
+                        rul_rep = rul_anchor_vec.unsqueeze(1).expand(B_enc, H, 1)  # [B,H,1]
+                        inputs.append(rul_rep)
+
+                    decoder_in = torch.cat(inputs, dim=-1)  # [B,H,input_dim]
+
+                    # GRU decoding with zero initial hidden state
+                    dec_out, _ = self.latent_decoder_rnn(decoder_in)  # [B,H,d_dec]
+                    dec_out = self.dropout(dec_out)
+
+                    # Delta predictions (GRU hidden -> delta)
+                    raw_delta_hi = self.hi_head(dec_out).squeeze(-1)   # [B,H]
+                    raw_delta_rul = self.rul_head(dec_out).squeeze(-1) # [B,H]
 
                 delta_hi = -F.softplus(raw_delta_hi)   # (B,H) <= 0
                 delta_rul = -F.softplus(raw_delta_rul) # (B,H) <= 0
@@ -410,7 +544,11 @@ class TransformerWorldModelV1(nn.Module):
                 pred_hi = hi_future.unsqueeze(-1)   # [B,H,1]
                 pred_rul = rul_future.unsqueeze(-1) # [B,H,1]
 
-                return pred_sensors, pred_hi, pred_rul
+                # Optional EOL scalar prediction: use first future step as EOL proxy.
+                pred_eol = None
+                if "eol_scalar" in locals() and eol_scalar is not None:
+                    pred_eol = eol_scalar  # (B,1) in [0,1]
+                return pred_sensors, pred_hi, pred_rul, pred_eol
 
         # ------------------------------------------------------------------
         # Original sensor-autoregressive world model path
@@ -535,6 +673,6 @@ class TransformerWorldModelV1(nn.Module):
         if self.predict_rul and len(preds_rul) > 0:
             pred_rul = torch.cat(preds_rul, dim=1)  # (B, T_out, 1)
 
-        return pred_sensors, pred_hi, pred_rul
+        return pred_sensors, pred_hi, pred_rul, None
 
 

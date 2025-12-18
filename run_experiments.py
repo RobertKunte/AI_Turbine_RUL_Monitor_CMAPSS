@@ -751,6 +751,18 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             world_model_config.use_latent_history = world_model_params.get('use_latent_history', False)
             world_model_config.use_hi_anchor = world_model_params.get('use_hi_anchor', False)
             world_model_config.use_future_conds = world_model_params.get('use_future_conds', False)
+            # A+ latent decoder conditioning + EOL fusion
+            world_model_config.use_eol_fusion = world_model_params.get("use_eol_fusion", False)
+            world_model_config.eol_fusion_mode = world_model_params.get("eol_fusion_mode", "token")
+            world_model_config.predict_latent = world_model_params.get("predict_latent", False)
+            world_model_config.latent_decoder_type = world_model_params.get("latent_decoder_type", "gru")
+            world_model_config.latent_decoder_num_layers = world_model_params.get("latent_decoder_num_layers", 2)
+            world_model_config.latent_decoder_nhead = world_model_params.get("latent_decoder_nhead", 4)
+            # Training staging (freeze -> partial unfreeze)
+            world_model_config.freeze_encoder_epochs = world_model_params.get("freeze_encoder_epochs", 0)
+            world_model_config.unfreeze_encoder_layers = world_model_params.get("unfreeze_encoder_layers", 0)
+            world_model_config.encoder_lr_mult = world_model_params.get("encoder_lr_mult", 0.1)
+            world_model_config.eol_scalar_loss_weight = world_model_params.get("eol_scalar_loss_weight", 0.0)
 
             # If this is one of the Transformer World Model V1 experiments, route to
             # the dedicated training function; otherwise use the existing
@@ -1607,6 +1619,9 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
 
 
 def main():
+    # Example (Dynamic Latent World Model A+ on FD004):
+    #   python run_experiments.py --experiments fd004_transformer_latent_worldmodel_dynamic_v1 --device cuda
+    #   python run_experiments.py --experiments fd004_transformer_latent_worldmodel_dynamic_delta_v2 --device cuda
     parser = argparse.ArgumentParser(description="Run RUL prediction experiments")
     parser.add_argument(
         "--group",

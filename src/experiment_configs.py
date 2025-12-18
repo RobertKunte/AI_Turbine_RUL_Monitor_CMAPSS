@@ -838,6 +838,18 @@ def get_fd004_transformer_latent_worldmodel_dynamic_v1_config() -> ExperimentCon
         "use_latent_history": True,
         "use_hi_anchor": True,
         "use_future_conds": True,
+        # A+ latent transformer decoder + EOL fusion
+        "use_eol_fusion": True,
+        "eol_fusion_mode": "token",
+        "predict_latent": True,
+        "latent_decoder_type": "transformer",
+        "latent_decoder_num_layers": 2,
+        "latent_decoder_nhead": 4,
+        # Training staging: freeze encoder then partially unfreeze
+        "freeze_encoder_epochs": 10,
+        "unfreeze_encoder_layers": 1,
+        "encoder_lr_mult": 0.1,
+        "eol_scalar_loss_weight": 0.1,
         # Start from best ms+DT encoder – no hard freeze in the main dynamic experiment
         "freeze_encoder": False,
         "encoder_checkpoint": str(
@@ -917,6 +929,18 @@ def get_fd004_transformer_latent_worldmodel_dynamic_delta_v2_config() -> Experim
         "use_latent_history": True,
         "use_hi_anchor": True,      # also enables RUL anchor inside the model
         "use_future_conds": True,
+        # A+ latent transformer decoder + EOL fusion
+        "use_eol_fusion": True,
+        "eol_fusion_mode": "token",
+        "predict_latent": True,
+        "latent_decoder_type": "transformer",
+        "latent_decoder_num_layers": 2,
+        "latent_decoder_nhead": 4,
+        # Training staging: freeze encoder then partially unfreeze
+        "freeze_encoder_epochs": 10,
+        "unfreeze_encoder_layers": 1,
+        "encoder_lr_mult": 0.1,
+        "eol_scalar_loss_weight": 0.1,
         # Start from best ms+DT encoder – typically not frozen for main delta run
         "freeze_encoder": False,
         "encoder_checkpoint": str(
