@@ -80,6 +80,17 @@ This directly motivates **Phase-2/3 work** (see roadmap) on:
 
 ---
 
+## Diagnostics: Dynamics KPIs (HI/RUL)
+
+When you run diagnostics for a trained experiment, we additionally write **HI/RUL dynamics KPIs** to:
+
+- `results/<dataset>/<run>/dynamics_kpis.json` (**definitions.version = "v1"**)
+
+The run’s `summary.json` stores only stable pointers:
+
+- `dynamics_kpis_path`
+- `dynamics_kpis_version`
+
 ### 0.3 Relation to literature (FD001 perspective)
 
 Recent works on FD001 (EOL RMSE):

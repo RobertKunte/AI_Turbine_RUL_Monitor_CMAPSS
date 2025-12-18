@@ -54,6 +54,7 @@ from src.metrics import compute_eol_errors_and_nasa
 from src.models.rul_decoder import RULTrajectoryDecoderV3
 from src.rul_decoder_training_v1 import apply_loaded_scaler
 from src.analysis.inference import load_model_from_experiment
+from src.loss import hi_rul_derivative_agreement_loss
 
 
 DATASET_NAME = "FD004"
@@ -478,6 +479,12 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
     w_mono = float(config.get("w_mono", 0.1))
     w_smooth = float(config.get("w_smooth", 0.01))
     w_slope = float(config.get("w_slope", 0.2))
+    # Stage-1: HI↔RUL derivative coupling (default off)
+    w_couple = float(config.get("w_couple", 0.0))
+    coupling_alpha = float(config.get("coupling_alpha", 1.0))
+    coupling_hi_to_rul_scale = float(config.get("coupling_hi_to_rul_scale", max_rul))
+    coupling_hi_delta_threshold = float(config.get("coupling_hi_delta_threshold", 0.0))
+    coupling_hi_source = str(config.get("coupling_hi_source", "hi_damage"))  # hi_damage|hi_phys|hi_cal1
     # NEW: optional Gaussian NLL on trajectory (requires sigma(t))
     w_traj_nll = float(config.get("w_traj_nll", 0.0))
     sigma_floor = float(config.get("sigma_floor", 1e-3))
@@ -661,9 +668,35 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
     best_state = None
     best_epoch = -1
 
+    # 3-phase curriculum on EOL loss (optional)
+    three_phase_schedule = bool(config.get("three_phase_schedule", False))
+    phase_a_frac = float(config.get("phase_a_frac", 0.2))
+    phase_b_end_frac = float(config.get("phase_b_end_frac", 0.8))
+    schedule_type = str(config.get("schedule_type", config.get("eol_ramp", "linear"))).lower()
+    eol_w_max = float(config.get("eol_w_max", 1.0))
+    def _eol_mult(epoch_idx_1based: int) -> float:
+        if not three_phase_schedule:
+            return 1.0
+        p = float(epoch_idx_1based) / float(max(1, num_epochs))
+        a = max(0.0, min(1.0, phase_a_frac))
+        b = max(0.0, min(1.0, phase_b_end_frac))
+        if b <= a:
+            return 1.0
+        if p <= a:
+            return 0.0
+        if p >= b:
+            return 1.0
+        ramp = (p - a) / (b - a)
+        if schedule_type == "cosine":
+            import math
+            return float(0.5 * (1.0 - math.cos(math.pi * ramp)))
+        return float(ramp)
+
     for epoch in range(1, num_epochs + 1):
         decoder.train()
         train_losses = []
+        eol_mult = _eol_mult(epoch)
+        w_eol_eff = float(w_eol) * float(eol_w_max) * float(eol_mult)
 
         for batch in train_loader:
             (
@@ -753,13 +786,30 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
 
             loss = (
                 w_traj * traj_loss
-                + w_eol * eol_loss
+                + w_eol_eff * eol_loss
                 + w_mono * mono_loss
                 + w_smooth * smooth_loss
                 + w_slope * slope_loss
             )
             if traj_nll is not None and w_traj_nll > 0.0:
                 loss = loss + w_traj_nll * traj_nll
+
+            # HI↔RUL coupling: when HI degrades, predicted RUL should decrease accordingly.
+            if w_couple > 0.0:
+                if coupling_hi_source == "hi_phys":
+                    hi_for_couple = hi_phys_batch
+                elif coupling_hi_source == "hi_cal1":
+                    hi_for_couple = hi_cal1_batch
+                else:
+                    hi_for_couple = hi_damage_seq_use
+                couple_loss = hi_rul_derivative_agreement_loss(
+                    hi_seq=hi_for_couple,
+                    rul_seq_pred=rul_seq_pred,
+                    alpha=coupling_alpha,
+                    hi_to_rul_scale=coupling_hi_to_rul_scale,
+                    hi_delta_threshold=coupling_hi_delta_threshold,
+                )
+                loss = loss + float(w_couple) * couple_loss
 
             loss.backward()
             optimizer.step()
@@ -842,7 +892,8 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
             f"val_rmse={val_rmse:.3f}, "
             f"val_mae={val_metrics['mae']:.3f}, "
             f"val_bias={val_metrics['bias']:.3f}, "
-            f"val_r2={val_metrics['r2']:.3f}"
+            f"val_r2={val_metrics['r2']:.3f}, "
+            f"eol_mult={eol_mult:.2f}"
         )
 
         if val_rmse < best_val_rmse:
@@ -939,6 +990,16 @@ def train_rul_decoder_v3(config: Dict[str, Any], device: torch.device) -> Dict[s
             "w_mono": w_mono,
             "w_smooth": w_smooth,
             "w_slope": w_slope,
+            "w_couple": w_couple,
+            "three_phase_schedule": three_phase_schedule,
+            "phase_a_frac": phase_a_frac,
+            "phase_b_end_frac": phase_b_end_frac,
+            "schedule_type": schedule_type,
+            "eol_w_max": eol_w_max,
+            "coupling_alpha": coupling_alpha,
+            "coupling_hi_to_rul_scale": coupling_hi_to_rul_scale,
+            "coupling_hi_delta_threshold": coupling_hi_delta_threshold,
+            "coupling_hi_source": coupling_hi_source,
             "w_traj_nll": w_traj_nll,
             "sigma_floor": sigma_floor,
         },

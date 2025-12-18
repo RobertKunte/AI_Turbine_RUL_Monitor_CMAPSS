@@ -1351,6 +1351,16 @@ def get_fd004_decoder_v3_from_encoder_v3d_config() -> ExperimentConfig:
         "w_mono": 0.1,
         "w_smooth": 0.01,
         "w_slope": 0.2,
+        # Stage-1: curriculum + coupling (defaults are conservative; adjust in ablations)
+        "three_phase_schedule": True,
+        "phase_a_frac": 0.2,
+        "phase_b_end_frac": 0.8,
+        # IMPORTANT: keep coupling OFF by default until KPIs confirm saturation/flatline.
+        "w_couple": 0.0,
+        "coupling_alpha": 1.0,
+        "coupling_hi_to_rul_scale": 125.0,
+        "coupling_hi_delta_threshold": 0.0,
+        "coupling_hi_source": "hi_damage",
     }
     return cfg
 
@@ -3457,6 +3467,27 @@ def get_world_model_phase5_universal_v3_residual_config(
         # New: tail-weighted EOL loss (emphasize small RUL region)
         "eol_tail_rul_threshold": 40.0,
         "eol_tail_weight": 3.0,
+
+        # Stage-1: 3-phase curriculum schedule (A/B/C) to improve early/mid-life dynamics
+        # while preserving EOL performance.
+        "three_phase_schedule": True,
+        "phase_a_frac": 0.2,       # 0–20%: no EOL loss
+        "phase_b_end_frac": 0.8,   # 20–80%: ramp EOL loss in
+        "schedule_type": "linear",
+        "eol_w_max": 1.0,
+
+        # Stage-1: HI shape regularizers (small weights; tune per ablation)
+        "hi_early_slope_weight": 0.05,
+        "hi_early_slope_epsilon": 1e-3,
+        "hi_early_slope_rul_threshold": 90.0,
+        "hi_curvature_weight": 0.01,
+        "hi_curvature_abs": True,
+
+        # Stage-2 (optional): WorldModel HI→EOL consistency (OFF by default; enable in ablations)
+        "w_eol_hi": 0.0,
+        "eol_hi_threshold": 0.2,
+        "eol_hi_temperature": 0.05,
+        "eol_hi_p_min": 0.2,
     }
     
     return ExperimentConfig(
@@ -3639,6 +3670,25 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
                         wm_params["eol_tail_weight"] = w_val
                     except ValueError:
                         pass
+
+                # Parse HI→EOL consistency coupling weight (WorldModel-only, optional):
+                # - If name contains "_eolhi" => enable with default 0.1
+                # - Or "_eolhi0p1" / "_eolhi0.1" to specify weight explicitly
+                if "_eolhi" in experiment_name:
+                    m_eh = re.search(r"_eolhi(?P<v>[0-9]+(?:p[0-9]+)?|\d+(?:\.\d+)?)?", experiment_name)
+                    w_default = 0.1
+                    if m_eh:
+                        raw = m_eh.group("v")
+                        if raw:
+                            try:
+                                if "p" in raw:
+                                    ip, fp = raw.split("p", 1)
+                                    w_default = float(f"{ip}.{fp}")
+                                else:
+                                    w_default = float(raw)
+                            except ValueError:
+                                w_default = 0.1
+                    wm_params["w_eol_hi"] = float(w_default)
 
                 cfg["world_model_params"] = wm_params
                 # Ensure the experiment_name in the config matches the requested name

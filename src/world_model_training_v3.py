@@ -36,7 +36,12 @@ from src.world_model_training import (
     build_seq2seq_samples_from_df,
 )
 from src.models.world_model import WorldModelUniversalV3
-from src.loss import monotonic_health_loss
+from src.loss import (
+    monotonic_health_loss,
+    hi_early_slope_regularizer,
+    hi_curvature_loss,
+    hi_eol_consistency_loss,
+)
 from src.training_utils import compute_global_trend_loss
 from src.metrics import compute_eol_errors_and_nasa
 from src.models.transformer_eol import EOLFullTransformerEncoder
@@ -323,17 +328,49 @@ def train_world_model_universal_v3(
         "val_hi_loss": [],
         "val_mono_late_loss": [],
         "val_mono_global_loss": [],
+        "val_hi_early_slope_loss": [],
+        "val_hi_curvature_loss": [],
         "val_traj_weighted": [],
         "val_eol_weighted": [],
         "val_hi_weighted": [],
         "val_mono_weighted": [],
+        "val_shape_weighted": [],
+        "val_eol_hi_loss": [],
+        "val_eol_hi_weighted": [],
     }
     
     best_val_loss = float("inf")
     epochs_no_improve = 0
     best_model_path = results_dir / "world_model_v3_best.pt"
     
+    def _eol_mult_for_epoch(epoch_idx: int) -> float:
+        if not bool(getattr(world_model_config, "three_phase_schedule", False)):
+            return 1.0
+        # progress in (0,1]
+        p = float(epoch_idx + 1) / float(max(1, num_epochs))
+        a = float(getattr(world_model_config, "phase_a_frac", 0.2))
+        b = float(getattr(world_model_config, "phase_b_frac", getattr(world_model_config, "phase_b_end_frac", 0.8)))
+        a = max(0.0, min(1.0, a))
+        b = max(0.0, min(1.0, b))
+        if b <= a:
+            # Degenerate schedule: treat as immediate joint training
+            return 1.0
+        if p <= a:
+            return 0.0
+        if p >= b:
+            return 1.0
+        # Ramp in phase B
+        ramp = (p - a) / (b - a)
+        schedule_type = str(getattr(world_model_config, "schedule_type", getattr(world_model_config, "eol_ramp", "linear"))).lower()
+        if schedule_type == "cosine":
+            # cosine from 0..1
+            import math
+            return float(0.5 * (1.0 - math.cos(math.pi * ramp)))
+        return float(ramp)
+
     for epoch in range(num_epochs):
+        eol_mult = _eol_mult_for_epoch(epoch)
+        eol_weight_eff = float(world_model_config.eol_loss_weight) * float(getattr(world_model_config, "eol_w_max", 1.0)) * float(eol_mult)
         # Training
         model.train()
         running_train_loss = 0.0
@@ -416,12 +453,41 @@ def train_world_model_universal_v3(
                 return_components=True,
             )
 
+            # Additional Stage-1 HI shape losses (optional, default off)
+            early_slope_raw = hi_early_slope_regularizer(
+                pred_hi=hi_seq_pred,
+                rul_seq=rul_future,
+                epsilon=float(getattr(world_model_config, "hi_early_slope_epsilon", 1e-3)),
+                early_rul_threshold=getattr(world_model_config, "hi_early_slope_rul_threshold", None),
+            )
+            curv_raw = hi_curvature_loss(
+                pred_hi=hi_seq_pred,
+                abs_mode=bool(getattr(world_model_config, "hi_curvature_abs", True)),
+            )
+            shape_loss = (
+                float(getattr(world_model_config, "hi_early_slope_weight", 0.0)) * early_slope_raw
+                + float(getattr(world_model_config, "hi_curvature_weight", 0.0)) * curv_raw
+            )
+
+            # Optional WorldModel coupling without RUL trajectory: HI → EOL consistency
+            eol_hi_raw = hi_eol_consistency_loss(
+                eol_pred=eol_pred,
+                hi_seq=hi_seq_pred,
+                hi_threshold=float(getattr(world_model_config, "eol_hi_threshold", 0.2)),
+                temperature=float(getattr(world_model_config, "eol_hi_temperature", 0.05)),
+                p_min=float(getattr(world_model_config, "eol_hi_p_min", 0.2)),
+                valid_mask=None,  # seq windows have no padding in this training path
+            )
+            eol_hi_loss = float(getattr(world_model_config, "w_eol_hi", 0.0)) * eol_hi_raw
+
             # Weighted total loss
             weighted_traj = world_model_config.traj_loss_weight * loss_traj
-            weighted_eol = world_model_config.eol_loss_weight * loss_eol
+            weighted_eol = eol_weight_eff * loss_eol
             weighted_hi = world_model_config.hi_loss_weight * loss_hi_last
+            weighted_shape = shape_loss
+            weighted_eol_hi = eol_hi_loss
 
-            loss = weighted_traj + weighted_eol + weighted_hi
+            loss = weighted_traj + weighted_eol + weighted_hi + weighted_shape + weighted_eol_hi
             
             loss.backward()
             optimizer.step()
@@ -439,10 +505,15 @@ def train_world_model_universal_v3(
         running_val_hi_loss = 0.0
         running_val_mono_late_loss = 0.0
         running_val_mono_global_loss = 0.0
+        running_val_hi_early_slope_loss = 0.0
+        running_val_hi_curvature_loss = 0.0
         running_val_traj_weighted = 0.0
         running_val_eol_weighted = 0.0
         running_val_hi_weighted = 0.0
         running_val_mono_weighted = 0.0
+        running_val_shape_weighted = 0.0
+        running_val_eol_hi_loss = 0.0
+        running_val_eol_hi_weighted = 0.0
         n_val_samples = 0
         
         with torch.no_grad():
@@ -509,17 +580,44 @@ def train_world_model_universal_v3(
                     beta=world_model_config.mono_global_weight,
                     return_components=True,
                 )
+
+                early_slope_raw = hi_early_slope_regularizer(
+                    pred_hi=hi_seq_pred,
+                    rul_seq=rul_future,
+                    epsilon=float(getattr(world_model_config, "hi_early_slope_epsilon", 1e-3)),
+                    early_rul_threshold=getattr(world_model_config, "hi_early_slope_rul_threshold", None),
+                )
+                curv_raw = hi_curvature_loss(
+                    pred_hi=hi_seq_pred,
+                    abs_mode=bool(getattr(world_model_config, "hi_curvature_abs", True)),
+                )
+                shape_loss = (
+                    float(getattr(world_model_config, "hi_early_slope_weight", 0.0)) * early_slope_raw
+                    + float(getattr(world_model_config, "hi_curvature_weight", 0.0)) * curv_raw
+                )
+
+                eol_hi_raw = hi_eol_consistency_loss(
+                    eol_pred=eol_pred,
+                    hi_seq=hi_seq_pred,
+                    hi_threshold=float(getattr(world_model_config, "eol_hi_threshold", 0.2)),
+                    temperature=float(getattr(world_model_config, "eol_hi_temperature", 0.05)),
+                    p_min=float(getattr(world_model_config, "eol_hi_p_min", 0.2)),
+                    valid_mask=None,
+                )
+                eol_hi_loss = float(getattr(world_model_config, "w_eol_hi", 0.0)) * eol_hi_raw
                 
                 # Weighted losses
                 weighted_traj = world_model_config.traj_loss_weight * loss_traj
-                weighted_eol = world_model_config.eol_loss_weight * loss_eol
+                weighted_eol = eol_weight_eff * loss_eol
                 weighted_hi = world_model_config.hi_loss_weight * loss_hi_last
                 weighted_mono = world_model_config.traj_loss_weight * (
                     world_model_config.mono_late_weight * mono_raw
                     + world_model_config.mono_global_weight * smooth_raw
                 )
+                weighted_shape = shape_loss
+                weighted_eol_hi = eol_hi_loss
                 
-                loss = weighted_traj + weighted_eol + weighted_hi
+                loss = weighted_traj + weighted_eol + weighted_hi + weighted_shape + weighted_eol_hi
                 
                 running_val_loss += loss.item() * X_batch.size(0)
                 running_val_traj_loss += base_hi_mse.item() * X_batch.size(0)
@@ -527,10 +625,15 @@ def train_world_model_universal_v3(
                 running_val_hi_loss += loss_hi_last.item() * X_batch.size(0)
                 running_val_mono_late_loss += mono_raw.item() * X_batch.size(0)
                 running_val_mono_global_loss += smooth_raw.item() * X_batch.size(0)
+                running_val_hi_early_slope_loss += early_slope_raw.item() * X_batch.size(0)
+                running_val_hi_curvature_loss += curv_raw.item() * X_batch.size(0)
                 running_val_traj_weighted += weighted_traj.item() * X_batch.size(0)
                 running_val_eol_weighted += weighted_eol.item() * X_batch.size(0)
                 running_val_hi_weighted += weighted_hi.item() * X_batch.size(0)
                 running_val_mono_weighted += weighted_mono.item() * X_batch.size(0)
+                running_val_shape_weighted += weighted_shape.item() * X_batch.size(0)
+                running_val_eol_hi_loss += eol_hi_raw.item() * X_batch.size(0)
+                running_val_eol_hi_weighted += weighted_eol_hi.item() * X_batch.size(0)
                 n_val_samples += X_batch.size(0)
         
         epoch_val_loss = running_val_loss / n_val_samples
@@ -539,10 +642,15 @@ def train_world_model_universal_v3(
         epoch_val_hi_loss = running_val_hi_loss / n_val_samples
         epoch_val_mono_late_loss = running_val_mono_late_loss / n_val_samples
         epoch_val_mono_global_loss = running_val_mono_global_loss / n_val_samples
+        epoch_val_hi_early_slope_loss = running_val_hi_early_slope_loss / n_val_samples
+        epoch_val_hi_curvature_loss = running_val_hi_curvature_loss / n_val_samples
         epoch_val_traj_weighted = running_val_traj_weighted / n_val_samples
         epoch_val_eol_weighted = running_val_eol_weighted / n_val_samples
         epoch_val_hi_weighted = running_val_hi_weighted / n_val_samples
         epoch_val_mono_weighted = running_val_mono_weighted / n_val_samples
+        epoch_val_shape_weighted = running_val_shape_weighted / n_val_samples
+        epoch_val_eol_hi_loss = running_val_eol_hi_loss / n_val_samples
+        epoch_val_eol_hi_weighted = running_val_eol_hi_weighted / n_val_samples
         
         history["train_loss"].append(epoch_train_loss)
         history["val_loss"].append(epoch_val_loss)
@@ -551,18 +659,25 @@ def train_world_model_universal_v3(
         history["val_hi_loss"].append(epoch_val_hi_loss)
         history["val_mono_late_loss"].append(epoch_val_mono_late_loss)
         history["val_mono_global_loss"].append(epoch_val_mono_global_loss)
+        history["val_hi_early_slope_loss"].append(epoch_val_hi_early_slope_loss)
+        history["val_hi_curvature_loss"].append(epoch_val_hi_curvature_loss)
         history["val_traj_weighted"].append(epoch_val_traj_weighted)
         history["val_eol_weighted"].append(epoch_val_eol_weighted)
         history["val_hi_weighted"].append(epoch_val_hi_weighted)
         history["val_mono_weighted"].append(epoch_val_mono_weighted)
+        history["val_shape_weighted"].append(epoch_val_shape_weighted)
+        history["val_eol_hi_loss"].append(epoch_val_eol_hi_loss)
+        history["val_eol_hi_weighted"].append(epoch_val_eol_hi_weighted)
         
         print(
             f"Epoch {epoch+1}/{num_epochs} - "
             f"train: {epoch_train_loss:.4f}, val: {epoch_val_loss:.4f}, "
             f"val_traj: {epoch_val_traj_loss:.4f} (w: {epoch_val_traj_weighted:.4f}), "
-            f"val_eol: {epoch_val_eol_loss:.4f} (w: {epoch_val_eol_weighted:.4f}), "
+            f"val_eol: {epoch_val_eol_loss:.4f} (w: {epoch_val_eol_weighted:.4f}, mult={eol_mult:.2f}), "
             f"val_hi: {epoch_val_hi_loss:.4f} (w: {epoch_val_hi_weighted:.4f}), "
-            f"val_mono: {epoch_val_mono_late_loss:.4f}+{epoch_val_mono_global_loss:.4f} (w: {epoch_val_mono_weighted:.4f})"
+            f"val_mono: {epoch_val_mono_late_loss:.4f}+{epoch_val_mono_global_loss:.4f} (w: {epoch_val_mono_weighted:.4f}), "
+            f"val_shape: {epoch_val_hi_early_slope_loss:.4f}+{epoch_val_hi_curvature_loss:.4f} (w: {epoch_val_shape_weighted:.4f}), "
+            f"val_eol_hi: {epoch_val_eol_hi_loss:.4f} (w: {epoch_val_eol_hi_weighted:.4f})"
         )
         
         # Early stopping
@@ -697,6 +812,23 @@ def train_world_model_universal_v3(
             "use_hi_slope_in_eol": world_model_config.use_hi_slope_in_eol,
             "eol_tail_rul_threshold": world_model_config.eol_tail_rul_threshold,
             "eol_tail_weight": world_model_config.eol_tail_weight,
+            # Stage-1 schedule + shape losses (may be absent in older configs)
+            "three_phase_schedule": bool(getattr(world_model_config, "three_phase_schedule", False)),
+            "phase_a_frac": float(getattr(world_model_config, "phase_a_frac", 0.2)),
+            "phase_b_end_frac": float(getattr(world_model_config, "phase_b_end_frac", 0.8)),
+            "phase_b_frac": getattr(world_model_config, "phase_b_frac", None),
+            "schedule_type": str(getattr(world_model_config, "schedule_type", getattr(world_model_config, "eol_ramp", "linear"))),
+            "eol_w_max": float(getattr(world_model_config, "eol_w_max", 1.0)),
+            "hi_early_slope_weight": float(getattr(world_model_config, "hi_early_slope_weight", 0.0)),
+            "hi_early_slope_epsilon": float(getattr(world_model_config, "hi_early_slope_epsilon", 1e-3)),
+            "hi_early_slope_rul_threshold": getattr(world_model_config, "hi_early_slope_rul_threshold", None),
+            "hi_curvature_weight": float(getattr(world_model_config, "hi_curvature_weight", 0.0)),
+            "hi_curvature_abs": bool(getattr(world_model_config, "hi_curvature_abs", True)),
+            # Stage-2 optional: HI→EOL consistency (WorldModel)
+            "w_eol_hi": float(getattr(world_model_config, "w_eol_hi", 0.0)),
+            "eol_hi_threshold": float(getattr(world_model_config, "eol_hi_threshold", 0.2)),
+            "eol_hi_temperature": float(getattr(world_model_config, "eol_hi_temperature", 0.05)),
+            "eol_hi_p_min": float(getattr(world_model_config, "eol_hi_p_min", 0.2)),
         },
         "test_metrics": {
             "rmse": test_metrics["RMSE"],

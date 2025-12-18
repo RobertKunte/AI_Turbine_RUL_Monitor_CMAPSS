@@ -694,6 +694,23 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 use_hi_slope_in_eol=world_model_params.get('use_hi_slope_in_eol', False),
                 eol_tail_rul_threshold=world_model_params.get('eol_tail_rul_threshold', None),
                 eol_tail_weight=world_model_params.get('eol_tail_weight', 1.0),
+                # Stage-1: 3-phase schedule + extra HI shape losses (optional; defaults keep old behavior)
+                three_phase_schedule=world_model_params.get('three_phase_schedule', False),
+                phase_a_frac=world_model_params.get('phase_a_frac', 0.2),
+                phase_b_end_frac=world_model_params.get('phase_b_end_frac', 0.8),
+                phase_b_frac=world_model_params.get('phase_b_frac', None),
+                schedule_type=world_model_params.get('schedule_type', world_model_params.get('eol_ramp', 'linear')),
+                eol_w_max=world_model_params.get('eol_w_max', 1.0),
+                hi_early_slope_weight=world_model_params.get('hi_early_slope_weight', 0.0),
+                hi_early_slope_epsilon=world_model_params.get('hi_early_slope_epsilon', 1e-3),
+                hi_early_slope_rul_threshold=world_model_params.get('hi_early_slope_rul_threshold', None),
+                hi_curvature_weight=world_model_params.get('hi_curvature_weight', 0.0),
+                hi_curvature_abs=world_model_params.get('hi_curvature_abs', True),
+                # Stage-2 (optional): HI→EOL consistency coupling for WorldModel (default off)
+                w_eol_hi=world_model_params.get('w_eol_hi', 0.0),
+                eol_hi_threshold=world_model_params.get('eol_hi_threshold', 0.2),
+                eol_hi_temperature=world_model_params.get('eol_hi_temperature', 0.05),
+                eol_hi_p_min=world_model_params.get('eol_hi_p_min', 0.2),
             )
             # Additional world-model V1 specific loss weights (sensor / future HI / future RUL)
             # and architectural flags are stored as dynamic attributes on the

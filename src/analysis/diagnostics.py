@@ -58,6 +58,14 @@ from src.eol_full_lstm import (
     evaluate_on_test_data,
 )
 from src.models.universal_encoder_v1 import UniversalEncoderV2, RULHIUniversalModelV2
+from src.health_index_metrics import (
+    hi_plateau_ratio,
+    hi_onset_cycle,
+    hi_curvature,
+    rul_saturation_rate,
+    rul_slope_error,
+    reconstruct_rul_trajectory_from_last,
+)
 
 
 def select_engines_for_trajectories(
@@ -680,7 +688,7 @@ def compute_hi_trajectory_sliding(
     is_world_model: bool = False,
     is_world_model_v3: bool = False,
     max_rul: float = 125.0,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]:
     """
     Berechnet eine HI-Trajektorie für eine Engine mit Sliding Window:
     
@@ -702,6 +710,7 @@ def compute_hi_trajectory_sliding(
         hi_vals:   HI-Werte pro Zyklus
         rul_vals:  RUL-Vorhersagen pro Zyklus (in Zyklen, gecappt auf [0, max_rul])
         hi_damage_vals: Optional damage-based HI values (None if model doesn't have damage_head)
+        rul_vals_raw: RUL-Vorhersagen pro Zyklus (ungeclippt, nur lower-bounded auf 0)
     """
     df_engine = df_engine.sort_values("TimeInCycles").copy()
     
@@ -717,6 +726,7 @@ def compute_hi_trajectory_sliding(
     
     hi_vals: List[float] = []
     rul_vals: List[float] = []
+    rul_vals_raw: List[float] = []
     hi_damage_vals: List[float] = []
     hi_cycles: List[float] = []
     
@@ -757,10 +767,12 @@ def compute_hi_trajectory_sliding(
                         traj_pred, eol_pred = outputs
                         eol_val = float(eol_pred[0, 0].item())
                         hi_val = max(0.0, min(1.0, 1.0 - (eol_val / max_rul)))
-                    # Clamp RUL to valid range
-                    eol_val = max(0.0, min(float(max_rul), eol_val))
+                    # Keep raw RUL (lower-bound at 0); clip only for plotting/range safety
+                    eol_val_raw = max(0.0, float(eol_val))
+                    eol_val_clip = min(float(max_rul), eol_val_raw)
                     hi_vals.append(hi_val)
-                    rul_vals.append(eol_val)
+                    rul_vals_raw.append(eol_val_raw)
+                    rul_vals.append(eol_val_clip)
                 else:
                     # World model v2 returns (traj_outputs, eol_pred)
                     try:
@@ -799,14 +811,17 @@ def compute_hi_trajectory_sliding(
                         # HI = 1 - (eol_pred / max_rul), clamped to [0, 1]
                         eol_val = float(eol_val)
                         hi_proxy = max(0.0, min(1.0, 1.0 - (eol_val / max_rul)))
-                        # Clamp RUL for plotting
-                        eol_val = max(0.0, min(float(max_rul), eol_val))
+                        # Keep raw RUL (lower-bound at 0); clip only for plotting/range safety
+                        eol_val_raw = max(0.0, float(eol_val))
+                        eol_val_clip = min(float(max_rul), eol_val_raw)
                         hi_vals.append(hi_proxy)
-                        rul_vals.append(eol_val)
+                        rul_vals_raw.append(eol_val_raw)
+                        rul_vals.append(eol_val_clip)
                     except Exception as e:
                         print(f"  Warning: Error computing HI/RUL for sliding window: {e}")
                         # Fallback: use default HI/RUL values
                         hi_vals.append(0.5)
+                        rul_vals_raw.append(float(max_rul) / 2.0)
                         rul_vals.append(float(max_rul) / 2.0)
             else:
                 # EOL model returns (rul_pred, hi_last, hi_seq)
@@ -827,9 +842,11 @@ def compute_hi_trajectory_sliding(
                     eol_val = float(rul_pred[0, 0].item())
                 else:
                     eol_val = float(rul_pred[0].item())
-                eol_val = max(0.0, min(float(max_rul), eol_val))
+                eol_val_raw = max(0.0, float(eol_val))
+                eol_val_clip = min(float(max_rul), eol_val_raw)
                 hi_vals.append(hi_last_val)
-                rul_vals.append(eol_val)
+                rul_vals_raw.append(eol_val_raw)
+                rul_vals.append(eol_val_clip)
                 
                 # Extract damage HI if damage_head is available
                 if has_damage_head:
@@ -893,7 +910,13 @@ def compute_hi_trajectory_sliding(
             hi_damage_array = np.array(valid_damage_vals)
         # Note: Logging is done at the build_trajectories level to avoid spam
     
-    return np.array(hi_cycles), np.array(hi_vals), np.array(rul_vals), hi_damage_array
+    return (
+        np.array(hi_cycles),
+        np.array(hi_vals),
+        np.array(rul_vals),
+        hi_damage_array,
+        np.array(rul_vals_raw),
+    )
 
 
 def build_trajectories(
@@ -909,7 +932,7 @@ def build_trajectories(
     max_rul: int,
     is_world_model: bool = False,
     is_world_model_v3: bool = False,
-) -> List[EngineTrajectory]:
+) -> Tuple[List[EngineTrajectory], Dict[int, Dict[str, np.ndarray]]]:
     """
     Baut pro Engine Trajektorien für HI + RUL.
     
@@ -930,7 +953,8 @@ def build_trajectories(
     Returns:
         List of EngineTrajectory objects
     """
-    trajectories = []
+    trajectories: List[EngineTrajectory] = []
+    raw_by_unit: Dict[int, Dict[str, np.ndarray]] = {}
     
     for i, unit_id in enumerate(unit_ids_test):
         unit_id = int(unit_id)
@@ -942,7 +966,7 @@ def build_trajectories(
             continue
         
         # Compute HI *and* RUL trajectory using sliding window
-        cycles_hi, hi_vals, pred_rul_traj, hi_damage_vals = compute_hi_trajectory_sliding(
+        cycles_hi, hi_vals, pred_rul_traj, hi_damage_vals, pred_rul_raw = compute_hi_trajectory_sliding(
             df_engine=df_engine,
             feature_cols=feature_cols,
             scaler_dict=scaler_dict,
@@ -957,16 +981,22 @@ def build_trajectories(
         if len(cycles_hi) == 0:
             continue  # Skip if no valid HI values
         
-        # Build full cycles array for RUL trajectories
-        cycles_full = df_engine["TimeInCycles"].values
-        
-        # True RUL trajectory: linear decline from max_rul to true_rul_eol
-        true_rul_eol = y_true_eol[i]
-        true_rul_full = np.linspace(max_rul, true_rul_eol, len(cycles_full))
-        
-        # Map cycles_hi to indices in cycles_full
-        idx_map = {c: idx for idx, c in enumerate(cycles_full)}
-        true_rul_traj = np.array([true_rul_full[idx_map[c]] for c in cycles_hi])
+        # True RUL trajectory for CMAPSS test is *right-censored*:
+        # y_true_eol is the true remaining RUL at the last observed cycle.
+        last_cycle = float(df_engine["TimeInCycles"].max())
+        true_rul_eol = float(y_true_eol[i])
+        true_rul_uncapped = reconstruct_rul_trajectory_from_last(
+            rul_last=true_rul_eol,
+            cycle_last=last_cycle,
+            cycles=cycles_hi,
+            cap=None,
+        )
+        true_rul_traj = reconstruct_rul_trajectory_from_last(
+            rul_last=true_rul_eol,
+            cycle_last=last_cycle,
+            cycles=cycles_hi,
+            cap=float(max_rul),
+        )
         
         trajectories.append(EngineTrajectory(
             unit_id=unit_id,
@@ -976,8 +1006,16 @@ def build_trajectories(
             pred_rul=pred_rul_traj,
             hi_damage=hi_damage_vals,  # Optional damage-based HI trajectory
         ))
+
+        raw_by_unit[unit_id] = {
+            "cycles": cycles_hi.astype(float),
+            "pred_rul_raw": pred_rul_raw.astype(float),
+            "pred_rul_clipped": pred_rul_traj.astype(float),
+            "true_rul_uncapped": true_rul_uncapped.astype(float),
+            "true_rul_clipped": true_rul_traj.astype(float),
+        }
     
-    return trajectories
+    return trajectories, raw_by_unit
 
 
 def select_degraded_engines(
@@ -2060,7 +2098,7 @@ def run_diagnostics_for_run(
     
     # Build trajectories (use df_test_fe from build_eval_data)
     print("[5] Building HI trajectories (sliding window)...")
-    trajectories = build_trajectories(
+    trajectories, raw_trajs_by_unit = build_trajectories(
         df_test_fe=df_test_fe,
         feature_cols=feature_cols,
         scaler_dict=scaler_dict,
@@ -2076,6 +2114,189 @@ def run_diagnostics_for_run(
     )
     
     print(f"  Built trajectories for {len(trajectories)} engines")
+
+    # ------------------------------------------------------------------
+    # Stage-0 diagnostics: HI/RUL dynamics KPIs (per-engine + aggregate)
+    # ------------------------------------------------------------------
+    print("[5b] Computing HI/RUL dynamics KPIs...")
+    kpis_path = experiment_dir / "dynamics_kpis.json"
+    kpi_version = "v1"
+    kpi_records: List[Dict[str, object]] = []
+    kpis_agg: Dict[str, float] = {}
+
+    # KPI definitions (explicit + reproducible; can be overridden via summary.json config)
+    # NOTE: these only affect diagnostics KPIs, not training.
+    kpi_cfg = {}
+    try:
+        if isinstance(config, dict):
+            kpi_cfg = config.get("diagnostics_kpi", {}) if isinstance(config.get("diagnostics_kpi", {}), dict) else {}
+    except Exception:
+        kpi_cfg = {}
+
+    hi_plateau_thr = float(kpi_cfg.get("hi_plateau_threshold", 0.98))
+    hi_onset_thr = float(kpi_cfg.get("hi_onset_threshold", 0.95))
+    rul_sat_delta = float(kpi_cfg.get("rul_saturation_delta", 2.0))
+    early_start_frac = float(kpi_cfg.get("rul_slope_early_start_frac", 0.0))
+    early_end_frac = float(kpi_cfg.get("rul_slope_early_end_frac", 0.4))
+    mid_start_frac = float(kpi_cfg.get("rul_slope_mid_start_frac", 0.4))
+    mid_end_frac = float(kpi_cfg.get("rul_slope_mid_end_frac", 0.8))
+
+    def _json_num(x: float) -> float | None:
+        try:
+            xf = float(x)
+            if not np.isfinite(xf):
+                return None
+            return xf
+        except Exception:
+            return None
+
+    short_seq_curv_skipped = 0
+
+    try:
+        for traj in trajectories:
+            uid = int(traj.unit_id)
+            raw = raw_trajs_by_unit.get(uid, {})
+            cycles = np.asarray(raw.get("cycles", traj.cycles), dtype=float)
+            hi = np.asarray(traj.hi, dtype=float)
+            pred_rul_clip = np.asarray(raw.get("pred_rul_clipped", traj.pred_rul), dtype=float)
+            pred_rul_raw = np.asarray(raw.get("pred_rul_raw", traj.pred_rul), dtype=float)
+            true_rul_uncapped = np.asarray(raw.get("true_rul_uncapped", traj.true_rul), dtype=float)
+
+            plateau = hi_plateau_ratio(hi, threshold=hi_plateau_thr)
+            onset = hi_onset_cycle(cycles, hi, threshold=hi_onset_thr)
+            last_cycle = float(np.max(cycles)) if cycles.size > 0 else float("nan")
+            onset_frac = float(onset / last_cycle) if np.isfinite(onset) and np.isfinite(last_cycle) and last_cycle > 0 else float("nan")
+            curv = hi_curvature(hi, abs_mode=True)
+            if hi.size < 3 and (not np.isfinite(curv)):
+                short_seq_curv_skipped += 1
+
+            sat_clip = rul_saturation_rate(pred_rul_clip, cap=float(max_rul), delta=rul_sat_delta)
+            sat_raw = rul_saturation_rate(np.minimum(pred_rul_raw, float(max_rul)), cap=float(max_rul), delta=rul_sat_delta)
+
+            slope_early = rul_slope_error(
+                cycles=cycles,
+                rul_true=true_rul_uncapped,
+                rul_pred=pred_rul_raw,
+                start_frac=early_start_frac,
+                end_frac=early_end_frac,
+            )
+            slope_mid = rul_slope_error(
+                cycles=cycles,
+                rul_true=true_rul_uncapped,
+                rul_pred=pred_rul_raw,
+                start_frac=mid_start_frac,
+                end_frac=mid_end_frac,
+            )
+
+            kpi_records.append(
+                {
+                    "unit_id": float(uid),
+                    # HI KPIs (dimensionless)
+                    "hi_plateau_ratio": _json_num(plateau),
+                    "hi_onset_cycle": _json_num(onset),  # cycles
+                    "hi_onset_cycle_frac": _json_num(onset_frac),  # fraction of last observed cycle
+                    "hi_curvature": _json_num(curv),
+                    # RUL KPIs (cycles / rates)
+                    "rul_saturation_rate_clipped": _json_num(sat_clip),
+                    "rul_saturation_rate_raw": _json_num(sat_raw),
+                    "rul_slope_true_early": _json_num(slope_early["true_slope"]),
+                    "rul_slope_pred_early": _json_num(slope_early["pred_slope"]),
+                    "rul_slope_abs_error_early": _json_num(slope_early["abs_error"]),
+                    "rul_slope_true_mid": _json_num(slope_mid["true_slope"]),
+                    "rul_slope_pred_mid": _json_num(slope_mid["pred_slope"]),
+                    "rul_slope_abs_error_mid": _json_num(slope_mid["abs_error"]),
+                }
+            )
+    except Exception as e:
+        print(f"  ⚠️  Warning: failed to compute some dynamics KPIs: {e}")
+
+    def _nanmean(xs: List[float]) -> float:
+        arr = np.asarray(xs, dtype=float)
+        if arr.size == 0:
+            return float("nan")
+        return float(np.nanmean(arr))
+
+    kpis_agg = {
+        "hi_plateau_ratio_mean": _nanmean([r.get("hi_plateau_ratio", float("nan")) for r in kpi_records]),  # type: ignore[arg-type]
+        "hi_onset_cycle_mean": _nanmean([r.get("hi_onset_cycle", float("nan")) for r in kpi_records]),  # type: ignore[arg-type]
+        "hi_onset_cycle_frac_mean": _nanmean([r.get("hi_onset_cycle_frac", float("nan")) for r in kpi_records]),  # type: ignore[arg-type]
+        "hi_curvature_mean": _nanmean([r.get("hi_curvature", float("nan")) for r in kpi_records]),  # type: ignore[arg-type]
+        "rul_saturation_rate_clipped_mean": _nanmean([r.get("rul_saturation_rate_clipped", float("nan")) for r in kpi_records]),  # type: ignore[arg-type]
+        "rul_saturation_rate_raw_mean": _nanmean([r.get("rul_saturation_rate_raw", float("nan")) for r in kpi_records]),  # type: ignore[arg-type]
+        "rul_slope_abs_error_early_mean": _nanmean([r.get("rul_slope_abs_error_early", float("nan")) for r in kpi_records]),  # type: ignore[arg-type]
+        "rul_slope_abs_error_mid_mean": _nanmean([r.get("rul_slope_abs_error_mid", float("nan")) for r in kpi_records]),  # type: ignore[arg-type]
+        "num_engines": int(len(kpi_records)),
+    }
+
+    try:
+        kpis_agg_json: Dict[str, object] = {
+            k: (_json_num(v) if k != "num_engines" else int(v))
+            for k, v in kpis_agg.items()
+        }
+        with open(kpis_path, "w") as f:
+            json.dump(
+                {
+                    "definitions": {
+                        "version": kpi_version,
+                        "thresholds": {
+                            "hi_plateau_thr": hi_plateau_thr,
+                            "hi_onset_thr": hi_onset_thr,
+                            "rul_cap_band_delta": rul_sat_delta,
+                        },
+                        "windows": {
+                            "window_type": "fraction_of_last_cycle",
+                            "early": {"start_frac": early_start_frac, "end_frac": early_end_frac},
+                            "mid": {"start_frac": mid_start_frac, "end_frac": mid_end_frac},
+                        },
+                        "units": {
+                            "hi_plateau_ratio": "fraction",
+                            "hi_onset_cycle": "cycles",
+                            "hi_onset_cycle_frac": "fraction",
+                            "hi_curvature": "hi_units",
+                            "rul_saturation_rate_*": "fraction",
+                            "rul_slope_*": "cycles_per_cycle",
+                        },
+                        "notes": [
+                            "FD004 test is right-censored: y_test_true is RUL at the last observed cycle.",
+                            "For diagnostics slope KPIs we reconstruct true_rul(t) from last-cycle label using reconstruct_rul_trajectory_from_last().",
+                            "pred_rul_raw is lower-bounded at 0; pred_rul_clipped is additionally capped to max_rul.",
+                        ],
+                    },
+                    "aggregate": kpis_agg_json,
+                    "per_engine": kpi_records,
+                },
+                f,
+                indent=2,
+            )
+        print(f"  Saved dynamics KPIs to {kpis_path}")
+        print(
+            "  KPIs (mean): "
+            f"plateau={kpis_agg['hi_plateau_ratio_mean']:.3f}, "
+            f"onset_frac={kpis_agg['hi_onset_cycle_frac_mean']:.3f}, "
+            f"sat={kpis_agg['rul_saturation_rate_clipped_mean']:.3f}, "
+            f"slope_err_early={kpis_agg['rul_slope_abs_error_early_mean']:.3f}"
+        )
+    except Exception as e:
+        print(f"  ⚠️  Warning: could not write dynamics_kpis.json: {e}")
+
+    if short_seq_curv_skipped > 0:
+        print(
+            f"  ⚠️  KPI warning: curvature undefined for {short_seq_curv_skipped} engines (sequence length < 3). "
+            "hi_curvature set to null."
+        )
+
+    # Lightweight sanity checks (warn-only; must not break older runs)
+    try:
+        if np.isfinite(kpis_agg.get("hi_plateau_ratio_mean", np.nan)):
+            v = float(kpis_agg["hi_plateau_ratio_mean"])
+            if not (0.0 <= v <= 1.0):
+                print(f"  ⚠️  KPI sanity: hi_plateau_ratio_mean out of [0,1]: {v}")
+        if np.isfinite(kpis_agg.get("rul_saturation_rate_clipped_mean", np.nan)):
+            v = float(kpis_agg["rul_saturation_rate_clipped_mean"])
+            if not (0.0 <= v <= 1.0):
+                print(f"  ⚠️  KPI sanity: rul_saturation_rate_clipped_mean out of [0,1]: {v}")
+    except Exception:
+        pass
     
     # Check if any trajectories have damage HI (check all trajectories first)
     trajectories_with_damage = [t for t in trajectories if t.hi_damage is not None and len(t.hi_damage) > 0]
@@ -2373,6 +2594,11 @@ def run_diagnostics_for_run(
             "generated_at_utc": generated_at_utc,
             "generated_git_sha": generated_git_sha,
         }
+
+        # Stage-0 dynamics KPIs: store only stable pointer + version (no nested structures).
+        # Keep the full KPI payload in results/<dataset>/<run>/dynamics_kpis.json.
+        summary_obj["dynamics_kpis_path"] = str(kpis_path)
+        summary_obj["dynamics_kpis_version"] = str(kpi_version)
 
         # Preserve training metrics as the official metrics in summary.json.
         # If training metrics are present, keep them untouched and snapshot them once.

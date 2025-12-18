@@ -140,6 +140,34 @@ class WorldModelTrainingConfig:
     eol_tail_rul_threshold: Optional[float] = None  # RUL < threshold => tail region
     eol_tail_weight: float = 1.0          # multiplicative weight for tail samples
 
+    # Stage-1: 3-phase curriculum schedule (A/B/C) to improve HI/RUL dynamics
+    # - Phase A: dynamics warmup (EOL weight = 0)
+    # - Phase B: joint training (EOL weight ramps to full)
+    # - Phase C: EOL focus (EOL weight = full; keep dynamics losses on as stabilizers)
+    three_phase_schedule: bool = False
+    phase_a_frac: float = 0.2
+    # Backward-compatible naming:
+    # - phase_b_end_frac is the end of the ramp-in phase (default 0.8)
+    # - phase_b_frac is an alias (preferred name in newer prompts)
+    phase_b_end_frac: float = 0.8
+    phase_b_frac: Optional[float] = None
+    schedule_type: Literal["linear", "cosine"] = "linear"
+    eol_w_max: float = 1.0
+
+    # Stage-1: additional HI shape losses (default off; enable via experiment config)
+    hi_early_slope_weight: float = 0.0
+    hi_early_slope_epsilon: float = 1e-3
+    hi_early_slope_rul_threshold: Optional[float] = None
+    hi_curvature_weight: float = 0.0
+    hi_curvature_abs: bool = True
+
+    # Stage-1/2: optional WorldModel coupling (no RUL_seq): HI → EOL consistency
+    # Default MUST be off to avoid silent behavior changes.
+    w_eol_hi: float = 0.0
+    eol_hi_threshold: float = 0.2
+    eol_hi_temperature: float = 0.05
+    eol_hi_p_min: float = 0.2
+
 
 def compute_trajectory_step_weights(
     horizon: int,

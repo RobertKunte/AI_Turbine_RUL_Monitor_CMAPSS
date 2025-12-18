@@ -558,6 +558,291 @@ def monotonic_health_loss(
     return total
 
 
+def hi_early_slope_regularizer(
+    pred_hi: torch.Tensor,
+    rul_seq: Optional[torch.Tensor] = None,
+    valid_mask: Optional[torch.Tensor] = None,
+    epsilon: float = 1e-3,
+    early_rul_threshold: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Encourage a *small but non-zero* early-life downward slope in HI to prevent flatlines.
+
+    This implements a hinge penalty on the per-step decrease:
+        penalty_t = relu(epsilon - (HI_t - HI_{t+1}))
+
+    Optionally restricts to an early-life window using a true RUL sequence mask.
+
+    Args:
+        pred_hi: (B,T) or (B,T,1) predicted HI trajectory (early -> late)
+        rul_seq: optional (B,T) or (B,T,1) true RUL per step (in cycles)
+        valid_mask: optional (B,T) mask (1=valid, 0=padding). If provided, only
+            valid adjacent pairs contribute.
+        epsilon: minimal desired per-step decrease (HI scale)
+        early_rul_threshold: if provided, apply penalty only where both steps satisfy
+            RUL >= early_rul_threshold (i.e. early/healthy regime).
+    """
+    if pred_hi.dim() == 3:
+        pred_hi = pred_hi.squeeze(-1)
+    if pred_hi.dim() == 1:
+        pred_hi = pred_hi.unsqueeze(0)
+    if pred_hi.size(1) < 2:
+        return pred_hi.new_tensor(0.0)
+
+    slope = pred_hi[:, :-1] - pred_hi[:, 1:]  # positive when HI decreases
+    penalty = torch.relu(float(epsilon) - slope)
+
+    pair_mask = None
+    if valid_mask is not None:
+        if valid_mask.dim() == 3:
+            valid_mask = valid_mask.squeeze(-1)
+        if valid_mask.dim() == 1:
+            valid_mask = valid_mask.unsqueeze(0)
+        if valid_mask.shape != pred_hi.shape:
+            raise ValueError(
+                f"valid_mask must match pred_hi shape {tuple(pred_hi.shape)}, got {tuple(valid_mask.shape)}"
+            )
+        pair_mask = (valid_mask[:, :-1] > 0.5) & (valid_mask[:, 1:] > 0.5)
+
+    if rul_seq is not None and early_rul_threshold is not None:
+        if rul_seq.dim() == 3:
+            rul_seq = rul_seq.squeeze(-1)
+        if rul_seq.dim() == 1:
+            rul_seq = rul_seq.unsqueeze(0)
+        thr = float(early_rul_threshold)
+        mask = (rul_seq[:, :-1] >= thr) & (rul_seq[:, 1:] >= thr)
+        if pair_mask is not None:
+            mask = mask & pair_mask
+        if mask.any():
+            return (penalty * mask.float()).sum() / (mask.float().sum() + 1e-8)
+        return pred_hi.new_tensor(0.0)
+
+    if pair_mask is not None:
+        if pair_mask.any():
+            return (penalty * pair_mask.float()).sum() / (pair_mask.float().sum() + 1e-8)
+        return pred_hi.new_tensor(0.0)
+
+    return penalty.mean()
+
+
+def hi_curvature_loss(
+    pred_hi: torch.Tensor,
+    valid_mask: Optional[torch.Tensor] = None,
+    abs_mode: bool = True,
+) -> torch.Tensor:
+    """
+    Penalize curvature / abrupt drops in HI via second-order differences.
+
+        curv_t = HI_{t+1} - 2*HI_t + HI_{t-1}
+
+    Args:
+        pred_hi: (B,T) or (B,T,1)
+        valid_mask: optional (B,T) mask (1=valid, 0=padding). If provided, only
+            valid triplets contribute.
+        abs_mode: if True -> mean(|curv|), else -> mean(curv^2)
+    """
+    if pred_hi.dim() == 3:
+        pred_hi = pred_hi.squeeze(-1)
+    if pred_hi.dim() == 1:
+        pred_hi = pred_hi.unsqueeze(0)
+    if pred_hi.size(1) < 3:
+        return pred_hi.new_tensor(0.0)
+    curv = pred_hi[:, 2:] - 2.0 * pred_hi[:, 1:-1] + pred_hi[:, :-2]
+
+    if abs_mode:
+        curv_val = torch.abs(curv)
+    else:
+        curv_val = curv ** 2
+
+    if valid_mask is not None:
+        if valid_mask.dim() == 3:
+            valid_mask = valid_mask.squeeze(-1)
+        if valid_mask.dim() == 1:
+            valid_mask = valid_mask.unsqueeze(0)
+        if valid_mask.shape != pred_hi.shape:
+            raise ValueError(
+                f"valid_mask must match pred_hi shape {tuple(pred_hi.shape)}, got {tuple(valid_mask.shape)}"
+            )
+        trip = (valid_mask[:, :-2] > 0.5) & (valid_mask[:, 1:-1] > 0.5) & (valid_mask[:, 2:] > 0.5)
+        if trip.any():
+            return (curv_val * trip.float()).sum() / (trip.float().sum() + 1e-8)
+        return pred_hi.new_tensor(0.0)
+
+    return torch.mean(curv_val)
+
+
+def hi_rul_derivative_agreement_loss(
+    hi_seq: torch.Tensor,
+    rul_seq_pred: torch.Tensor,
+    *,
+    valid_mask: Optional[torch.Tensor] = None,
+    alpha: float = 1.0,
+    hi_to_rul_scale: float = 125.0,
+    hi_delta_threshold: float = 0.0,
+) -> torch.Tensor:
+    """
+    Couple HI degradation rate to predicted RUL degradation rate (hinge).
+
+    If HI degrades (HI decreases), predicted RUL should also decrease accordingly:
+        loss_t = relu(alpha * (-ΔHI_t) * hi_to_rul_scale - (-ΔRUL_pred_t))
+
+    Args:
+        hi_seq: (B,T) or (B,T,1) HI trajectory (healthy high -> degraded low)
+        rul_seq_pred: (B,T) or (B,T,1) predicted RUL in cycles
+        valid_mask: optional (B,T) mask (1=valid, 0=padding). If provided, only
+            valid adjacent pairs contribute.
+        alpha: proportionality factor between HI-degradation (scaled) and RUL-degradation
+        hi_to_rul_scale: convert HI units to cycle units (default ~ max_rul)
+        hi_delta_threshold: only apply on steps where (-ΔHI) > threshold (HI actually degrading)
+    """
+    if hi_seq.dim() == 3:
+        hi_seq = hi_seq.squeeze(-1)
+    if rul_seq_pred.dim() == 3:
+        rul_seq_pred = rul_seq_pred.squeeze(-1)
+    if hi_seq.dim() == 1:
+        hi_seq = hi_seq.unsqueeze(0)
+    if rul_seq_pred.dim() == 1:
+        rul_seq_pred = rul_seq_pred.unsqueeze(0)
+    if hi_seq.size(1) < 2 or rul_seq_pred.size(1) < 2:
+        return hi_seq.new_tensor(0.0)
+
+    d_hi = hi_seq[:, 1:] - hi_seq[:, :-1]
+    d_rul = rul_seq_pred[:, 1:] - rul_seq_pred[:, :-1]
+
+    hi_degr = torch.relu(-d_hi)  # positive when HI decreases
+    rul_degr = torch.relu(-d_rul)  # positive when predicted RUL decreases
+
+    target_rul_degr = float(alpha) * hi_degr * float(hi_to_rul_scale)
+    penalty = torch.relu(target_rul_degr - rul_degr)
+
+    pair_mask = None
+    if valid_mask is not None:
+        if valid_mask.dim() == 3:
+            valid_mask = valid_mask.squeeze(-1)
+        if valid_mask.dim() == 1:
+            valid_mask = valid_mask.unsqueeze(0)
+        if valid_mask.shape != hi_seq.shape:
+            raise ValueError(
+                f"valid_mask must match hi_seq shape {tuple(hi_seq.shape)}, got {tuple(valid_mask.shape)}"
+            )
+        pair_mask = (valid_mask[:, :-1] > 0.5) & (valid_mask[:, 1:] > 0.5)
+        penalty = penalty * pair_mask.float()
+
+    thr = float(hi_delta_threshold)
+    if thr > 0.0:
+        mask = hi_degr > thr
+        if pair_mask is not None:
+            mask = mask & pair_mask
+        if mask.any():
+            return (penalty * mask.float()).sum() / (mask.float().sum() + 1e-8)
+        return hi_seq.new_tensor(0.0)
+
+    if pair_mask is not None:
+        if pair_mask.any():
+            return penalty.sum() / (pair_mask.float().sum() + 1e-8)
+        return hi_seq.new_tensor(0.0)
+
+    return penalty.mean()
+
+
+def hi_to_eol_soft_hitting_time(
+    hi_seq: torch.Tensor,
+    *,
+    hi_threshold: float = 0.2,
+    temperature: float = 0.05,
+    valid_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Differentiable expected time-to-threshold from an HI trajectory.
+
+    We interpret hi_seq as HI values for future steps t=1..T (one step ~ one cycle).
+    Compute per-step "crossed" probability c_t = sigmoid((thr - HI_t)/temp).
+    Then first-crossing distribution:
+        f_t = c_t * Π_{k < t} (1 - c_k)
+    Expected hitting time:
+        E[t] = Σ_{t=1..T} t * f_t + (T+1) * Π_{k<=T} (1 - c_k)
+
+    Returns:
+        expected_t: (B,) expected hitting time in cycles ahead (censored at T+1).
+        p_reach:    (B,) probability of reaching threshold within horizon.
+    """
+    if hi_seq.dim() == 3:
+        hi_seq = hi_seq.squeeze(-1)
+    if hi_seq.dim() == 1:
+        hi_seq = hi_seq.unsqueeze(0)
+    B, T = hi_seq.shape
+    if T <= 0:
+        z = hi_seq.new_zeros((B,))
+        return z, z
+
+    thr = float(hi_threshold)
+    temp = float(max(1e-6, temperature))
+
+    c = torch.sigmoid((thr - hi_seq) / temp)  # (B,T)
+    if valid_mask is not None:
+        if valid_mask.dim() == 3:
+            valid_mask = valid_mask.squeeze(-1)
+        if valid_mask.dim() == 1:
+            valid_mask = valid_mask.unsqueeze(0)
+        if valid_mask.shape != hi_seq.shape:
+            raise ValueError(
+                f"valid_mask must match hi_seq shape {tuple(hi_seq.shape)}, got {tuple(valid_mask.shape)}"
+            )
+        m = (valid_mask > 0.5).float()
+        c = c * m  # invalid => no crossing probability
+
+    one_minus = 1.0 - c
+    # Exclusive product Π_{k < t} (1 - c_k)
+    prefix = torch.cumprod(one_minus, dim=1)  # (B,T)
+    prefix_excl = torch.cat([one_minus.new_ones((B, 1)), prefix[:, :-1]], dim=1)
+
+    f = c * prefix_excl  # (B,T)
+    p_not = torch.prod(one_minus, dim=1)  # (B,)
+    p_reach = 1.0 - p_not
+
+    t_idx = torch.arange(1, T + 1, device=hi_seq.device, dtype=hi_seq.dtype).unsqueeze(0)  # (1,T)
+    expected = torch.sum(t_idx * f, dim=1) + (T + 1.0) * p_not
+
+    return expected, p_reach
+
+
+def hi_eol_consistency_loss(
+    eol_pred: torch.Tensor,
+    hi_seq: torch.Tensor,
+    *,
+    hi_threshold: float = 0.2,
+    temperature: float = 0.05,
+    p_min: float = 0.2,
+    valid_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Optional WorldModel coupling without RUL trajectory:
+    encourage scalar EOL_pred (RUL at current step) to be consistent with HI dynamics.
+
+    We derive an "EOL-from-HI" proxy = expected time (cycles) to reach hi_threshold.
+    Loss is applied only when p_reach >= p_min (i.e. HI suggests reaching threshold within horizon).
+    """
+    if eol_pred.dim() > 1:
+        eol_pred = eol_pred.view(-1)
+    else:
+        eol_pred = eol_pred.reshape(-1)
+
+    expected_t, p_reach = hi_to_eol_soft_hitting_time(
+        hi_seq,
+        hi_threshold=hi_threshold,
+        temperature=temperature,
+        valid_mask=valid_mask,
+    )
+    # If HI never suggests reaching threshold in-horizon, don't force EOL down.
+    pmin = float(p_min)
+    if pmin > 0.0:
+        m = p_reach >= pmin
+        if m.any():
+            return torch.abs(eol_pred[m] - expected_t[m]).mean()
+        return eol_pred.new_tensor(0.0)
+
+    return torch.abs(eol_pred - expected_t).mean()
+
 def rul_asymmetric_weighted_loss(pred, target,
                                  over_factor=2.0,
                                  min_rul_weight=1.0,

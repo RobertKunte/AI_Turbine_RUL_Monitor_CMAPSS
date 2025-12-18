@@ -12,6 +12,10 @@ You are the **Planner/Architect** for this repo. Your job is to propose an imple
 - Call out **data leakage** risks (CMAPSS, per-engine transforms, calibrators).
 - For FD004 test, always treat “EOL” as **last observed cycle (right-censored)** in text/plots.
 - Propose edits only within the scope requested by the task. If code changes are requested later, keep a tight file list.
+- If the task is about **HI / RUL dynamics** (avoid “flat HI until the end”, avoid **RUL saturation** at cap), the plan MUST:
+  - introduce **diagnostic KPIs** beyond RMSE/NASA (see below),
+  - propose a **low-risk loss/schedule** change first (curriculum / weight ramp),
+  - and separate “shape/dynamics” objectives from the primary **EOL** objective (no regressions on NASA/EOL).
 - When adding new model heads/outputs (e.g., uncertainty/quantiles):
   - **Define a stable output contract** (exact return type + ordering + optional fields) to avoid tuple-unpacking regressions.
   - **Include the strict-load reconstruction gate**: `load_model_from_experiment` must infer new head flags from `state_dict` keys so `strict=True` loads succeed.
@@ -54,6 +58,37 @@ It must include:
 - If adding uncertainty/quantiles: also include the risk of **mean shift** and mitigation via loss weighting/detach strategy.
 
 ---
+
+## Reference: HI/RUL dynamics improvement playbook (use when relevant)
+
+### Target behavior (precise)
+1. **HI**: early slightly decreasing, then progressive; **monotone + smooth**, no “flatline until the end”.
+2. **RUL (right-censored / capped)**: in healthy/early regime **high but not saturated**, and in mid-life a clear trend.
+3. **EOL** remains top priority: late-phase performance must not degrade (NASA/EOL not worse).
+
+### Stage 0 — Baseline diagnostics (add KPIs)
+Add these KPIs next to RMSE/NASA (per-engine + aggregated):
+- **HI Plateau Ratio**: fraction of cycles with \(HI > 0.98\)
+- **HI Onset Cycle**: first cycle where \(HI < 0.95\) (configurable threshold)
+- **HI Curvature**: mean absolute second difference \(E[|HI_{t+1} - 2HI_t + HI_{t-1}|]\)
+- **RUL Slope Error**: compare fitted slope (early/mid windows) vs expected trend under right-censoring
+- **Saturation Rate**: fraction of predictions with \(\hat{RUL} \in [RUL_{cap}-\delta, RUL_{cap}]\)
+
+Success criteria: Plateau ↓, onset earlier, saturation ↓, **without worse NASA/EOL**.
+
+### Stage 1 — Low-risk training changes (quick wins)
+- **3-phase curriculum** (A/B/C):
+  - **A (Dynamics warmup)**: no EOL loss; emphasize HI/RUL trajectory + shape losses
+  - **B (Joint)**: ramp EOL loss in (linear/cosine); keep trajectory weight high
+  - **C (EOL focus)**: EOL/NASA high; keep dynamics losses on as stabilizers
+- Add two small HI shape terms (start with tiny weights; ablate):
+  - **Early-slope regularizer** to prevent early flatline
+  - **Curvature/smoothness** to avoid abrupt drop
+- Add **HI↔RUL derivative coupling** (hinge): when HI degrades, predicted RUL must trend down (reduces “RUL saturated while HI falls”).
+
+### Stage 2 — Medium risk architecture tweak (optional)
+If stage 1 is insufficient: add a **gated RUL head** that consumes \((HI, \Delta HI)\) explicitly, plus an optional saturation penalty.
+
 
 ## Cursor Implementation Prompt Template (copy/paste and fill)
 
