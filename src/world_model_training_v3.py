@@ -12,6 +12,21 @@ import pandas as pd
 import json
 import matplotlib.pyplot as plt
 
+# region agent log
+def _agent_dbg(payload: dict) -> None:
+    """Minimal NDJSON debug logger (safe/no-throw)."""
+    try:
+        import json as _json
+        with open(
+            r"c:\Users\rober\OneDrive\Dokumente\GitHub\AI_Turbine_RUL_Monitor_CMAPSS\.cursor\debug.log",
+            "a",
+            encoding="utf-8",
+        ) as _f:
+            _f.write(_json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+# endregion
+
 try:
     import torch
     import torch.nn as nn
@@ -137,6 +152,28 @@ def train_world_model_universal_v3(
             mono_late_weight=0.1,
             mono_global_weight=0.1,
         )
+
+    # region agent log
+    _agent_dbg(
+        {
+            "sessionId": "debug-session",
+            "runId": "pre-fix",
+            "hypothesisId": "A",
+            "location": "src/world_model_training_v3.py:train_world_model_universal_v3:config_ready",
+            "message": "world_model_config schedule fields snapshot",
+            "data": {
+                "world_model_config_type": type(world_model_config).__name__,
+                "three_phase_schedule": getattr(world_model_config, "three_phase_schedule", "<missing>"),
+                "phase_a_frac": getattr(world_model_config, "phase_a_frac", "<missing>"),
+                "phase_b_frac": getattr(world_model_config, "phase_b_frac", "<missing>"),
+                "phase_b_end_frac": getattr(world_model_config, "phase_b_end_frac", "<missing>"),
+                "schedule_type": getattr(world_model_config, "schedule_type", "<missing>"),
+                "num_epochs": num_epochs,
+            },
+            "timestamp": int(__import__("time").time() * 1000),
+        }
+    )
+    # endregion
     
     past_len = world_model_config.past_len
     # Allow an override for the decoder forecast horizon specific to WorldModelV1
@@ -344,11 +381,68 @@ def train_world_model_universal_v3(
     best_model_path = results_dir / "world_model_v3_best.pt"
     
     def _eol_mult_for_epoch(epoch_idx: int) -> float:
+        # region agent log
+        _agent_dbg(
+            {
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": "A",
+                "location": "src/world_model_training_v3.py:_eol_mult_for_epoch:entry",
+                "message": "entered _eol_mult_for_epoch",
+                "data": {
+                    "epoch_idx": epoch_idx,
+                    "num_epochs": num_epochs,
+                    "three_phase_schedule": getattr(world_model_config, "three_phase_schedule", "<missing>"),
+                },
+                "timestamp": int(__import__("time").time() * 1000),
+            }
+        )
+        # endregion
         if not bool(getattr(world_model_config, "three_phase_schedule", False)):
+            # region agent log
+            _agent_dbg(
+                {
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "C",
+                    "location": "src/world_model_training_v3.py:_eol_mult_for_epoch:no_schedule",
+                    "message": "three_phase_schedule disabled => eol_mult=1.0",
+                    "data": {"epoch_idx": epoch_idx},
+                    "timestamp": int(__import__("time").time() * 1000),
+                }
+            )
+            # endregion
             return 1.0
         # progress in (0,1]
         p = float(epoch_idx + 1) / float(max(1, num_epochs))
-        a = float(getattr(world_model_config, "phase_a_frac", 0.2))
+        raw_a = getattr(world_model_config, "phase_a_frac", 0.2)
+        raw_b_frac = getattr(world_model_config, "phase_b_frac", "<missing>")
+        raw_b_end = getattr(world_model_config, "phase_b_end_frac", "<missing>")
+        # region agent log
+        _agent_dbg(
+            {
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": "A",
+                "location": "src/world_model_training_v3.py:_eol_mult_for_epoch:pre_float_cast",
+                "message": "raw schedule values before float() cast",
+                "data": {
+                    "epoch_idx": epoch_idx,
+                    "p": p,
+                    "raw_phase_a_frac": raw_a,
+                    "raw_phase_b_frac": raw_b_frac,
+                    "raw_phase_b_end_frac": raw_b_end,
+                    "types": {
+                        "phase_a_frac": type(raw_a).__name__,
+                        "phase_b_frac": type(raw_b_frac).__name__,
+                        "phase_b_end_frac": type(raw_b_end).__name__,
+                    },
+                },
+                "timestamp": int(__import__("time").time() * 1000),
+            }
+        )
+        # endregion
+        a = float(raw_a)
         b = float(getattr(world_model_config, "phase_b_frac", getattr(world_model_config, "phase_b_end_frac", 0.8)))
         a = max(0.0, min(1.0, a))
         b = max(0.0, min(1.0, b))
