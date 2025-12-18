@@ -3489,6 +3489,27 @@ def get_world_model_phase5_universal_v3_residual_config(
         "eol_hi_temperature": 0.05,
         "eol_hi_p_min": 0.2,
     }
+
+    # ------------------------------------------------------------------
+    # FD004 stabilization defaults (ONLY for FD004)
+    # ------------------------------------------------------------------
+    if dataset == "FD004":
+        # Stabilize EOL ramp-in by normalizing EOL targets/preds inside loss
+        world_params.update(
+            {
+                "normalize_eol": True,
+                "eol_scale": "rul_cap",
+                "eol_loss_type": "huber",
+                "eol_huber_beta": 0.1,
+                "clip_grad_norm": 1.0,
+                "freeze_encoder_epochs_after_eol_on": 3,
+                # Temporarily disable HI-fusion into EOL head for stability; can be re-enabled later
+                "use_hi_in_eol": False,
+                "use_hi_slope_in_eol": False,
+                # Keep max multiplier; normalization handles scale
+                "eol_w_max": 1.0,
+            }
+        )
     
     return ExperimentConfig(
         experiment_name=exp_name,

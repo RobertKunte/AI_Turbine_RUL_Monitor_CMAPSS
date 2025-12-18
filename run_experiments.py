@@ -118,6 +118,8 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     
     dataset_name = config['dataset']
     experiment_name = config['experiment_name']
+    # Canonical results directory for this run (used across all branches)
+    results_dir = Path("results") / dataset_name.lower() / experiment_name
 
     # ===================================================================
     # Phase 1 Run Registry (SQLite) – best-effort (must not break runs)
@@ -125,7 +127,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
     registry = None
     run_id: Optional[str] = None
     artifact_root_current: Optional[Path] = None
-    registry_results_dir_default = Path("results") / dataset_name.lower() / experiment_name
+    registry_results_dir_default = results_dir
 
     def _get_git_sha() -> Optional[str]:
         try:
@@ -701,6 +703,13 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 phase_b_frac=world_model_params.get('phase_b_frac', None),
                 schedule_type=world_model_params.get('schedule_type', world_model_params.get('eol_ramp', 'linear')),
                 eol_w_max=world_model_params.get('eol_w_max', 1.0),
+                # EOL ramp stabilization (optional; default off)
+                normalize_eol=bool(world_model_params.get('normalize_eol', False)),
+                eol_scale=world_model_params.get('eol_scale', 'rul_cap'),
+                eol_loss_type=world_model_params.get('eol_loss_type', 'mse'),
+                eol_huber_beta=float(world_model_params.get('eol_huber_beta', 0.1)),
+                clip_grad_norm=world_model_params.get('clip_grad_norm', None),
+                freeze_encoder_epochs_after_eol_on=int(world_model_params.get('freeze_encoder_epochs_after_eol_on', 0)),
                 hi_early_slope_weight=world_model_params.get('hi_early_slope_weight', 0.0),
                 hi_early_slope_epsilon=world_model_params.get('hi_early_slope_epsilon', 1e-3),
                 hi_early_slope_rul_threshold=world_model_params.get('hi_early_slope_rul_threshold', None),
@@ -764,7 +773,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                     lr=config['optimizer_params']['lr'],
                     weight_decay=config['optimizer_params']['weight_decay'],
                     patience=config['training_params']['patience'],
-                    results_dir=Path("results") / dataset_name.lower() / experiment_name,
+                    results_dir=results_dir,
                     device=device,
                 )
             else:
@@ -792,7 +801,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                     engine_train_ratio=config['training_params']['engine_train_ratio'],
                     random_seed=config['training_params']['random_seed'],
                     world_model_config=world_model_config,
-                    results_dir=Path("results") / dataset_name.lower() / experiment_name,
+                    results_dir=results_dir,
                     device=device,
                 )
             
@@ -839,7 +848,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 engine_train_ratio=config['training_params']['engine_train_ratio'],
                 random_seed=config['training_params']['random_seed'],
                 world_model_config=world_model_config,
-                results_dir=Path("results") / dataset_name.lower() / experiment_name,
+                results_dir=results_dir,
                 device=device,
             )
         
@@ -862,7 +871,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             print(f"  Best val_loss (train_transformer_world_model_v1): {summary.get('val_loss', float('nan')):.4f}")
         print("=" * 80)
 
-        _registry_finish(summary, results_dir=results_dir)
+        _registry_finish(summary, results_dir=results_dir, summary_path=results_dir / "summary.json")
         return summary
     
     # ===================================================================
@@ -1605,6 +1614,15 @@ def main():
         choices=["auto", "cpu", "cuda"],
         help="Device to use (default: auto-detect)",
     )
+    parser.add_argument(
+        "--smoke-epochs",
+        type=int,
+        default=None,
+        help=(
+            "Override num_epochs for a quick smoke run (e.g. 3–5). "
+            "Does not change the experiment configs on disk."
+        ),
+    )
     
     args = parser.parse_args()
     
@@ -1661,6 +1679,18 @@ def main():
         print(f"Experiment {i}/{len(experiments)}")
         print(f"{'#' * 80}")
         try:
+            if args.smoke_epochs is not None:
+                try:
+                    config.setdefault("training_params", {})
+                    config["training_params"]["num_epochs"] = int(args.smoke_epochs)
+                    # Keep patience bounded so smoke runs don't early-stop instantly.
+                    if "patience" in config["training_params"]:
+                        config["training_params"]["patience"] = min(
+                            int(config["training_params"]["patience"]),
+                            int(args.smoke_epochs),
+                        )
+                except Exception as e:
+                    print(f"  ⚠️  Could not apply --smoke-epochs override: {e}")
             summary = run_single_experiment(config, device)
             all_summaries.append(summary)
         except Exception as e:

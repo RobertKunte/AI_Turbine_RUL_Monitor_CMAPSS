@@ -356,9 +356,62 @@ def train_world_model_universal_v3(
     print("\n[6] Training model...")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     mse_loss = nn.MSELoss()
+
+    # -------------------------------
+    # EOL loss stabilization options
+    # -------------------------------
+    normalize_eol = bool(getattr(world_model_config, "normalize_eol", False))
+    eol_loss_type = str(getattr(world_model_config, "eol_loss_type", "mse")).lower()
+    eol_huber_beta = float(getattr(world_model_config, "eol_huber_beta", 0.1))
+
+    # Resolve EOL normalization scale once (used only inside loss)
+    def _resolve_eol_scale() -> float:
+        scale_cfg = getattr(world_model_config, "eol_scale", "rul_cap")
+        if isinstance(scale_cfg, (int, float)):
+            return float(scale_cfg)
+        if isinstance(scale_cfg, str):
+            key = scale_cfg.lower()
+            if key == "rul_cap":
+                return float(getattr(world_model_config, "max_rul", 125.0) or 125.0)
+            if key == "max_cycle":
+                try:
+                    # global max last-cycle length in training set
+                    mx = float(df_train.groupby("UnitNumber")["TimeInCycles"].max().max())
+                    return mx if mx > 0 else float(getattr(world_model_config, "max_rul", 125.0) or 125.0)
+                except Exception:
+                    return float(getattr(world_model_config, "max_rul", 125.0) or 125.0)
+        # fallback
+        return float(getattr(world_model_config, "max_rul", 125.0) or 125.0)
+
+    eol_scale_value = _resolve_eol_scale() if normalize_eol else 1.0
+
+    # Default grad clipping only when normalization is enabled (opt-in stability)
+    clip_grad_norm_cfg = getattr(world_model_config, "clip_grad_norm", None)
+    if normalize_eol and clip_grad_norm_cfg is None:
+        clip_grad_norm_cfg = 1.0
+
+    freeze_encoder_n = int(getattr(world_model_config, "freeze_encoder_epochs_after_eol_on", 0) or 0)
+    eol_on_epoch: Optional[int] = None
+
+    def _set_requires_grad(module: nn.Module, flag: bool) -> None:
+        for p in module.parameters():
+            p.requires_grad = flag
+
+    def _eol_loss_per_sample(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-sample EOL loss on normalized scale, shape (B,).
+        """
+        if eol_loss_type == "huber":
+            fn = nn.SmoothL1Loss(beta=eol_huber_beta, reduction="none")
+            return fn(pred, target)
+        if eol_loss_type == "mae":
+            return torch.abs(pred - target)
+        # default mse
+        return (pred - target) ** 2
     
     history = {
         "train_loss": [],
+        "train_grad_norm": [],
         "val_loss": [],
         "val_traj_loss": [],
         "val_eol_loss": [],
@@ -379,6 +432,7 @@ def train_world_model_universal_v3(
     best_val_loss = float("inf")
     epochs_no_improve = 0
     best_model_path = results_dir / "world_model_v3_best.pt"
+    abort_path = results_dir / "world_model_v3_abort_nan.pt"
     
     def _eol_mult_for_epoch(epoch_idx: int) -> float:
         # region agent log
@@ -469,12 +523,36 @@ def train_world_model_universal_v3(
     for epoch in range(num_epochs):
         eol_mult = _eol_mult_for_epoch(epoch)
         eol_weight_eff = float(world_model_config.eol_loss_weight) * float(getattr(world_model_config, "eol_w_max", 1.0)) * float(eol_mult)
+        eol_active = bool(eol_mult > 0.0)
+        if eol_active and eol_on_epoch is None:
+            eol_on_epoch = int(epoch)
+
+        # Optional: freeze encoder briefly when EOL starts to protect representation
+        if freeze_encoder_n > 0 and eol_on_epoch is not None and (epoch - eol_on_epoch) < freeze_encoder_n:
+            _set_requires_grad(model.encoder, False)
+            encoder_frozen = True
+        else:
+            _set_requires_grad(model.encoder, True)
+            encoder_frozen = False
+
         # Training
         model.train()
+        # If we freeze the encoder during early EOL ramp-in, also put it in eval mode
+        # (reduces dropout noise while still training decoder + heads).
+        try:
+            if encoder_frozen:
+                model.encoder.eval()
+            else:
+                model.encoder.train()
+        except Exception:
+            pass
         running_train_loss = 0.0
         n_train_samples = 0
+        printed_epoch_stats = False
+        running_grad_norm = 0.0
+        n_grad_norm = 0
         
-        for X_batch, Y_batch, cond_batch in train_loader:
+        for batch_idx, (X_batch, Y_batch, cond_batch) in enumerate(train_loader):
             X_batch = X_batch.to(device)
             Y_batch = Y_batch.to(device)
             cond_batch = cond_batch.to(device)
@@ -524,9 +602,12 @@ def train_world_model_universal_v3(
             # Losses per head
             # ------------------------------------------------------------------
             # 1) EOL head: RUL at current step (optionally tail-weighted)
-            if (world_model_config.eol_tail_rul_threshold is not None and
-                world_model_config.eol_tail_weight is not None and
-                world_model_config.eol_tail_weight != 1.0):
+            # Sample weights (tail emphasis) based on raw cycles
+            if (
+                world_model_config.eol_tail_rul_threshold is not None
+                and world_model_config.eol_tail_weight is not None
+                and world_model_config.eol_tail_weight != 1.0
+            ):
                 thr = float(world_model_config.eol_tail_rul_threshold)
                 tail_w = float(world_model_config.eol_tail_weight)
                 weights_eol = torch.where(
@@ -534,9 +615,52 @@ def train_world_model_universal_v3(
                     torch.full_like(target_eol, tail_w),
                     torch.ones_like(target_eol),
                 )
-                loss_eol = ((eol_pred - target_eol) ** 2 * weights_eol).mean()
             else:
-                loss_eol = mse_loss(eol_pred, target_eol)
+                weights_eol = torch.ones_like(target_eol)
+
+            if normalize_eol:
+                # Normalize only inside loss
+                scale = float(max(1e-6, eol_scale_value))
+                eol_pred_n = eol_pred / scale
+                eol_true_n = target_eol / scale
+                per = _eol_loss_per_sample(eol_pred_n, eol_true_n)
+                loss_eol = (per * weights_eol).mean()
+            else:
+                # Old behavior (raw scale, pure MSE)
+                loss_eol = ((eol_pred - target_eol) ** 2 * weights_eol).mean()
+
+            # Logging once per epoch (first batch)
+            if not printed_epoch_stats and batch_idx == 0:
+                with torch.no_grad():
+                    te = target_eol.detach()
+                    pe = eol_pred.detach()
+                    msg = (
+                        f"[EOL stats][epoch {epoch+1}] active={eol_active} mult={eol_mult:.3f} "
+                        f"w_eff={eol_weight_eff:.3f} normalize={normalize_eol} scale={eol_scale_value:.2f} "
+                        f"loss_type={eol_loss_type} huber_beta={eol_huber_beta} "
+                        f"encoder_frozen={encoder_frozen}"
+                    )
+                    print(msg)
+                    print(
+                        f"  eol_true: mean={te.mean().item():.2f} std={te.std().item():.2f} "
+                        f"min={te.min().item():.2f} max={te.max().item():.2f}"
+                    )
+                    print(
+                        f"  eol_pred: mean={pe.mean().item():.2f} std={pe.std().item():.2f} "
+                        f"min={pe.min().item():.2f} max={pe.max().item():.2f}"
+                    )
+                    if normalize_eol:
+                        te_n = te / float(max(1e-6, eol_scale_value))
+                        pe_n = pe / float(max(1e-6, eol_scale_value))
+                        print(
+                            f"  eol_true_n: mean={te_n.mean().item():.3f} std={te_n.std().item():.3f} "
+                            f"min={te_n.min().item():.3f} max={te_n.max().item():.3f}"
+                        )
+                        print(
+                            f"  eol_pred_n: mean={pe_n.mean().item():.3f} std={pe_n.std().item():.3f} "
+                            f"min={pe_n.min().item():.3f} max={pe_n.max().item():.3f}"
+                        )
+                printed_epoch_stats = True
 
             # 2) HI head (scalar): MSE to current-step HI target
             loss_hi_last = mse_loss(hi_pred, target_hi_last)
@@ -586,14 +710,47 @@ def train_world_model_universal_v3(
             weighted_eol_hi = eol_hi_loss
 
             loss = weighted_traj + weighted_eol + weighted_hi + weighted_shape + weighted_eol_hi
+
+            # NaN/Inf guard
+            if not torch.isfinite(loss):
+                print(f"\n❌ Non-finite loss detected at epoch {epoch+1}, batch {batch_idx}. Aborting training.")
+                print(f"  loss={loss.item() if torch.is_tensor(loss) else loss}")
+                try:
+                    torch.save(
+                        {
+                            "model_state_dict": model.state_dict(),
+                            "epoch": epoch,
+                            "batch_idx": batch_idx,
+                            "loss": float(loss.detach().cpu().item()) if torch.is_tensor(loss) else None,
+                        },
+                        abort_path,
+                    )
+                    print(f"  Saved abort checkpoint to {abort_path}")
+                except Exception as e:
+                    print(f"  ⚠️  Could not save abort checkpoint: {e}")
+                return {"error": "non_finite_loss", "abort_checkpoint": str(abort_path)}
             
             loss.backward()
+
+            # Gradient clipping (optional)
+            if clip_grad_norm_cfg is not None:
+                try:
+                    gn = torch.nn.utils.clip_grad_norm_(model.parameters(), float(clip_grad_norm_cfg))
+                    # gn is total norm BEFORE clipping
+                    if torch.is_tensor(gn):
+                        running_grad_norm += float(gn.detach().cpu().item())
+                        n_grad_norm += 1
+                except Exception as e:
+                    print(f"  ⚠️  Warning: clip_grad_norm failed: {e}")
+
             optimizer.step()
             
             running_train_loss += loss.item() * X_batch.size(0)
             n_train_samples += X_batch.size(0)
         
         epoch_train_loss = running_train_loss / n_train_samples
+        epoch_grad_norm = (running_grad_norm / n_grad_norm) if n_grad_norm > 0 else float("nan")
+        history["train_grad_norm"].append(epoch_grad_norm)
         
         # Validation
         model.eval()
@@ -655,9 +812,12 @@ def train_world_model_universal_v3(
                 )  # (B,)
                 
                 # Losses
-                if (world_model_config.eol_tail_rul_threshold is not None and
-                    world_model_config.eol_tail_weight is not None and
-                    world_model_config.eol_tail_weight != 1.0):
+                # EOL loss (same logic as training)
+                if (
+                    world_model_config.eol_tail_rul_threshold is not None
+                    and world_model_config.eol_tail_weight is not None
+                    and world_model_config.eol_tail_weight != 1.0
+                ):
                     thr = float(world_model_config.eol_tail_rul_threshold)
                     tail_w = float(world_model_config.eol_tail_weight)
                     weights_eol = torch.where(
@@ -665,9 +825,17 @@ def train_world_model_universal_v3(
                         torch.full_like(target_eol, tail_w),
                         torch.ones_like(target_eol),
                     )
-                    loss_eol = ((eol_pred - target_eol) ** 2 * weights_eol).mean()
                 else:
-                    loss_eol = mse_loss(eol_pred, target_eol)
+                    weights_eol = torch.ones_like(target_eol)
+
+                if normalize_eol:
+                    scale = float(max(1e-6, eol_scale_value))
+                    eol_pred_n = eol_pred / scale
+                    eol_true_n = target_eol / scale
+                    per = _eol_loss_per_sample(eol_pred_n, eol_true_n)
+                    loss_eol = (per * weights_eol).mean()
+                else:
+                    loss_eol = ((eol_pred - target_eol) ** 2 * weights_eol).mean()
                 loss_hi_last = mse_loss(hi_pred, target_hi_last)
 
                 hi_seq_pred = traj_pred.squeeze(-1)  # (B, H)
@@ -917,6 +1085,13 @@ def train_world_model_universal_v3(
             "phase_b_frac": getattr(world_model_config, "phase_b_frac", None),
             "schedule_type": str(getattr(world_model_config, "schedule_type", getattr(world_model_config, "eol_ramp", "linear"))),
             "eol_w_max": float(getattr(world_model_config, "eol_w_max", 1.0)),
+            # EOL ramp stabilization (FD004 default-on via experiment config)
+            "normalize_eol": bool(getattr(world_model_config, "normalize_eol", False)),
+            "eol_scale": getattr(world_model_config, "eol_scale", "rul_cap"),
+            "eol_loss_type": str(getattr(world_model_config, "eol_loss_type", "mse")),
+            "eol_huber_beta": float(getattr(world_model_config, "eol_huber_beta", 0.1)),
+            "clip_grad_norm": getattr(world_model_config, "clip_grad_norm", None),
+            "freeze_encoder_epochs_after_eol_on": int(getattr(world_model_config, "freeze_encoder_epochs_after_eol_on", 0) or 0),
             "hi_early_slope_weight": float(getattr(world_model_config, "hi_early_slope_weight", 0.0)),
             "hi_early_slope_epsilon": float(getattr(world_model_config, "hi_early_slope_epsilon", 1e-3)),
             "hi_early_slope_rul_threshold": getattr(world_model_config, "hi_early_slope_rul_threshold", None),

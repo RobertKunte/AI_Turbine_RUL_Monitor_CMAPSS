@@ -154,6 +154,15 @@ class WorldModelTrainingConfig:
     schedule_type: Literal["linear", "cosine"] = "linear"
     eol_w_max: float = 1.0
 
+    # Stabilization knobs for EOL ramp-in (default OFF for backward compatibility)
+    normalize_eol: bool = False
+    # eol_scale can be: "rul_cap" | "max_cycle" | numeric (float)
+    eol_scale: object = "rul_cap"
+    eol_loss_type: Literal["huber", "mse", "mae"] = "mse"
+    eol_huber_beta: float = 0.1
+    clip_grad_norm: Optional[float] = None
+    freeze_encoder_epochs_after_eol_on: int = 0
+
     # Stage-1: additional HI shape losses (default off; enable via experiment config)
     hi_early_slope_weight: float = 0.0
     hi_early_slope_epsilon: float = 1e-3
