@@ -862,6 +862,13 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             world_model_config.rul_saturation_margin = world_model_params.get("rul_saturation_margin", 0.05)
             world_model_config.rul_linear_decay = bool(world_model_params.get("rul_linear_decay", False))
             world_model_config.rul_cap_threshold = float(world_model_params.get("rul_cap_threshold", 0.999999))
+            # WM-V1 RUL training hardening (optional)
+            world_model_config.rul_train_max_cycles = world_model_params.get("rul_train_max_cycles", None)
+            world_model_config.rul_r0_only = bool(world_model_params.get("rul_r0_only", False))
+            world_model_config.rul_r0_points = world_model_params.get("rul_r0_points", None)
+            world_model_config.rul_sample_weight_power = float(world_model_params.get("rul_sample_weight_power", 0.0))
+            world_model_config.rul_sample_weight_min = float(world_model_params.get("rul_sample_weight_min", 0.2))
+            world_model_config.rul_sample_weight_max = float(world_model_params.get("rul_sample_weight_max", 3.0))
 
             # If this is one of the Transformer World Model V1 experiments, route to
             # the dedicated training function; otherwise use the existing

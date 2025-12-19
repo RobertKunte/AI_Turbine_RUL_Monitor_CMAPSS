@@ -241,6 +241,19 @@ class WorldModelTrainingConfig:
     # If true_rul >= rul_cap_threshold, we treat it as "capped/plateau" and exclude from traj loss.
     rul_cap_threshold: float = 0.999999
 
+    # --- WM-V1 RUL training hardening (defaults OFF) ---
+    # If set: ignore (mask out) targets with true_rul_cycles >= this.
+    rul_train_max_cycles: Optional[float] = None
+    # If True: supervise only RUL at t=0 (horizon start) or selected points.
+    rul_r0_only: bool = False
+    # Optional extra indices (e.g. [0, 15, 29]); if None and r0_only -> [0]
+    rul_r0_points: Optional[list[int]] = None
+    # 0 => off; >0 enables per-sample weighting (late-life emphasis)
+    rul_sample_weight_power: float = 0.0
+    # clamp weights
+    rul_sample_weight_min: float = 0.2
+    rul_sample_weight_max: float = 3.0
+
     # Stage-1: additional HI shape losses (default off; enable via experiment config)
     hi_early_slope_weight: float = 0.0
     hi_early_slope_epsilon: float = 1e-3

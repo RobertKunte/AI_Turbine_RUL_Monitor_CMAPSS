@@ -1102,6 +1102,13 @@ def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_co
     wmp["rul_cap_threshold"] = 0.999999
     # Optional physics-consistent linear-decay construction from pred_rul0
     wmp["rul_linear_decay"] = True
+    # Optional WM-V1 hardening knobs (do not affect other experiments)
+    wmp["rul_train_max_cycles"] = 95.0
+    wmp["rul_r0_only"] = True
+    wmp["rul_r0_points"] = [0, 15, 29]
+    wmp["rul_sample_weight_power"] = 1.0
+    wmp["rul_sample_weight_min"] = 0.2
+    wmp["rul_sample_weight_max"] = 3.0
     return cfg
 
 def get_fd003_transformer_encoder_ms_dt_v1_config() -> ExperimentConfig:
