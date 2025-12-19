@@ -2091,6 +2091,10 @@ def train_transformer_world_model_v1(
         world_model.train()
         running_train = 0.0
         n_train_samples = 0
+        # Track saturation-penalty activity (train) once per epoch
+        sat_loss_sum = 0.0
+        sat_mask_frac_sum = 0.0
+        sat_batches = 0
 
         for batch_idx, (X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b) in enumerate(train_loader):
             X_b = X_b.to(device)
@@ -2177,6 +2181,16 @@ def train_transformer_world_model_v1(
                     pred_sensors, pred_hi, pred_rul = out
                     pred_eol = None
 
+            # Optional: deterministic linear-decay RUL sequence from pred_rul0 (physics-consistent)
+            if bool(getattr(world_model_config, "rul_linear_decay", False)) and (pred_rul is not None):
+                # pred_rul is normalized in [0,1]; step size is 1/max_rul per horizon step
+                max_rul_denom = float(getattr(world_model_config, "max_rul", 125.0))
+                H = int(pred_rul.size(1))
+                pred_rul0 = pred_rul[:, 0, 0].clamp(0.0, 1.0)  # (B,)
+                k = torch.arange(H, device=pred_rul.device, dtype=pred_rul.dtype).view(1, H)
+                pred_seq = (pred_rul0.unsqueeze(1) - k / max(max_rul_denom, 1e-6)).clamp(0.0, 1.0)
+                pred_rul = pred_seq.unsqueeze(-1)  # (B,H,1)
+
             # Sensor trajectory loss
             loss_sensors = F.mse_loss(pred_sensors, Y_sens_b)
             loss = sensor_w * loss_sensors
@@ -2196,6 +2210,15 @@ def train_transformer_world_model_v1(
                 y_rul_h = Y_rul_b
                 if y_rul_h.dim() == 3 and y_rul_h.size(-1) == 1:
                     y_rul_h = y_rul_h.squeeze(-1)
+
+                # [dbg] Print true RUL sequence stats once (same tensor used for loss)
+                if epoch == 0 and batch_idx == 0:
+                    from src.tools.debug_stats import tensor_stats, batch_time_std, compare_two_samples
+
+                    y_rul_seq_norm = y_rul_h.unsqueeze(-1)  # (B,H,1)
+                    tensor_stats("true_rul_seq_norm", y_rul_seq_norm)
+                    batch_time_std("true_rul_seq_norm", y_rul_seq_norm)
+                    compare_two_samples("true_rul_seq_norm", y_rul_seq_norm, t_steps=10)
 
                 rul_traj_weight = getattr(world_model_config, "rul_traj_weight", None)
                 rul_traj_late_ramp = bool(getattr(world_model_config, "rul_traj_late_ramp", False))
@@ -2240,6 +2263,9 @@ def train_transformer_world_model_v1(
                         mask = (y_rul_h < (1.0 - margin)).float()
                         loss_sat = torch.mean(mask * torch.relu(pred_rul_h - (1.0 - margin)) ** 2)
                         loss = loss + rul_saturation_weight * loss_sat
+                        sat_loss_sum += float(loss_sat.detach().cpu())
+                        sat_mask_frac_sum += float(mask.detach().mean().cpu())
+                        sat_batches += 1
                     else:
                         loss_sat = torch.tensor(0.0, device=pred_rul_h.device)
 
@@ -2281,6 +2307,13 @@ def train_transformer_world_model_v1(
             n_train_samples += X_b.size(0)
 
         train_loss = running_train / max(1, n_train_samples)
+        if sat_batches > 0:
+            print(
+                f"[WorldModelV1][epoch {epoch+1}] sat_loss_mean={sat_loss_sum / sat_batches:.6f} "
+                f"sat_mask_frac_mean={sat_mask_frac_sum / sat_batches:.6f}"
+            )
+        else:
+            print(f"[WorldModelV1][epoch {epoch+1}] sat_loss_mean=0.000000 sat_mask_frac_mean=0.000000")
 
         # Validation
         world_model.eval()
@@ -2330,6 +2363,15 @@ def train_transformer_world_model_v1(
                     else:
                         pred_sensors, pred_hi, pred_rul = out
                         pred_eol = None
+
+                # Optional: deterministic linear-decay RUL sequence from pred_rul0 (physics-consistent)
+                if bool(getattr(world_model_config, "rul_linear_decay", False)) and (pred_rul is not None):
+                    max_rul_denom = float(getattr(world_model_config, "max_rul", 125.0))
+                    H = int(pred_rul.size(1))
+                    pred_rul0 = pred_rul[:, 0, 0].clamp(0.0, 1.0)  # (B,)
+                    k = torch.arange(H, device=pred_rul.device, dtype=pred_rul.dtype).view(1, H)
+                    pred_seq = (pred_rul0.unsqueeze(1) - k / max(max_rul_denom, 1e-6)).clamp(0.0, 1.0)
+                    pred_rul = pred_seq.unsqueeze(-1)  # (B,H,1)
 
                 loss_sensors = F.mse_loss(pred_sensors, Y_sens_b)
                 loss = sensor_w * loss_sensors
@@ -2549,6 +2591,7 @@ def evaluate_transformer_world_model_v1_on_test(
 
     X_list: List[np.ndarray] = []
     hi_seq_list: List[np.ndarray] = []
+    rul_seq_norm_list: List[np.ndarray] = []
     true_rul_last_list: List[float] = []
     cond_id_list: List[int] = []
     future_cond_list: List[np.ndarray] = []
@@ -2575,6 +2618,7 @@ def evaluate_transformer_world_model_v1_on_test(
             # RUL future in cycles for metrics (clipped)
             rul_future = future["RUL"].clip(lower=0.0, upper=max_rul).to_numpy(dtype=np.float32)
             true_rul_last_list.append(float(rul_future[-1]))
+            rul_seq_norm_list.append((rul_future / max(max_rul, 1e-6)).astype(np.float32))
 
             # HI future (normalized) as in training: HI = clip(RUL / max_rul, 0, 1)
             hi_future = np.clip(rul_future / max_rul, 0.0, 1.0)
@@ -2593,6 +2637,7 @@ def evaluate_transformer_world_model_v1_on_test(
 
     X_np = np.stack(X_list, axis=0)  # (N, past_len, F)
     Y_hi_np = np.stack(hi_seq_list, axis=0)  # (N, horizon)
+    Y_rul_np = np.stack(rul_seq_norm_list, axis=0)  # (N, horizon)
     cond_ids_np = np.array(cond_id_list, dtype=np.int64)  # (N,)
     future_cond_np = np.stack(future_cond_list, axis=0).astype(np.float32)  # (N, horizon, cond_dim_actual)
 
@@ -2630,11 +2675,12 @@ def evaluate_transformer_world_model_v1_on_test(
 
     X = torch.from_numpy(X_np).float().to(device)
     Y_hi = torch.from_numpy(Y_hi_np).float().to(device)
+    Y_rul = torch.from_numpy(Y_rul_np).float().to(device)
     cond_ids = torch.from_numpy(cond_ids_np).long().to(device)
     future_cond = torch.from_numpy(future_cond_np).float().to(device)
 
     batch_size = int(getattr(world_model_config, "batch_size", 256))
-    ds = TensorDataset(X, Y_hi, cond_ids, future_cond)
+    ds = TensorDataset(X, Y_hi, Y_rul, cond_ids, future_cond)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
     all_true_rul_last: List[float] = []
@@ -2644,7 +2690,7 @@ def evaluate_transformer_world_model_v1_on_test(
     cond_dim = getattr(world_model_config, "cond_dim", 9)
 
     with torch.no_grad():
-        for X_b, Y_hi_b, cond_b, future_cond_b in loader:
+        for X_b, Y_hi_b, Y_rul_b, cond_b, future_cond_b in loader:
             B, _, _ = X_b.shape
             cond_vec = torch.zeros(B, cond_dim, device=device)
 
@@ -2690,6 +2736,15 @@ def evaluate_transformer_world_model_v1_on_test(
             if pred_rul is None:
                 continue
 
+            # Optional: deterministic linear-decay RUL sequence from pred_rul0 (physics-consistent)
+            if bool(getattr(world_model_config, "rul_linear_decay", False)) and isinstance(pred_rul, torch.Tensor):
+                max_rul_denom = float(getattr(world_model_config, "max_rul", 125.0))
+                H = int(pred_rul.size(1))
+                pred_rul0 = pred_rul[:, 0, 0].clamp(0.0, 1.0)  # (B,)
+                k = torch.arange(H, device=pred_rul.device, dtype=pred_rul.dtype).view(1, H)
+                pred_seq = (pred_rul0.unsqueeze(1) - k / max(max_rul_denom, 1e-6)).clamp(0.0, 1.0)
+                pred_rul = pred_seq.unsqueeze(-1)  # (B,H,1)
+
             # Model predicts normalized RUL; take last horizon step and denormalize
             pred_rul_last_norm = pred_rul[:, -1, 0]  # (B,)
             pred_rul_last = (pred_rul_last_norm * max_rul).cpu().numpy()
@@ -2701,6 +2756,12 @@ def evaluate_transformer_world_model_v1_on_test(
                 tensor_stats("TEST_X_b", X_b)
                 tensor_stats("TEST_future_cond_b", future_cond_b)
                 tensor_stats("TEST_future_cond_b_scaled", future_cond_b)
+
+                # [dbg] True RUL horizon sequence stats (normalized) – same horizon length H
+                y_rul_seq_norm = Y_rul_b.unsqueeze(-1)  # (B,H,1)
+                tensor_stats("true_rul_seq_norm", y_rul_seq_norm)
+                batch_time_std("true_rul_seq_norm", y_rul_seq_norm)
+                compare_two_samples("true_rul_seq_norm", y_rul_seq_norm, t_steps=10)
 
                 tensor_stats("pred_rul_seq_norm", pred_rul)
                 batch_time_std("pred_rul_seq_norm", pred_rul)

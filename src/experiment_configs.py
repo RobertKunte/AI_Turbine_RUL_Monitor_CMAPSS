@@ -1098,6 +1098,8 @@ def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_co
     wmp["rul_mono_future_weight"] = 1.0
     wmp["rul_saturation_weight"] = 1.0
     wmp["rul_saturation_margin"] = 0.05
+    # Optional physics-consistent linear-decay construction from pred_rul0
+    wmp["rul_linear_decay"] = True
     return cfg
 
 def get_fd003_transformer_encoder_ms_dt_v1_config() -> ExperimentConfig:

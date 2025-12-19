@@ -860,6 +860,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             world_model_config.rul_mono_future_weight = world_model_params.get("rul_mono_future_weight", 0.0)
             world_model_config.rul_saturation_weight = world_model_params.get("rul_saturation_weight", 0.0)
             world_model_config.rul_saturation_margin = world_model_params.get("rul_saturation_margin", 0.05)
+            world_model_config.rul_linear_decay = bool(world_model_params.get("rul_linear_decay", False))
 
             # If this is one of the Transformer World Model V1 experiments, route to
             # the dedicated training function; otherwise use the existing

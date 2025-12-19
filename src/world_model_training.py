@@ -233,6 +233,10 @@ class WorldModelTrainingConfig:
     rul_saturation_weight: float = 0.0
     rul_saturation_margin: float = 0.05
 
+    # If True, construct a physics-consistent linear-decay RUL sequence from pred_rul0.
+    # Default OFF for backwards compatibility.
+    rul_linear_decay: bool = False
+
     # Stage-1: additional HI shape losses (default off; enable via experiment config)
     hi_early_slope_weight: float = 0.0
     hi_early_slope_epsilon: float = 1e-3
