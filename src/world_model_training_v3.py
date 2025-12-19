@@ -1665,7 +1665,7 @@ def train_transformer_world_model_v1(
     # --------------------------------------------------------------
     try:
         import os
-        from src.tools.x_scaler import fit_x_scaler, transform_x, save_scaler
+        from src.tools.x_scaler import fit_x_scaler, transform_x, save_scaler, clip_x
         from src.tools.debug_stats import tensor_stats
 
         # Fit only on TRAIN split
@@ -1678,21 +1678,46 @@ def train_transformer_world_model_v1(
         # dbg before/after (small subset)
         tensor_stats("TRAIN_X_before_scaler", X_tr_np_raw[:256])
         X_tr_np = transform_x(x_scaler, X_tr_np_raw)
+        X_tr_np, frac = clip_x(X_tr_np, clip=10.0)
+        print(f"[WorldModelV1] TRAIN X clip frac={frac:.6f}")
         tensor_stats("TRAIN_X_after_scaler", X_tr_np[:256])
 
         X_val_np_raw = X_train_np[val_indices]
         X_val_np = transform_x(x_scaler, X_val_np_raw)
+        X_val_np, frac = clip_x(X_val_np, clip=10.0)
+        print(f"[WorldModelV1] VAL   X clip frac={frac:.6f}")
+
+        # Scale future_cond_np consistently using Cond_* stats from the fitted X scaler.
+        # (future_cond_np itself is NOT part of X; but its features correspond to Cond_* columns in X)
+        cond_idx = np.array([i for i, c in enumerate(feature_cols) if c.startswith("Cond_")], dtype=np.int64)
+        future_cond_tr_np = future_cond_np[train_indices]
+        future_cond_val_np = future_cond_np[val_indices]
+        if cond_idx.size > 0:
+            cond_mean = x_scaler.mean_[cond_idx]
+            cond_scale = x_scaler.scale_[cond_idx]
+            future_cond_tr_np = (future_cond_tr_np - cond_mean[None, None, :]) / cond_scale[None, None, :]
+            future_cond_val_np = (future_cond_val_np - cond_mean[None, None, :]) / cond_scale[None, None, :]
+            future_cond_tr_np = np.clip(future_cond_tr_np, -10.0, 10.0).astype(np.float32, copy=False)
+            future_cond_val_np = np.clip(future_cond_val_np, -10.0, 10.0).astype(np.float32, copy=False)
+        else:
+            # No Cond_* features in X; keep future conds as-is.
+            future_cond_tr_np = future_cond_tr_np.astype(np.float32, copy=False)
+            future_cond_val_np = future_cond_val_np.astype(np.float32, copy=False)
 
     except Exception as e:
         print(f"[WorldModelV1] Warning: failed to fit/apply X scaler; proceeding unscaled: {e}")
         X_tr_np = X_train_np[train_indices]
         X_val_np = X_train_np[val_indices]
+        future_cond_tr_np = future_cond_np[train_indices].astype(np.float32, copy=False)
+        future_cond_val_np = future_cond_np[val_indices].astype(np.float32, copy=False)
 
     # Targets + aux stay unscaled; only X is scaled.
     Y_sens_train = torch.from_numpy(Y_sens_np).float()
     Y_rul_train = torch.from_numpy(Y_rul_np).float()
     Y_hi_train = torch.from_numpy(Y_hi_np).float()
-    future_cond_train = torch.from_numpy(future_cond_np).float()
+    # Use the scaled future condition sequences (if X scaler succeeded), otherwise raw.
+    future_cond_tr = torch.from_numpy(future_cond_tr_np).float()
+    future_cond_val = torch.from_numpy(future_cond_val_np).float()
     cond_ids = torch.tensor(cond_id_list, dtype=torch.long)
 
     X_tr = torch.from_numpy(X_tr_np).float()
@@ -1701,13 +1726,11 @@ def train_transformer_world_model_v1(
     Y_sens_tr = Y_sens_train[train_indices]
     Y_rul_tr = Y_rul_train[train_indices]
     Y_hi_tr = Y_hi_train[train_indices]
-    future_cond_tr = future_cond_train[train_indices]
     cond_tr = cond_ids[train_indices]
 
     Y_sens_val = Y_sens_train[val_indices]
     Y_rul_val = Y_rul_train[val_indices]
     Y_hi_val = Y_hi_train[val_indices]
-    future_cond_val = future_cond_train[val_indices]
     cond_val = cond_ids[val_indices]
 
     train_ds = torch.utils.data.TensorDataset(
@@ -2472,7 +2495,7 @@ def evaluate_transformer_world_model_v1_on_test(
     # --------------------------------------------------------------
     try:
         import os
-        from src.tools.x_scaler import load_scaler, transform_x
+        from src.tools.x_scaler import load_scaler, transform_x, clip_x
         from src.tools.debug_stats import tensor_stats
 
         if results_dir is None:
@@ -2483,7 +2506,19 @@ def evaluate_transformer_world_model_v1_on_test(
 
         tensor_stats("TEST_X_before_scaler", X_np[:256])
         X_np = transform_x(x_scaler, X_np)
+        X_np, frac = clip_x(X_np, clip=10.0)
+        print(f"[WorldModelV1] TEST  X clip frac={frac:.6f}")
         tensor_stats("TEST_X_after_scaler", X_np[:256])
+
+        # Scale future_cond_np consistently using Cond_* stats from the fitted X scaler.
+        cond_idx = np.array([i for i, c in enumerate(feature_cols) if c.startswith("Cond_")], dtype=np.int64)
+        if cond_idx.size > 0:
+            cond_mean = x_scaler.mean_[cond_idx]
+            cond_scale = x_scaler.scale_[cond_idx]
+            tensor_stats("TEST_future_cond_before_scale", future_cond_np[:256])
+            future_cond_np = (future_cond_np - cond_mean[None, None, :]) / cond_scale[None, None, :]
+            future_cond_np = np.clip(future_cond_np, -10.0, 10.0).astype(np.float32, copy=False)
+            tensor_stats("TEST_future_cond_after_scale", future_cond_np[:256])
     except Exception as e:
         print(f"[WorldModelV1] Warning: could not load/apply X scaler for test eval: {e}")
 
@@ -2559,6 +2594,7 @@ def evaluate_transformer_world_model_v1_on_test(
 
                 tensor_stats("TEST_X_b", X_b)
                 tensor_stats("TEST_future_cond_b", future_cond_b)
+                tensor_stats("TEST_future_cond_b_scaled", future_cond_b)
 
                 tensor_stats("pred_rul_seq_norm", pred_rul)
                 batch_time_std("pred_rul_seq_norm", pred_rul)

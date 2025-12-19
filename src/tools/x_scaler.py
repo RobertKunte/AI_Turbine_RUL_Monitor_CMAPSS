@@ -5,6 +5,25 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 
 
+def make_scaler_safe(scaler: StandardScaler, eps: float = 1e-6) -> StandardScaler:
+    # sklearn StandardScaler stores per-feature std in scaler.scale_
+    if hasattr(scaler, "scale_") and scaler.scale_ is not None:
+        bad = scaler.scale_ < float(eps)
+        if np.any(bad):
+            print(
+                f"[WorldModelV1] X-scaler: flooring {int(bad.sum())} / {int(bad.size)} "
+                f"tiny scales (<{eps})."
+            )
+            scaler.scale_[bad] = 1.0
+    return scaler
+
+
+def clip_x(X_np: np.ndarray, clip: float = 10.0) -> tuple[np.ndarray, float]:
+    Xc = np.clip(X_np, -float(clip), float(clip))
+    frac = float((Xc != X_np).mean()) if X_np.size > 0 else 0.0
+    return Xc.astype(np.float32, copy=False), frac
+
+
 def fit_x_scaler(X_train_np: np.ndarray, max_rows: int = 2_000_000, random_state: int = 42) -> StandardScaler:
     """
     Fit a StandardScaler on flattened (N,T,D) input windows.
@@ -27,6 +46,7 @@ def fit_x_scaler(X_train_np: np.ndarray, max_rows: int = 2_000_000, random_state
 
     scaler = StandardScaler(with_mean=True, with_std=True)
     scaler.fit(X_fit)
+    scaler = make_scaler_safe(scaler, eps=1e-6)
     return scaler
 
 
