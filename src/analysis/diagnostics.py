@@ -407,8 +407,14 @@ def generate_all_diagnostics(
     if test_metrics:
         print(f"\n  [Diagnostics] Sanity check vs test_metrics:")
         
+        def _get_last_style(m: dict, base: str):
+            # Prefer standardized LAST keys; fall back to legacy keys.
+            if f"{base}_last" in m:
+                return m.get(f"{base}_last")
+            return m.get(base)
+        
         # Compare bias
-        test_bias = test_metrics.get("bias")
+        test_bias = _get_last_style(test_metrics, "bias")
         diagnostics_bias = diagnostics_summary['bias']
         if test_bias is not None:
             bias_diff = abs(diagnostics_bias - test_bias)
@@ -417,7 +423,7 @@ def generate_all_diagnostics(
                 print(f"    ⚠️  WARNING: Bias difference > 0.5 cycles - please verify consistency")
         
         # Compare RMSE
-        test_rmse = test_metrics.get("rmse")
+        test_rmse = _get_last_style(test_metrics, "rmse")
         diagnostics_rmse = diagnostics_summary['rmse']
         if test_rmse is not None:
             rmse_diff = abs(diagnostics_rmse - test_rmse)
@@ -426,7 +432,8 @@ def generate_all_diagnostics(
                 print(f"    ⚠️  WARNING: RMSE difference > 0.5 cycles - please verify consistency")
         
         # Compare NASA mean
-        test_nasa_mean = test_metrics.get("nasa_mean")
+        # Prefer nasa_last_mean if present
+        test_nasa_mean = test_metrics.get("nasa_last_mean", test_metrics.get("nasa_mean"))
         diagnostics_nasa_mean = diagnostics_summary['nasa_mean']
         if test_nasa_mean is not None:
             nasa_diff = abs(diagnostics_nasa_mean - test_nasa_mean)

@@ -58,6 +58,7 @@ from src.loss import (
 )
 from src.training_utils import compute_global_trend_loss
 from src.eval.eol_eval import evaluate_eol_metrics
+from src.metrics import compute_last_per_unit_metrics, compute_all_samples_metrics
 from src.models.transformer_eol import EOLFullTransformerEncoder
 from src.models.transformer_world_model_v1 import TransformerWorldModelV1
 
@@ -1146,9 +1147,101 @@ def train_world_model_universal_v3(
         f"\n[7] Best model loaded from epoch {checkpoint['epoch']+1} "
         f"(best_metric={checkpoint.get('best_metric','val_total')}, val={checkpoint['val_loss']:.4f})"
     )
+
+    # ===================================================================
+    # 7a. Evaluate on train/val splits (LAST + ALL; truncated-aware)
+    # ===================================================================
+    def _evaluate_last_all_on_df(
+        df_split: pd.DataFrame,
+        *,
+        split_name: str,
+    ) -> Dict[str, Any]:
+        y_col = "RUL_raw" if ("RUL_raw" in df_split.columns) else "RUL"
+        if y_col not in df_split.columns:
+            raise KeyError(f"Expected '{y_col}' in df_split for split={split_name}")
+
+        wc = WindowConfig(past_len=int(past_len), horizon=1, stride=1, require_full_horizon=False, pad_mode="clamp")
+        tc = TargetConfig(max_rul=int(max_rul if max_rul is not None else 125), cap_targets=True, eol_target_mode="current_from_df")
+
+        built_split = build_sliding_windows(
+            df_split,
+            feature_cols,
+            target_col=y_col,
+            unit_col="UnitNumber",
+            time_col="TimeInCycles",
+            cond_col="ConditionID",
+            window_cfg=wc,
+            target_cfg=tc,
+            return_mask=False,
+        )
+
+        X = built_split["X"]
+        y_true = built_split["Y_eol"].astype(float)
+        unit_ids = built_split["unit_ids"].astype(np.int64)
+        cond_ids = built_split["cond_ids"].astype(np.int64)
+
+        # Condition-wise scaling
+        X_scaled = np.empty_like(X, dtype=np.float32)
+        for cond in np.unique(cond_ids):
+            cond = int(cond)
+            idxs = np.where(cond_ids == cond)[0]
+            scaler = scaler_dict.get(cond, scaler_dict.get(0))
+            flat = X[idxs].reshape(-1, len(feature_cols))
+            X_scaled[idxs] = scaler.transform(flat).reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
+
+        X_t = torch.tensor(X_scaled, dtype=torch.float32).to(device)
+        cond_t = torch.tensor(cond_ids, dtype=torch.long).to(device) if num_conditions > 1 else None
+
+        with torch.no_grad():
+            out = model(
+                encoder_inputs=X_t,
+                decoder_targets=None,
+                teacher_forcing_ratio=0.0,
+                horizon=1,
+                cond_ids=cond_t,
+            )
+            if isinstance(out, dict):
+                e = out.get("eol", out.get("rul"))
+            else:
+                e = out[1] if isinstance(out, (tuple, list)) and len(out) >= 2 else out
+            if torch.is_tensor(e):
+                y_pred = e.view(-1).detach().cpu().numpy().astype(float)
+            else:
+                y_pred = np.asarray(e, dtype=float).reshape(-1)
+        y_pred = np.clip(y_pred, 0.0, float(max_rul)).astype(float)
+
+        clip = (0.0, float(max_rul)) if max_rul is not None else None
+        m_all = compute_all_samples_metrics(y_true, y_pred, unit_ids=unit_ids, clip=clip)
+        m_last = compute_last_per_unit_metrics(unit_ids, y_true, y_pred, clip=clip)
+        return {
+            **m_last,
+            **m_all,
+            "dataset_split": split_name,
+            "last_definition": m_last.get("note_last_definition", "LAST_AVAILABLE_PER_UNIT (truncated-aware)"),
+        }
+
+    try:
+        train_units_set = set(train_units.detach().cpu().numpy().astype(int).tolist())
+        val_units_set = set(val_units.detach().cpu().numpy().astype(int).tolist())
+        df_train_split_df = df_train[df_train["UnitNumber"].isin(train_units_set)].copy()
+        df_val_split_df = df_train[df_train["UnitNumber"].isin(val_units_set)].copy()
+
+        print("\n[7a] Evaluating on train/val splits...")
+        metrics_train = _evaluate_last_all_on_df(df_train_split_df, split_name="train")
+        metrics_val = _evaluate_last_all_on_df(df_val_split_df, split_name="val")
+
+        with open(results_dir / "metrics_train.json", "w") as f:
+            json.dump(metrics_train, f, indent=2)
+        with open(results_dir / "metrics_val.json", "w") as f:
+            json.dump(metrics_val, f, indent=2)
+        print(f"  Saved metrics_train.json and metrics_val.json to {results_dir}")
+    except Exception as e:
+        print(f"[7a] Warning: could not compute/save train/val metrics: {e}")
+        metrics_train = {}
+        metrics_val = {}
     
     # ===================================================================
-    # 7. Evaluate on test set
+    # 8. Evaluate on test set
     # ===================================================================
     print("\n[8] Evaluating on test set...")
     test_metrics = evaluate_world_model_v3_eol(
@@ -1166,11 +1259,25 @@ def train_world_model_universal_v3(
         target_cfg=target_cfg,
     )
     
-    print(f"  Test RMSE: {test_metrics['RMSE']:.2f} cycles")
-    print(f"  Test MAE:  {test_metrics['MAE']:.2f} cycles")
-    print(f"  Test Bias: {test_metrics['Bias']:.2f} cycles")
-    print(f"  Test R²:   {test_metrics.get('R2', 0.0):.4f}")
-    print(f"  NASA Score (mean): {test_metrics['nasa_score_mean']:.2f}")
+    # Standardized reporting: LAST + ALL
+    print("\n--- LAST (literature-style, truncated-aware) ---")
+    print(f"  rmse_last: {test_metrics.get('rmse_last', float('nan')):.2f}")
+    print(f"  mae_last:  {test_metrics.get('mae_last', float('nan')):.2f}")
+    print(f"  bias_last: {test_metrics.get('bias_last', float('nan')):.2f}")
+    print(f"  r2_last:   {test_metrics.get('r2_last', 0.0):.4f}")
+    print(f"  nasa_last_mean: {test_metrics.get('nasa_last_mean', float('nan')):.4f}")
+    print(f"  nasa_last_sum:  {test_metrics.get('nasa_last_sum', float('nan')):.2f}")
+    print(f"  n_units: {test_metrics.get('n_units', 0)}")
+    print(f"  max_rul_used: {test_metrics.get('max_rul_used', max_rul)}")
+
+    print("\n--- ALL (all windows/timepoints) ---")
+    print(f"  rmse_all: {test_metrics.get('rmse_all', float('nan')):.2f}")
+    print(f"  mae_all:  {test_metrics.get('mae_all', float('nan')):.2f}")
+    print(f"  bias_all: {test_metrics.get('bias_all', float('nan')):.2f}")
+    print(f"  r2_all:   {test_metrics.get('r2_all', 0.0):.4f}")
+    print(f"  nasa_all_mean: {test_metrics.get('nasa_all_mean', float('nan')):.4f}")
+    print(f"  nasa_all_sum:  {test_metrics.get('nasa_all_sum', float('nan')):.2f}")
+    print(f"  n_samples_all: {test_metrics.get('n_samples_all', 0)}")
     
     # ===================================================================
     # 8. Compute per-condition metrics
@@ -1181,8 +1288,9 @@ def train_world_model_universal_v3(
     df_test_cond = df_test.groupby("UnitNumber")["ConditionID"].first()
     unit_ids_test = sorted(df_test["UnitNumber"].unique())
     
-    y_pred_eol = np.array(test_metrics.get("y_pred_eol", []))
-    y_true_eol = np.array(test_metrics.get("y_true_eol", y_test_true))
+    # Per-condition metrics are defined on LAST (1 value per engine)
+    y_pred_eol = np.array(test_metrics.get("y_pred_last", test_metrics.get("y_pred_eol", [])))
+    y_true_eol = np.array(test_metrics.get("y_true_last", test_metrics.get("y_true_eol", y_test_true)))
     
     if len(y_pred_eol) > 0 and len(y_pred_eol) == len(unit_ids_test):
         for cond_id in unique_conditions:
@@ -1306,15 +1414,9 @@ def train_world_model_universal_v3(
             "eol_hi_temperature": float(getattr(world_model_config, "eol_hi_temperature", 0.05)),
             "eol_hi_p_min": float(getattr(world_model_config, "eol_hi_p_min", 0.2)),
         },
-        "test_metrics": {
-            "rmse": test_metrics["RMSE"],
-            "mae": test_metrics["MAE"],
-            "bias": test_metrics["Bias"],
-            "r2": test_metrics.get("R2", 0.0),
-            "nasa_mean": test_metrics["nasa_score_mean"],
-            "nasa_sum": test_metrics["nasa_score_sum"],
-            "num_engines": test_metrics["num_engines"],
-        },
+        "train_metrics": metrics_train,
+        "val_metrics": metrics_val,
+        "test_metrics": test_metrics,
         "condition_metrics": condition_metrics,
         "training_history": {
             "best_epoch": checkpoint["epoch"] + 1,
@@ -1328,6 +1430,15 @@ def train_world_model_universal_v3(
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"  Saved summary to {summary_path}")
+
+    # Save split metrics as standalone artifact (standard name)
+    try:
+        metrics_test_path = results_dir / "metrics_test.json"
+        with open(metrics_test_path, "w") as f:
+            json.dump(test_metrics, f, indent=2)
+        print(f"  Saved metrics to {metrics_test_path}")
+    except Exception as e:
+        print(f"  Warning: Could not save metrics_test.json: {e}")
     
     # Save full training history
     training_history_path = results_dir / "training_history.json"
@@ -2696,11 +2807,23 @@ def train_transformer_world_model_v1(
         test_metrics: Dict[str, Any] = {}
 
     if test_metrics:
-        print(f"  RMSE: {test_metrics['rmse']:.2f} cycles")
-        print(f"  MAE:  {test_metrics['mae']:.2f} cycles")
-        print(f"  Bias: {test_metrics['bias']:.2f} cycles")
-        print(f"  R²:   {test_metrics['r2']:.4f}")
-        print(f"  NASA Mean: {test_metrics['nasa_mean']:.2f}")
+        print("\n--- LAST (literature-style, truncated-aware) ---")
+        print(f"  rmse_last: {test_metrics.get('rmse_last', float('nan')):.2f}")
+        print(f"  mae_last:  {test_metrics.get('mae_last', float('nan')):.2f}")
+        print(f"  bias_last: {test_metrics.get('bias_last', float('nan')):.2f}")
+        print(f"  r2_last:   {test_metrics.get('r2_last', 0.0):.4f}")
+        print(f"  nasa_last_mean: {test_metrics.get('nasa_last_mean', float('nan')):.4f}")
+        print(f"  nasa_last_sum:  {test_metrics.get('nasa_last_sum', float('nan')):.2f}")
+        print(f"  n_units: {test_metrics.get('n_units', 0)}")
+
+        print("\n--- ALL (all windows/timepoints) ---")
+        print(f"  rmse_all: {test_metrics.get('rmse_all', float('nan')):.2f}")
+        print(f"  mae_all:  {test_metrics.get('mae_all', float('nan')):.2f}")
+        print(f"  bias_all: {test_metrics.get('bias_all', float('nan')):.2f}")
+        print(f"  r2_all:   {test_metrics.get('r2_all', 0.0):.4f}")
+        print(f"  nasa_all_mean: {test_metrics.get('nasa_all_mean', float('nan')):.4f}")
+        print(f"  nasa_all_sum:  {test_metrics.get('nasa_all_sum', float('nan')):.2f}")
+        print(f"  n_samples_all: {test_metrics.get('n_samples_all', 0)}")
     else:
         print("  (no test metrics computed)")
     print("=" * 80)
@@ -2726,6 +2849,15 @@ def train_transformer_world_model_v1(
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"[WorldModelV1] Saved summary to {summary_path}")
+
+    if test_metrics:
+        try:
+            metrics_test_path = results_dir / "metrics_test.json"
+            with open(metrics_test_path, "w") as f:
+                json.dump(test_metrics, f, indent=2)
+            print(f"[WorldModelV1] Saved metrics to {metrics_test_path}")
+        except Exception as e:
+            print(f"[WorldModelV1] Warning: could not save metrics_test.json: {e}")
 
     return summary
 
@@ -2758,6 +2890,7 @@ def evaluate_transformer_world_model_v1_on_test(
     hi_seq_list: List[np.ndarray] = []
     rul_seq_norm_list: List[np.ndarray] = []
     true_rul_last_list: List[float] = []
+    unit_id_list: List[int] = []
     cond_id_list: List[int] = []
     future_cond_list: List[np.ndarray] = []
 
@@ -2779,6 +2912,7 @@ def evaluate_transformer_world_model_v1_on_test(
             future = df_unit.iloc[start + past_len : start + past_len + horizon]
 
             X_list.append(past[feature_cols].to_numpy(dtype=np.float32, copy=True))
+            unit_id_list.append(int(unit_id))
 
             # RUL future in cycles for metrics (clipped)
             rul_future = future["RUL"].clip(lower=0.0, upper=max_rul).to_numpy(dtype=np.float32)
@@ -2803,6 +2937,7 @@ def evaluate_transformer_world_model_v1_on_test(
     X_np = np.stack(X_list, axis=0)  # (N, past_len, F)
     Y_hi_np = np.stack(hi_seq_list, axis=0)  # (N, horizon)
     Y_rul_np = np.stack(rul_seq_norm_list, axis=0)  # (N, horizon)
+    unit_ids_np = np.array(unit_id_list, dtype=np.int64)  # (N,)
     cond_ids_np = np.array(cond_id_list, dtype=np.int64)  # (N,)
     future_cond_np = np.stack(future_cond_list, axis=0).astype(np.float32)  # (N, horizon, cond_dim_actual)
 
@@ -2850,6 +2985,7 @@ def evaluate_transformer_world_model_v1_on_test(
 
     all_true_rul_last: List[float] = []
     all_pred_rul_last: List[float] = []
+    all_unit_ids: List[np.ndarray] = []
     idx_offset = 0
 
     cond_dim = getattr(world_model_config, "cond_dim", 9)
@@ -2986,11 +3122,13 @@ def evaluate_transformer_world_model_v1_on_test(
                         f"shape={tuple(pe.shape)} min={float(pe.min()):.4f} mean={float(pe.mean()):.4f} max={float(pe.max()):.4f}"
                     )
 
+            unit_ids_batch = unit_ids_np[idx_offset : idx_offset + B].astype(np.int64, copy=False)
             true_rul_last_batch = np.array(true_rul_last_list[idx_offset : idx_offset + B], dtype=np.float32)
             idx_offset += B
 
             all_true_rul_last.append(true_rul_last_batch)
             all_pred_rul_last.append(pred_rul_last)
+            all_unit_ids.append(unit_ids_batch)
 
     if not all_true_rul_last:
         print("[WorldModelV1-Test] No RUL predictions were produced.")
@@ -2998,6 +3136,7 @@ def evaluate_transformer_world_model_v1_on_test(
 
     y_true = np.concatenate(all_true_rul_last, axis=0)
     y_pred = np.concatenate(all_pred_rul_last, axis=0)
+    unit_ids_all = np.concatenate(all_unit_ids, axis=0)
 
     # Log unclipped vs clipped stats (clip happens inside evaluate_eol_metrics when clip_y_pred=True)
     y_pred_clip = np.clip(y_pred, 0.0, float(max_rul))
@@ -3007,26 +3146,17 @@ def evaluate_transformer_world_model_v1_on_test(
         f"clipped(min/mean/max)={float(y_pred_clip.min()):.2f}/{float(y_pred_clip.mean()):.2f}/{float(y_pred_clip.max()):.2f}"
     )
 
-    m = evaluate_eol_metrics(
-        y_true=y_true,
-        y_pred=y_pred,
-        max_rul=float(max_rul),
-        clip_y_true=False,
-        clip_y_pred=True,
-        log_prefix="[WorldModelV1-eval]",
-    )
+    clip = (0.0, float(max_rul)) if max_rul is not None else None
+    metrics_all = compute_all_samples_metrics(y_true, y_pred, unit_ids=unit_ids_all, clip=clip)
+    metrics_last = compute_last_per_unit_metrics(unit_ids_all, y_true, y_pred, clip=clip)
 
-    metrics = {
-        "rmse": float(m["RMSE"]),
-        "mae": float(m["MAE"]),
-        "bias": float(m["Bias"]),
-        "r2": float(m["R2"]),
-        "nasa_mean": float(m["nasa_score_mean"]),
-        "nasa_sum": float(m["nasa_score_sum"]),
-        "num_samples": int(len(m["y_true"])),
+    merged = {
+        **metrics_last,
+        **metrics_all,
+        "dataset_split": "test",
+        "last_definition": metrics_last.get("note_last_definition", "LAST_AVAILABLE_PER_UNIT (truncated-aware)"),
     }
-
-    return metrics
+    return merged
 
 
 def evaluate_world_model_v3_eol(
@@ -3068,7 +3198,9 @@ def evaluate_world_model_v3_eol(
     model = model.to(device)
     model.eval()
 
-    # Use the central builder for "last window per unit"
+    clip = (0.0, float(max_rul)) if max_rul is not None else None
+
+    # Use the central builder for "last window per unit" (LAST)
     if window_cfg is None:
         window_cfg = WindowConfig(past_len=int(past_len), horizon=1, pad_mode="clamp")
     if target_cfg is None:
@@ -3087,6 +3219,7 @@ def evaluate_world_model_v3_eol(
 
     X = built["X"]  # (N, P, F)
     y_true = built["y_true"]  # (N,)
+    unit_ids_np = built["unit_ids"]
     cond_ids_np = built["cond_ids"]
 
     # Condition-wise scaling (same as training)
@@ -3121,29 +3254,111 @@ def evaluate_world_model_v3_eol(
         if torch.is_tensor(e):
             e = e.view(-1).detach().cpu().numpy()
         e = np.asarray(e, dtype=float).reshape(-1)
-        y_pred = np.clip(e, 0.0, float(max_rul)).astype(float)
+        y_pred_last = np.asarray(np.clip(e, 0.0, float(max_rul)), dtype=float).reshape(-1)
 
-    metrics = evaluate_eol_metrics(
-        y_true=y_true,
-        y_pred=y_pred,
-        max_rul=float(max_rul),
-        clip_y_true=bool(clip_y_true_to_max_rul),
-        clip_y_pred=True,
-        log_prefix="[eval]",
-    )
+    # LAST metrics
+    metrics_last = compute_last_per_unit_metrics(unit_ids_np, y_true, y_pred_last, clip=clip)
 
-    return {
-        "MSE": metrics["MSE"],
-        "RMSE": metrics["RMSE"],
-        "MAE": metrics["MAE"],
-        "Bias": metrics["Bias"],
-        "R2": metrics["R2"],
-        "nasa_score_sum": metrics["nasa_score_sum"],
-        "nasa_score_mean": metrics["nasa_score_mean"],
-        "num_engines": int(len(metrics["y_true"])),
-        "y_pred_eol": metrics["y_pred"].tolist(),
-        "y_true_eol": metrics["y_true"].tolist(),
-        # Expose nasa_scores for diagnostics plots
-        "nasa_scores": metrics["nasa_scores"].tolist(),
+    # ALL metrics: derive per-timepoint truth for test via y_test_true + remaining-to-last-observed,
+    # then build sliding windows with horizon=1 and current_from_df targets.
+    metrics_all: Dict[str, Any] = {}
+    try:
+        df_eval = df_test.copy()
+        # Create an eval RUL column that is valid for the truncated test trajectories:
+        # RUL(t) = RUL_last_observed + (t_last - t)
+        rul_eval = np.zeros((len(df_eval),), dtype=float)
+        for uid, df_u in df_eval.groupby("UnitNumber"):
+            uid_i = int(uid)
+            idx = {i + 1: i for i in range(len(y_test_true))}.get(uid_i, uid_i - 1)
+            rul_last_obs = float(y_test_true[idx]) if idx < len(y_test_true) else float(y_test_true[-1])
+            t_last = float(df_u["TimeInCycles"].max())
+            mask = (df_eval["UnitNumber"].to_numpy() == uid_i)
+            times = df_eval.loc[mask, "TimeInCycles"].to_numpy(dtype=float)
+            rul_eval[mask] = rul_last_obs + (t_last - times)
+        df_eval["RUL_eval"] = rul_eval
+
+        wc_all = WindowConfig(past_len=int(past_len), horizon=1, stride=1, require_full_horizon=False, pad_mode="clamp")
+        tc_all = TargetConfig(max_rul=int(max_rul), cap_targets=True, eol_target_mode="current_from_df")
+        built_all = build_sliding_windows(
+            df_eval,
+            feature_cols,
+            target_col="RUL_eval",
+            unit_col="UnitNumber",
+            time_col="TimeInCycles",
+            cond_col="ConditionID",
+            window_cfg=wc_all,
+            target_cfg=tc_all,
+            return_mask=False,
+        )
+
+        X_all = built_all["X"]
+        y_true_all = built_all["Y_eol"].astype(float)
+        unit_ids_all = built_all["unit_ids"].astype(np.int64)
+        cond_ids_all = built_all["cond_ids"].astype(np.int64)
+
+        # Condition-wise scaling
+        X_all_scaled = np.empty_like(X_all, dtype=np.float32)
+        for cond in np.unique(cond_ids_all):
+            cond = int(cond)
+            idxs = np.where(cond_ids_all == cond)[0]
+            scaler = scaler_dict.get(cond, scaler_dict.get(0))
+            flat = X_all[idxs].reshape(-1, len(feature_cols))
+            X_all_scaled[idxs] = scaler.transform(flat).reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
+
+        X_all_t = torch.tensor(X_all_scaled, dtype=torch.float32).to(device)
+        cond_all_t = torch.tensor(cond_ids_all, dtype=torch.long).to(device) if num_conditions > 1 else None
+
+        with torch.no_grad():
+            out_all = model(
+                encoder_inputs=X_all_t,
+                decoder_targets=None,
+                teacher_forcing_ratio=0.0,
+                horizon=1,
+                cond_ids=cond_all_t,
+            )
+            if isinstance(out_all, dict):
+                eol_all = out_all.get("eol", out_all.get("rul"))
+            else:
+                eol_all = out_all[1] if isinstance(out_all, (tuple, list)) and len(out_all) >= 2 else out_all
+            if torch.is_tensor(eol_all):
+                y_pred_all = eol_all.view(-1).detach().cpu().numpy().astype(float)
+            else:
+                y_pred_all = np.asarray(eol_all, dtype=float).reshape(-1)
+        y_pred_all = np.clip(y_pred_all, 0.0, float(max_rul)).astype(float)
+
+        metrics_all = compute_all_samples_metrics(y_true_all, y_pred_all, unit_ids=unit_ids_all, clip=clip)
+    except Exception as e:
+        print(f"[eval] Warning: could not compute ALL windows metrics for test: {e}")
+        metrics_all = {"n_samples_all": 0}
+
+    merged = {
+        **metrics_last,
+        **metrics_all,
+        "dataset_split": "test",
+        "last_definition": metrics_last.get("note_last_definition", "LAST_AVAILABLE_PER_UNIT (truncated-aware)"),
+        "unit_ids_last": unit_ids_np.tolist(),
+        "y_true_last": y_true.tolist(),
+        "y_pred_last": y_pred_last.tolist(),
     }
+
+    # Backward-compat aliases for older diagnostics code (deprecated names).
+    merged["y_true_eol"] = merged["y_true_last"]
+    merged["y_pred_eol"] = merged["y_pred_last"]
+    try:
+        from src.metrics import compute_eol_errors_and_nasa
+        nasa_stats = compute_eol_errors_and_nasa(np.asarray(y_true, dtype=float), np.asarray(y_pred_last, dtype=float), max_rul=float(max_rul))
+        merged["nasa_scores"] = nasa_stats["nasa_scores"].tolist()
+    except Exception:
+        pass
+
+    # Legacy aliases (deprecated): previous behavior was LAST on test.
+    merged["RMSE"] = merged.get("rmse_last")
+    merged["MAE"] = merged.get("mae_last")
+    merged["Bias"] = merged.get("bias_last")
+    merged["R2"] = merged.get("r2_last")
+    merged["nasa_score_sum"] = merged.get("nasa_last_sum")
+    merged["nasa_score_mean"] = merged.get("nasa_last_mean")
+    merged["num_engines"] = merged.get("n_units")
+
+    return merged
 

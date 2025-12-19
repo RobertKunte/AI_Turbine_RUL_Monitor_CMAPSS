@@ -43,7 +43,11 @@ from .uncertainty import mc_dropout_predict
 from .models.lstm_rul_mcdo import LSTMRULPredictorMCDropout
 from .models.world_model import WorldModelEncoderDecoder, WorldModelEncoderDecoderMultiTask, WorldModelEncoderDecoderUniversalV2
 from .training import build_eol_sequences_from_df
-from src.metrics import compute_eol_errors_and_nasa
+from src.metrics import (
+    compute_eol_errors_and_nasa,
+    compute_last_per_unit_metrics,
+    compute_all_samples_metrics,
+)
 from src.models.eol_regressor import EOLRegressor
 from src.models.tail_lstm import TailLSTMRegressor, TailLSTMConfig
 
@@ -545,11 +549,40 @@ def train_world_model_universal_v2_residual(
     ).to(device)
     
     # ===================================================================
-    # 1. Build sequences with condition IDs
+    # 1. Engine-based train/val split (TRUNCATED-AWARE reporting needs per-unit splits)
     # ===================================================================
-    print("[1] Building seq2seq sequences...")
-    X_train, Y_train, cond_ids_train = build_world_model_dataset_with_cond_ids(
-        df=df_train,
+    print("[1] Creating engine-based train/val split...")
+    unit_ids_all = sorted(df_train["UnitNumber"].unique().tolist())
+    n_units_total = len(unit_ids_all)
+    if n_units_total == 0:
+        raise ValueError("No UnitNumber found in df_train.")
+
+    g = torch.Generator().manual_seed(random_seed)
+    perm = torch.randperm(n_units_total, generator=g).tolist()
+    n_units_train = max(1, int(engine_train_ratio * n_units_total))
+    train_units = set([unit_ids_all[i] for i in perm[:n_units_train]])
+    val_units = set([unit_ids_all[i] for i in perm[n_units_train:]])
+    if len(val_units) == 0:
+        # Ensure non-empty val split
+        moved = next(iter(train_units))
+        train_units.remove(moved)
+        val_units.add(moved)
+
+    df_train_split_df = df_train[df_train["UnitNumber"].isin(train_units)].copy()
+    df_val_split_df = df_train[df_train["UnitNumber"].isin(val_units)].copy()
+    print(f"  Units total: {n_units_total} | train: {len(train_units)} | val: {len(val_units)}")
+
+    # Determine number of conditions on the full training dataframe
+    unique_conditions = np.unique(df_train["ConditionID"].to_numpy(dtype=int, copy=False))
+    num_conditions = int(len(unique_conditions))
+    print(f"  Found {num_conditions} unique conditions: {unique_conditions}")
+
+    # ===================================================================
+    # 2. Build sequences with condition IDs (train/val separately; avoids leakage)
+    # ===================================================================
+    print("\n[2] Building seq2seq sequences...")
+    X_train_split, Y_train_split, cond_ids_train_split = build_world_model_dataset_with_cond_ids(
+        df=df_train_split_df,
         feature_cols=feature_cols,
         target_col="RUL",
         past_len=past_len,
@@ -557,39 +590,18 @@ def train_world_model_universal_v2_residual(
         unit_col="UnitNumber",
         cond_col="ConditionID",
     )
-    
-    print(f"  Train sequences: {X_train.shape[0]}")
-    print(f"  Input shape: {X_train.shape}, Target shape: {Y_train.shape}")
-    
-    # Determine number of conditions
-    unique_conditions = torch.unique(cond_ids_train).cpu().numpy()
-    num_conditions = len(unique_conditions)
-    print(f"  Found {num_conditions} unique conditions: {unique_conditions}")
-    
-    # ===================================================================
-    # 2. Engine-based train/val split
-    # ===================================================================
-    print("\n[2] Creating engine-based train/val split...")
-    # Extract unit IDs from sequences (we need to track which sequences belong to which engines)
-    # For simplicity, we'll use a random split on sequences, but ideally we'd split by engines
-    # For now, use random split (can be improved later)
-    n_total = len(X_train)
-    n_val = int((1 - engine_train_ratio) * n_total)
-    n_train = n_total - n_val
-    
-    indices = torch.randperm(n_total, generator=torch.Generator().manual_seed(random_seed))
-    train_indices = indices[:n_train]
-    val_indices = indices[n_train:]
-    
-    X_train_split = X_train[train_indices]
-    Y_train_split = Y_train[train_indices]
-    cond_ids_train_split = cond_ids_train[train_indices]
-    
-    X_val = X_train[val_indices]
-    Y_val = Y_train[val_indices]
-    cond_ids_val = cond_ids_train[val_indices]
-    
-    print(f"  Train samples: {len(X_train_split)}, Val samples: {len(X_val)}")
+    X_val, Y_val, cond_ids_val = build_world_model_dataset_with_cond_ids(
+        df=df_val_split_df,
+        feature_cols=feature_cols,
+        target_col="RUL",
+        past_len=past_len,
+        horizon=horizon,
+        unit_col="UnitNumber",
+        cond_col="ConditionID",
+    )
+
+    print(f"  Train sequences: {X_train_split.shape[0]}, Val sequences: {X_val.shape[0]}")
+    print(f"  Input shape: {X_train_split.shape}, Target shape: {Y_train_split.shape}")
     
     # ===================================================================
     # 3. Condition-wise scaling
@@ -853,9 +865,108 @@ def train_world_model_universal_v2_residual(
     model.eval()
     
     print(f"\n[7] Best model loaded from epoch {checkpoint['epoch']+1} (val_loss={checkpoint['val_loss']:.4f})")
+
+    # ===================================================================
+    # 7a. Evaluate on train/val splits (LAST + ALL; truncated-aware)
+    # ===================================================================
+    def _evaluate_last_all_on_dataframe(
+        df_split: pd.DataFrame,
+        *,
+        split_name: str,
+    ) -> Dict[str, Any]:
+        y_col = "RUL_raw" if ("RUL_raw" in df_split.columns) else "RUL"
+        if y_col not in df_split.columns:
+            raise KeyError(f"Expected '{y_col}' in df_split for split={split_name}")
+
+        X_list: list[np.ndarray] = []
+        y_true_list: list[float] = []
+        unit_ids_list: list[int] = []
+        cond_ids_list: list[int] = []
+
+        for unit_id, df_unit in df_split.groupby("UnitNumber"):
+            unit_id = int(unit_id)
+            df_u = df_unit.sort_values("TimeInCycles").reset_index(drop=True)
+
+            feats = df_u[feature_cols].to_numpy(dtype=np.float32, copy=True)
+            y_now = df_u[y_col].to_numpy(dtype=np.float32, copy=True).reshape(-1)
+            y_now = np.maximum(y_now, 0.0)
+            if max_rul is not None:
+                y_now = np.minimum(y_now, float(max_rul))
+
+            # Pad short units to allow at least one LAST window
+            if feats.shape[0] < past_len:
+                pad_len = past_len - feats.shape[0]
+                pad = np.repeat(feats[0:1], pad_len, axis=0)
+                feats = np.vstack([pad, feats])
+                y_pad = np.repeat(y_now[0:1], pad_len, axis=0)
+                y_now = np.concatenate([y_pad, y_now], axis=0)
+
+            cond_id = int(df_u["ConditionID"].iloc[0]) if ("ConditionID" in df_u.columns) else 0
+            scaler = scaler_dict.get(cond_id, scaler_dict.get(0))
+            feats_scaled = scaler.transform(feats)
+
+            # Create windows for ALL timepoints (window end at each observed t_end)
+            for t_end in range(past_len - 1, feats_scaled.shape[0]):
+                x = feats_scaled[t_end - past_len + 1 : t_end + 1]
+                X_list.append(x.astype(np.float32, copy=False))
+                y_true_list.append(float(y_now[t_end]))
+                unit_ids_list.append(unit_id)
+                cond_ids_list.append(cond_id)
+
+        if not X_list:
+            return {"dataset_split": split_name, "n_samples_all": 0, "n_units": 0}
+
+        X_all = torch.tensor(np.stack(X_list, axis=0), dtype=torch.float32).to(device)
+        cond_all = torch.tensor(np.asarray(cond_ids_list, dtype=np.int64), dtype=torch.long).to(device) if num_conditions > 1 else None
+
+        preds: list[float] = []
+        bs = 1024
+        model.eval()
+        with torch.no_grad():
+            for i0 in range(0, X_all.size(0), bs):
+                xb = X_all[i0 : i0 + bs]
+                cb = cond_all[i0 : i0 + bs] if cond_all is not None else None
+                _, eol_pred = model(
+                    encoder_inputs=xb,
+                    decoder_targets=None,
+                    teacher_forcing_ratio=0.0,
+                    horizon=1,
+                    cond_ids=cb,
+                )
+                p = eol_pred.view(-1).detach().cpu().numpy().astype(float)
+                preds.extend(p.tolist())
+
+        unit_ids_np = np.asarray(unit_ids_list, dtype=np.int64)
+        y_true_np = np.asarray(y_true_list, dtype=float)
+        y_pred_np = np.asarray(preds, dtype=float)
+
+        clip = (0.0, float(max_rul)) if max_rul is not None else None
+        metrics_all = compute_all_samples_metrics(y_true_np, y_pred_np, unit_ids=unit_ids_np, clip=clip)
+        metrics_last = compute_last_per_unit_metrics(unit_ids_np, y_true_np, y_pred_np, clip=clip)
+        merged = {
+            **metrics_last,
+            **metrics_all,
+            "dataset_split": split_name,
+            "last_definition": metrics_last.get("note_last_definition", "LAST_AVAILABLE_PER_UNIT (truncated-aware)"),
+        }
+        return merged
+
+    print("\n[7a] Evaluating on train/val splits...")
+    metrics_train = _evaluate_last_all_on_dataframe(df_train_split_df, split_name="train")
+    metrics_val = _evaluate_last_all_on_dataframe(df_val_split_df, split_name="val")
+
+    # Save split metrics (standalone artifacts)
+    try:
+        with open(results_dir / "metrics_train.json", "w") as f:
+            json.dump(metrics_train, f, indent=2)
+        with open(results_dir / "metrics_val.json", "w") as f:
+            json.dump(metrics_val, f, indent=2)
+        print(f"  Saved metrics_train.json and metrics_val.json to {results_dir}")
+    except Exception as e:
+        print(f"  Warning: could not save train/val metrics json: {e}")
     
     # ===================================================================
-    # 7. Evaluate on test set
+    # 8. Evaluate on test set
     # ===================================================================
     print("\n[8] Evaluating on test set...")
     test_metrics = evaluate_world_model_eol_universal_v2(
@@ -868,13 +979,28 @@ def train_world_model_universal_v2_residual(
         max_rul=max_rul,
         num_conditions=num_conditions,
         device=device,
+        eval_all_windows=True,
     )
     
-    print(f"  Test RMSE: {test_metrics['RMSE']:.2f} cycles")
-    print(f"  Test MAE:  {test_metrics['MAE']:.2f} cycles")
-    print(f"  Test Bias: {test_metrics['Bias']:.2f} cycles")
-    print(f"  Test R²:   {test_metrics.get('R2', 0.0):.4f}")
-    print(f"  NASA Score (mean): {test_metrics['nasa_score_mean']:.2f}")
+    # Standardized reporting: LAST + ALL
+    print("\n--- LAST (literature-style, truncated-aware) ---")
+    print(f"  rmse_last: {test_metrics.get('rmse_last', float('nan')):.2f}")
+    print(f"  mae_last:  {test_metrics.get('mae_last', float('nan')):.2f}")
+    print(f"  bias_last: {test_metrics.get('bias_last', float('nan')):.2f}")
+    print(f"  r2_last:   {test_metrics.get('r2_last', 0.0):.4f}")
+    print(f"  nasa_last_mean: {test_metrics.get('nasa_last_mean', float('nan')):.4f}")
+    print(f"  nasa_last_sum:  {test_metrics.get('nasa_last_sum', float('nan')):.2f}")
+    print(f"  n_units: {test_metrics.get('n_units', 0)}")
+    print(f"  max_rul_used: {test_metrics.get('max_rul_used', max_rul)}")
+
+    print("\n--- ALL (all windows/timepoints) ---")
+    print(f"  rmse_all: {test_metrics.get('rmse_all', float('nan')):.2f}")
+    print(f"  mae_all:  {test_metrics.get('mae_all', float('nan')):.2f}")
+    print(f"  bias_all: {test_metrics.get('bias_all', float('nan')):.2f}")
+    print(f"  r2_all:   {test_metrics.get('r2_all', 0.0):.4f}")
+    print(f"  nasa_all_mean: {test_metrics.get('nasa_all_mean', float('nan')):.4f}")
+    print(f"  nasa_all_sum:  {test_metrics.get('nasa_all_sum', float('nan')):.2f}")
+    print(f"  n_samples_all: {test_metrics.get('n_samples_all', 0)}")
     
     # ===================================================================
     # 8. Compute per-condition metrics
@@ -886,9 +1012,9 @@ def train_world_model_universal_v2_residual(
     df_test_cond = df_test.groupby("UnitNumber")["ConditionID"].first()
     unit_ids_test = sorted(df_test["UnitNumber"].unique())
     
-    # Get predictions for all test engines
-    y_pred_eol = np.array(test_metrics.get("y_pred_eol", []))
-    y_true_eol = np.array(test_metrics.get("y_true_eol", y_test_true))
+    # Per-condition metrics are defined on LAST (1 value per engine)
+    y_pred_eol = np.array(test_metrics.get("y_pred_last", test_metrics.get("y_pred_eol", [])))
+    y_true_eol = np.array(test_metrics.get("y_true_last", test_metrics.get("y_true_eol", y_test_true)))
     
     if len(y_pred_eol) > 0 and len(y_pred_eol) == len(unit_ids_test):
         for cond_id in unique_conditions:
@@ -958,15 +1084,9 @@ def train_world_model_universal_v2_residual(
             "traj_step_weighting": world_model_config.traj_step_weighting,
             "use_condition_wise_scaling": use_condition_wise_scaling,
         },
-        "test_metrics": {
-            "rmse": test_metrics["RMSE"],
-            "mae": test_metrics["MAE"],
-            "bias": test_metrics["Bias"],
-            "r2": test_metrics.get("R2", 0.0),
-            "nasa_mean": test_metrics["nasa_score_mean"],
-            "nasa_sum": test_metrics["nasa_score_sum"],
-            "num_engines": test_metrics["num_engines"],
-        },
+        "train_metrics": metrics_train,
+        "val_metrics": metrics_val,
+        "test_metrics": test_metrics,
         "condition_metrics": condition_metrics,
         "training_history": {
             "best_epoch": checkpoint["epoch"] + 1,
@@ -980,6 +1100,15 @@ def train_world_model_universal_v2_residual(
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"  Saved summary to {summary_path}")
+
+    # Save split metrics as standalone artifact (standard name)
+    metrics_test_path = results_dir / "metrics_test.json"
+    try:
+        with open(metrics_test_path, "w") as f:
+            json.dump(test_metrics, f, indent=2)
+        print(f"  Saved metrics to {metrics_test_path}")
+    except Exception as e:
+        print(f"  Warning: Could not save metrics_test.json: {e}")
     
     # Save full training history
     training_history_path = results_dir / "training_history.json"
@@ -1075,6 +1204,8 @@ def evaluate_world_model_eol_universal_v2(
     max_rul: int = 125,
     num_conditions: int = 1,
     device: torch.device = None,
+    *,
+    eval_all_windows: bool = True,
 ) -> Dict[str, Any]:
     """
     Evaluate UniversalEncoderV2-based world model on test set (EOL metrics).
@@ -1091,7 +1222,7 @@ def evaluate_world_model_eol_universal_v2(
         device: PyTorch device
     
     Returns:
-        Dictionary with EOL metrics
+        Dictionary with LAST (per-unit last-available) and ALL (all windows/timepoints) metrics.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1099,9 +1230,10 @@ def evaluate_world_model_eol_universal_v2(
     model = model.to(device)
     model.eval()
     
-    y_pred_all = []
-    y_true_all = []
-    unit_ids_list = []
+    # --- LAST (one window per unit; last available) ---
+    y_pred_last_list: list[float] = []
+    y_true_last_list: list[float] = []
+    unit_ids_last_list: list[int] = []
     
     # Helper function to build EOL input
     def _build_eol_input_for_unit(df_unit: pd.DataFrame, feature_cols: List[str], past_len: int) -> np.ndarray:
@@ -1126,69 +1258,139 @@ def evaluate_world_model_eol_universal_v2(
     with torch.no_grad():
         for unit_id, df_unit in df_test.groupby("UnitNumber"):
             unit_id = int(unit_id)
-            
-            # Build input
+
+            # Build input (last window)
             X_past_np = _build_eol_input_for_unit(df_unit, feature_cols, past_len)
-            
-            # Get condition ID
+
+            # Condition ID
             cond_id = int(df_unit["ConditionID"].iloc[0])
-            
+
             # Scale
             scaler = scaler_dict.get(cond_id, scaler_dict.get(0))
             X_past_scaled = scaler.transform(X_past_np.reshape(-1, len(feature_cols))).reshape(past_len, len(feature_cols))
-            
+
             X_past = torch.tensor(X_past_scaled, dtype=torch.float32).unsqueeze(0).to(device)  # (1, past_len, F)
             cond_ids = torch.tensor([cond_id], dtype=torch.long).to(device) if num_conditions > 1 else None
-            
-            # Predict
-            traj_pred, eol_pred = model(
+
+            # Predict scalar head (EOL-style)
+            _, eol_pred = model(
                 encoder_inputs=X_past,
                 decoder_targets=None,
                 teacher_forcing_ratio=0.0,
                 horizon=1,
                 cond_ids=cond_ids,
             )
-            
+
             pred_rul = float(eol_pred[0, 0].cpu().item())
-            pred_rul = np.clip(pred_rul, 0.0, max_rul)
-            
-            y_pred_all.append(pred_rul)
-            unit_ids_list.append(unit_id)
-            # Map unit_id to index in y_test_true
+            pred_rul = float(np.clip(pred_rul, 0.0, max_rul))
+
+            # Ground truth at LAST OBSERVED time (NASA test target)
             idx = unit_id_to_idx.get(unit_id, unit_id - 1)
-            if idx < len(y_test_true):
-                y_true_all.append(y_test_true[idx])
-            else:
-                # Fallback: use last value if index out of range
-                y_true_all.append(y_test_true[-1])
-    
-    y_true = np.array(y_true_all)
-    y_pred = np.array(y_pred_all)
-    
-    # Compute metrics
-    errors = y_pred - y_true
-    mse = float(np.mean(errors**2))
-    rmse = float(np.sqrt(mse))
-    mae = float(np.mean(np.abs(errors)))
-    bias = float(np.mean(errors))
-    
-    # R²
-    ss_res = np.sum((y_true - y_pred)**2)
-    ss_tot = np.sum((y_true - np.mean(y_true))**2)
-    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-    
-    # NASA score using compute_eol_errors_and_nasa
-    nasa_stats = compute_eol_errors_and_nasa(y_true, y_pred, max_rul=max_rul)
-    
-    return {
-        "MSE": mse,
-        "RMSE": rmse,
-        "MAE": mae,
-        "Bias": bias,
-        "R2": r2,
-        "nasa_score_sum": nasa_stats["nasa_sum"],
-        "nasa_score_mean": nasa_stats["nasa_mean"],
-        "num_engines": len(y_true),
-        "y_pred_eol": y_pred.tolist(),  # Add predictions for per-condition analysis
-        "y_true_eol": y_true.tolist(),  # Add true values for per-condition analysis
+            true_rul = float(y_test_true[idx]) if idx < len(y_test_true) else float(y_test_true[-1])
+
+            y_pred_last_list.append(pred_rul)
+            y_true_last_list.append(true_rul)
+            unit_ids_last_list.append(unit_id)
+
+    y_true_last = np.asarray(y_true_last_list, dtype=float)
+    y_pred_last = np.asarray(y_pred_last_list, dtype=float)
+    unit_ids_last = np.asarray(unit_ids_last_list, dtype=np.int64)
+
+    clip = (0.0, float(max_rul)) if max_rul is not None else None
+    metrics_last = compute_last_per_unit_metrics(unit_ids_last, y_true_last, y_pred_last, clip=clip)
+
+    # --- ALL (all available windows/timepoints; truncated-aware via y_test_true + remaining-to-last) ---
+    metrics_all: Dict[str, Any] = {}
+    y_true_all = None
+    y_pred_all = None
+    unit_ids_all = None
+    if eval_all_windows:
+        X_all_list: list[np.ndarray] = []
+        y_true_all_list: list[float] = []
+        unit_ids_all_list: list[int] = []
+        cond_ids_all_list: list[int] = []
+
+        # Build per-timepoint truth from (last-observed RUL) + remaining cycles to last observed.
+        for unit_id, df_unit in df_test.groupby("UnitNumber"):
+            unit_id = int(unit_id)
+            df_u = df_unit.sort_values("TimeInCycles").reset_index(drop=True)
+            feats = df_u[feature_cols].to_numpy(dtype=np.float32, copy=True)
+            times = df_u["TimeInCycles"].to_numpy(dtype=np.float32, copy=True).reshape(-1)
+            if feats.shape[0] < past_len:
+                continue
+
+            cond_id = int(df_u["ConditionID"].iloc[0])
+            scaler = scaler_dict.get(cond_id, scaler_dict.get(0))
+            feats_scaled = scaler.transform(feats)
+
+            t_last = float(np.max(times))
+            idx = unit_id_to_idx.get(unit_id, unit_id - 1)
+            rul_last_obs = float(y_test_true[idx]) if idx < len(y_test_true) else float(y_test_true[-1])
+
+            # Window ends at each observed timepoint t_end (>= past_len-1)
+            for t_end in range(past_len - 1, feats_scaled.shape[0]):
+                x = feats_scaled[t_end - past_len + 1 : t_end + 1]  # (P,F)
+                # True RUL at this observed timepoint (remaining to failure)
+                rul_t = rul_last_obs + (t_last - float(times[t_end]))
+                y_true_all_list.append(float(rul_t))
+                X_all_list.append(x.astype(np.float32, copy=False))
+                unit_ids_all_list.append(unit_id)
+                cond_ids_all_list.append(cond_id)
+
+        if X_all_list:
+            X_all = torch.tensor(np.stack(X_all_list, axis=0), dtype=torch.float32).to(device)
+            cond_all = torch.tensor(np.asarray(cond_ids_all_list, dtype=np.int64), dtype=torch.long).to(device) if num_conditions > 1 else None
+
+            preds: list[float] = []
+            bs = 1024
+            with torch.no_grad():
+                for i0 in range(0, X_all.size(0), bs):
+                    xb = X_all[i0 : i0 + bs]
+                    cb = cond_all[i0 : i0 + bs] if cond_all is not None else None
+                    _, eol_pred = model(
+                        encoder_inputs=xb,
+                        decoder_targets=None,
+                        teacher_forcing_ratio=0.0,
+                        horizon=1,
+                        cond_ids=cb,
+                    )
+                    p = eol_pred.view(-1).detach().cpu().numpy().astype(float)
+                    preds.extend(p.tolist())
+
+            unit_ids_all = np.asarray(unit_ids_all_list, dtype=np.int64)
+            y_true_all = np.asarray(y_true_all_list, dtype=float)
+            y_pred_all = np.asarray(preds, dtype=float)
+
+            metrics_all = compute_all_samples_metrics(y_true_all, y_pred_all, unit_ids=unit_ids_all, clip=clip)
+        else:
+            metrics_all = {"n_samples_all": 0}
+
+    # Merge and keep a few legacy aliases (deprecated)
+    merged: Dict[str, Any] = {
+        **metrics_last,
+        **metrics_all,
+        "dataset_split": "test",
+        "last_definition": metrics_last.get("note_last_definition", "LAST_AVAILABLE_PER_UNIT (truncated-aware)"),
     }
+    # Provide LAST arrays for downstream diagnostics/per-condition logic
+    merged["unit_ids_last"] = unit_ids_last.tolist()
+    merged["y_true_last"] = y_true_last.tolist()
+    merged["y_pred_last"] = y_pred_last.tolist()
+    # Backward-compat aliases (deprecated names)
+    merged["y_true_eol"] = merged["y_true_last"]
+    merged["y_pred_eol"] = merged["y_pred_last"]
+    if eval_all_windows and unit_ids_all is not None and y_true_all is not None and y_pred_all is not None:
+        merged["unit_ids_all"] = unit_ids_all.tolist()
+        merged["y_true_all_raw"] = y_true_all.tolist()
+        merged["y_pred_all_raw"] = y_pred_all.tolist()
+
+    # Legacy aliases (deprecated): previous behavior was effectively LAST on test.
+    merged["RMSE"] = merged.get("rmse_last")
+    merged["MAE"] = merged.get("mae_last")
+    merged["Bias"] = merged.get("bias_last")
+    merged["R2"] = merged.get("r2_last")
+    merged["nasa_score_sum"] = merged.get("nasa_last_sum")
+    merged["nasa_score_mean"] = merged.get("nasa_last_mean")
+    merged["num_engines"] = merged.get("n_units")
+
+    return merged

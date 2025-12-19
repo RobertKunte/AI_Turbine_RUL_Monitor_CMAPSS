@@ -8,7 +8,7 @@ especially the NASA PHM08 score, used across training, evaluation, and diagnosti
 from __future__ import annotations
 
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, Any
 
 
 def nasa_phm_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -142,4 +142,187 @@ def compute_eol_errors_and_nasa(
         "nasa_median": float(np.median(nasa_scores)),
         "num_engines": len(y_true_eol),
     }
+
+
+def _clip_y(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    clip: Optional[Tuple[float, float]] = None,
+) -> Tuple[np.ndarray, np.ndarray, Optional[Dict[str, Any]]]:
+    """
+    Clip y_true/y_pred if requested.
+
+    Args:
+        y_true: array-like
+        y_pred: array-like
+        clip: None (no clipping) or (min_val, max_val)
+
+    Returns:
+        (y_true_clipped, y_pred_clipped, meta_clip)
+    """
+    yt = np.asarray(y_true, dtype=float).reshape(-1)
+    yp = np.asarray(y_pred, dtype=float).reshape(-1)
+    if yt.shape[0] != yp.shape[0]:
+        raise ValueError(f"y_true and y_pred must have same length. Got {yt.shape[0]} and {yp.shape[0]}.")
+
+    if clip is None:
+        return yt, yp, None
+
+    lo, hi = float(clip[0]), float(clip[1])
+    yt_c = np.clip(yt, lo, hi)
+    yp_c = np.clip(yp, lo, hi)
+    meta = {"clip_min": lo, "clip_max": hi}
+    return yt_c, yp_c, meta
+
+
+def compute_last_per_unit_metrics(
+    unit_ids: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    clip: Optional[Tuple[float, float]] = None,
+    include_r2: bool = True,
+    include_nasa: bool = True,
+) -> Dict[str, Any]:
+    """
+    Compute LAST-AVAILABLE-per-unit metrics (truncated-aware, literature-style).
+
+    Definition:
+      For each unit_id, take the *last occurrence* in the provided arrays
+      (stable last index by scan order), then compute metrics over these per-unit
+      last samples.
+
+    Args:
+        unit_ids: array of unit ids aligned with y_true/y_pred (shape (N,))
+        y_true: true targets (shape (N,))
+        y_pred: predictions (shape (N,))
+        clip: optional (min,max) applied to y_true and y_pred before metrics
+        include_r2: include r2_last
+        include_nasa: include nasa_last_sum/nasa_last_mean
+
+    Returns:
+        Dict with keys:
+          rmse_last, mae_last, bias_last, r2_last (optional),
+          nasa_last_sum, nasa_last_mean (optional),
+          n_units, max_rul_used (if clip provided), note_last_definition
+    """
+    u = np.asarray(unit_ids).reshape(-1)
+    yt = np.asarray(y_true, dtype=float).reshape(-1)
+    yp = np.asarray(y_pred, dtype=float).reshape(-1)
+    if u.shape[0] != yt.shape[0] or yt.shape[0] != yp.shape[0]:
+        raise ValueError(
+            f"unit_ids, y_true, y_pred must have same length. "
+            f"Got {u.shape[0]}, {yt.shape[0]}, {yp.shape[0]}."
+        )
+
+    # stable last index per unit: last occurrence wins
+    last_idx: Dict[int, int] = {}
+    for i, uid in enumerate(u.tolist()):
+        last_idx[int(uid)] = int(i)
+    idxs = np.array(sorted(last_idx.values()), dtype=np.int64)
+
+    yt_last = yt[idxs]
+    yp_last = yp[idxs]
+    yt_last, yp_last, clip_meta = _clip_y(yt_last, yp_last, clip=clip)
+
+    # Base metrics
+    errors = yp_last - yt_last
+    mse = float(np.mean(errors ** 2)) if errors.size else 0.0
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(errors))) if errors.size else 0.0
+    bias = float(np.mean(errors)) if errors.size else 0.0
+
+    out: Dict[str, Any] = {
+        "rmse_last": rmse,
+        "mae_last": mae,
+        "bias_last": bias,
+        "n_units": int(len(last_idx)),
+        "note_last_definition": "LAST_AVAILABLE_PER_UNIT (truncated-aware)",
+    }
+    if clip_meta is not None:
+        out["max_rul_used"] = float(clip_meta["clip_max"])
+
+    if include_r2:
+        ss_res = float(np.sum(errors ** 2))
+        ss_tot = float(np.sum((yt_last - float(np.mean(yt_last))) ** 2)) if yt_last.size else 0.0
+        r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+        out["r2_last"] = float(r2)
+
+    if include_nasa:
+        # Reuse the centralized NASA implementation via compute_eol_errors_and_nasa
+        # If clip is provided, we map it to "max_rul" behavior (lower bound = 0.0).
+        max_rul = None
+        if clip is not None:
+            # compute_eol_errors_and_nasa clamps y_pred to [0,max_rul] and y_true to [0,max_rul]
+            max_rul = float(clip[1])
+        nasa_stats = compute_eol_errors_and_nasa(yt_last, yp_last, max_rul=max_rul)
+        out["nasa_last_sum"] = float(nasa_stats["nasa_sum"])
+        out["nasa_last_mean"] = float(nasa_stats["nasa_mean"])
+
+    return out
+
+
+def compute_all_samples_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    unit_ids: Optional[np.ndarray] = None,
+    clip: Optional[Tuple[float, float]] = None,
+    include_r2: bool = True,
+    include_nasa: bool = True,
+) -> Dict[str, Any]:
+    """
+    Compute ALL-SAMPLES metrics (all windows / all timepoints).
+
+    Args:
+        y_true: shape (N,)
+        y_pred: shape (N,)
+        unit_ids: optional, for debug only (not required for the metrics)
+        clip: optional (min,max) applied to y_true and y_pred before metrics
+        include_r2: include r2_all
+        include_nasa: include nasa_all_sum/nasa_all_mean (interpret as asymmetric cost over all samples)
+
+    Returns:
+        Dict with keys:
+          rmse_all, mae_all, bias_all, r2_all (optional),
+          nasa_all_sum, nasa_all_mean (optional),
+          n_samples_all, n_units (if unit_ids provided), max_rul_used (if clip provided)
+    """
+    yt, yp, clip_meta = _clip_y(y_true, y_pred, clip=clip)
+    errors = yp - yt
+    mse = float(np.mean(errors ** 2)) if errors.size else 0.0
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(errors))) if errors.size else 0.0
+    bias = float(np.mean(errors)) if errors.size else 0.0
+
+    out: Dict[str, Any] = {
+        "rmse_all": rmse,
+        "mae_all": mae,
+        "bias_all": bias,
+        "n_samples_all": int(yt.size),
+    }
+    if unit_ids is not None:
+        try:
+            out["n_units"] = int(len(np.unique(np.asarray(unit_ids).reshape(-1))))
+        except Exception:
+            pass
+    if clip_meta is not None:
+        out["max_rul_used"] = float(clip_meta["clip_max"])
+
+    if include_r2:
+        ss_res = float(np.sum(errors ** 2))
+        ss_tot = float(np.sum((yt - float(np.mean(yt))) ** 2)) if yt.size else 0.0
+        r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+        out["r2_all"] = float(r2)
+
+    if include_nasa:
+        max_rul = None
+        if clip is not None:
+            max_rul = float(clip[1])
+        nasa_stats = compute_eol_errors_and_nasa(yt, yp, max_rul=max_rul)
+        out["nasa_all_sum"] = float(nasa_stats["nasa_sum"])
+        out["nasa_all_mean"] = float(nasa_stats["nasa_mean"])
+
+    return out
 

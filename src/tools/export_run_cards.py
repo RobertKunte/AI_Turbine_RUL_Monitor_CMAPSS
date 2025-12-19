@@ -89,6 +89,17 @@ def build_run_card_markdown(
     def _metric_block(m: Any) -> str:
         if not isinstance(m, dict):
             return "n/a"
+        # Prefer the standardized LAST keys; fall back to legacy keys if needed.
+        if "rmse_last" in m or "mae_last" in m:
+            rmse = _fmt_float(m.get("rmse_last"), 3)
+            mae = _fmt_float(m.get("mae_last"), 3)
+            bias = _fmt_float(m.get("bias_last"), 3)
+            r2 = _fmt_float(m.get("r2_last"), 4)
+            nasa = _fmt_float(m.get("nasa_last_mean"), 3)
+            n_units = m.get("n_units", None)
+            n_units_s = f", n_units={int(n_units)}" if n_units is not None else ""
+            return f"LAST: RMSE={rmse}, MAE={mae}, Bias={bias}, R²={r2}, NASA_mean={nasa}{n_units_s}"
+
         rmse = _fmt_float(m.get("rmse"), 3)
         mae = _fmt_float(m.get("mae"), 3)
         bias = _fmt_float(m.get("bias"), 3)
