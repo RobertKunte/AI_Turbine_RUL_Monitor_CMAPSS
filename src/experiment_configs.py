@@ -1095,9 +1095,11 @@ def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_co
     # Keys must match run_experiments.py wiring.
     wmp["rul_traj_weight"] = 6.0
     wmp["rul_traj_late_ramp"] = True
-    wmp["rul_mono_future_weight"] = 1.0
+    # rul_linear_decay already enforces monotonicity
+    wmp["rul_mono_future_weight"] = 0.0
     wmp["rul_saturation_weight"] = 1.0
     wmp["rul_saturation_margin"] = 0.05
+    wmp["rul_cap_threshold"] = 0.999999
     # Optional physics-consistent linear-decay construction from pred_rul0
     wmp["rul_linear_decay"] = True
     return cfg

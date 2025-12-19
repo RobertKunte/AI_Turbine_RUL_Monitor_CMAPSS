@@ -237,6 +237,10 @@ class WorldModelTrainingConfig:
     # Default OFF for backwards compatibility.
     rul_linear_decay: bool = False
 
+    # Cap-threshold for masking non-informative (fully capped) RUL targets in WM-V1.
+    # If true_rul >= rul_cap_threshold, we treat it as "capped/plateau" and exclude from traj loss.
+    rul_cap_threshold: float = 0.999999
+
     # Stage-1: additional HI shape losses (default off; enable via experiment config)
     hi_early_slope_weight: float = 0.0
     hi_early_slope_epsilon: float = 1e-3

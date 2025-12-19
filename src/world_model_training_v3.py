@@ -2095,6 +2095,8 @@ def train_transformer_world_model_v1(
         sat_loss_sum = 0.0
         sat_mask_frac_sum = 0.0
         sat_batches = 0
+        cap_frac_sum = 0.0
+        cap_batches = 0
 
         for batch_idx, (X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b) in enumerate(train_loader):
             X_b = X_b.to(device)
@@ -2225,6 +2227,7 @@ def train_transformer_world_model_v1(
                 rul_mono_future_weight = float(getattr(world_model_config, "rul_mono_future_weight", 0.0) or 0.0)
                 rul_saturation_weight = float(getattr(world_model_config, "rul_saturation_weight", 0.0) or 0.0)
                 margin = float(getattr(world_model_config, "rul_saturation_margin", 0.05) or 0.05)
+                cap_thr = float(getattr(world_model_config, "rul_cap_threshold", 0.999999) or 0.999999)
 
                 use_new = (
                     (rul_traj_weight is not None)
@@ -2238,14 +2241,24 @@ def train_transformer_world_model_v1(
                         rul_loss = F.l1_loss(pred_rul_h, y_rul_h)
                         loss = loss + float(rul_w) * rul_loss
                 else:
+                    # Mask out capped plateau targets (non-informative for dynamics)
+                    mask_cap = (y_rul_h < cap_thr).float()  # (B,H)
+                    cap_frac_sum += float((mask_cap == 0.0).float().mean().detach().cpu())
+                    cap_batches += 1
+
                     w_traj = float(rul_traj_weight) if rul_traj_weight is not None else float(rul_w)
                     if w_traj > 0.0:
+                        err2 = (pred_rul_h - y_rul_h) ** 2
                         if rul_traj_late_ramp:
                             w = torch.linspace(0.2, 1.0, steps=pred_rul_h.size(1), device=pred_rul_h.device)
                             w = w / w.mean()
-                            loss_rul_traj = torch.mean(w[None, :] * (pred_rul_h - y_rul_h) ** 2)
+                            num = (w[None, :] * err2 * mask_cap).sum()
+                            den = (w[None, :] * mask_cap).sum() + 1e-6
+                            loss_rul_traj = num / den
                         else:
-                            loss_rul_traj = torch.mean((pred_rul_h - y_rul_h) ** 2)
+                            num = (err2 * mask_cap).sum()
+                            den = mask_cap.sum() + 1e-6
+                            loss_rul_traj = num / den
                         loss = loss + w_traj * loss_rul_traj
                     else:
                         loss_rul_traj = torch.tensor(0.0, device=pred_rul_h.device)
@@ -2260,11 +2273,11 @@ def train_transformer_world_model_v1(
 
                     # Anti-high-saturation penalty (only where target is below 1-margin)
                     if rul_saturation_weight > 0.0:
-                        mask = (y_rul_h < (1.0 - margin)).float()
-                        loss_sat = torch.mean(mask * torch.relu(pred_rul_h - (1.0 - margin)) ** 2)
+                        mask_sat = (y_rul_h < (1.0 - margin)).float()
+                        loss_sat = torch.mean(mask_sat * torch.relu(pred_rul_h - (1.0 - margin)) ** 2)
                         loss = loss + rul_saturation_weight * loss_sat
                         sat_loss_sum += float(loss_sat.detach().cpu())
-                        sat_mask_frac_sum += float(mask.detach().mean().cpu())
+                        sat_mask_frac_sum += float(mask_sat.detach().mean().cpu())
                         sat_batches += 1
                     else:
                         loss_sat = torch.tensor(0.0, device=pred_rul_h.device)
@@ -2314,11 +2327,15 @@ def train_transformer_world_model_v1(
             )
         else:
             print(f"[WorldModelV1][epoch {epoch+1}] sat_loss_mean=0.000000 sat_mask_frac_mean=0.000000")
+        if cap_batches > 0:
+            print(f"[WorldModelV1][epoch {epoch+1}] rul_cap_frac_train={cap_frac_sum / cap_batches:.6f}")
 
         # Validation
         world_model.eval()
         running_val = 0.0
         n_val_samples = 0
+        cap_frac_val_sum = 0.0
+        cap_val_batches = 0
         with torch.no_grad():
             for X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b in val_loader:
                 X_b = X_b.to(device)
@@ -2392,6 +2409,7 @@ def train_transformer_world_model_v1(
                     rul_mono_future_weight = float(getattr(world_model_config, "rul_mono_future_weight", 0.0) or 0.0)
                     rul_saturation_weight = float(getattr(world_model_config, "rul_saturation_weight", 0.0) or 0.0)
                     margin = float(getattr(world_model_config, "rul_saturation_margin", 0.05) or 0.05)
+                    cap_thr = float(getattr(world_model_config, "rul_cap_threshold", 0.999999) or 0.999999)
 
                     use_new = (
                         (rul_traj_weight is not None)
@@ -2405,14 +2423,24 @@ def train_transformer_world_model_v1(
                             rul_loss = F.l1_loss(pred_rul_h, y_rul_h)
                             loss = loss + float(rul_w) * rul_loss
                     else:
+                        mask_cap = (y_rul_h < cap_thr).float()
+                        cap_frac_val_sum += float((mask_cap == 0.0).float().mean().detach().cpu())
+                        cap_val_batches += 1
+
                         w_traj = float(rul_traj_weight) if rul_traj_weight is not None else float(rul_w)
                         if w_traj > 0.0:
                             if rul_traj_late_ramp:
                                 w = torch.linspace(0.2, 1.0, steps=pred_rul_h.size(1), device=pred_rul_h.device)
                                 w = w / w.mean()
-                                loss_rul_traj = torch.mean(w[None, :] * (pred_rul_h - y_rul_h) ** 2)
+                                err2 = (pred_rul_h - y_rul_h) ** 2
+                                num = (w[None, :] * err2 * mask_cap).sum()
+                                den = (w[None, :] * mask_cap).sum() + 1e-6
+                                loss_rul_traj = num / den
                             else:
-                                loss_rul_traj = torch.mean((pred_rul_h - y_rul_h) ** 2)
+                                err2 = (pred_rul_h - y_rul_h) ** 2
+                                num = (err2 * mask_cap).sum()
+                                den = mask_cap.sum() + 1e-6
+                                loss_rul_traj = num / den
                             loss = loss + w_traj * loss_rul_traj
 
                         if rul_mono_future_weight > 0.0:
@@ -2421,8 +2449,8 @@ def train_transformer_world_model_v1(
                             loss = loss + rul_mono_future_weight * loss_mono_future
 
                         if rul_saturation_weight > 0.0:
-                            mask = (y_rul_h < (1.0 - margin)).float()
-                            loss_sat = torch.mean(mask * torch.relu(pred_rul_h - (1.0 - margin)) ** 2)
+                            mask_sat = (y_rul_h < (1.0 - margin)).float()
+                            loss_sat = torch.mean(mask_sat * torch.relu(pred_rul_h - (1.0 - margin)) ** 2)
                             loss = loss + rul_saturation_weight * loss_sat
 
                 if eol_scalar_loss_weight > 0.0 and pred_eol is not None:
@@ -2433,6 +2461,9 @@ def train_transformer_world_model_v1(
                 n_val_samples += X_b.size(0)
 
         val_loss = running_val / max(1, n_val_samples)
+
+        if cap_val_batches > 0:
+            print(f"[WorldModelV1][epoch {epoch+1}] rul_cap_frac_val={cap_frac_val_sum / cap_val_batches:.6f}")
 
         print(
             f"[WorldModelV1] Epoch {epoch+1}/{num_epochs} - "
@@ -2762,6 +2793,9 @@ def evaluate_transformer_world_model_v1_on_test(
                 tensor_stats("true_rul_seq_norm", y_rul_seq_norm)
                 batch_time_std("true_rul_seq_norm", y_rul_seq_norm)
                 compare_two_samples("true_rul_seq_norm", y_rul_seq_norm, t_steps=10)
+                cap_thr = float(getattr(world_model_config, "rul_cap_threshold", 0.999999) or 0.999999)
+                true_rul_cap_frac_batch = float((y_rul_seq_norm >= cap_thr).float().mean().detach().cpu())
+                print(f"[dbg] true_rul_cap_frac_batch={true_rul_cap_frac_batch:.6f}")
 
                 tensor_stats("pred_rul_seq_norm", pred_rul)
                 batch_time_std("pred_rul_seq_norm", pred_rul)
