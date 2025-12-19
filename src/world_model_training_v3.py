@@ -1576,6 +1576,23 @@ def train_transformer_world_model_v1(
     cond_id_list = built["cond_ids"].tolist()
     unit_ids_np = built["unit_ids"]
 
+    # --------------------------------------------------------------
+    # Train/val split (engine-level) BEFORE fitting X scaler
+    # (so scaler is fit on TRAIN windows only, no leakage)
+    # --------------------------------------------------------------
+    N_all = int(X_train_np.shape[0])
+    unit_ids_t = torch.from_numpy(unit_ids_np.astype(np.int64))
+    uniq = torch.unique(unit_ids_t)
+    gen = torch.Generator().manual_seed(42)
+    perm = uniq[torch.randperm(len(uniq), generator=gen)]
+    n_val_units = max(1, int(0.2 * len(uniq)))
+    val_units = perm[:n_val_units]
+    train_units = perm[n_val_units:]
+    train_mask = torch.isin(unit_ids_t, train_units)
+    val_mask = torch.isin(unit_ids_t, val_units)
+    train_indices = torch.nonzero(train_mask, as_tuple=False).view(-1).cpu().numpy()
+    val_indices = torch.nonzero(val_mask, as_tuple=False).view(-1).cpu().numpy()
+
     # ------------------------------------------------------------------
     # Debug: dataset-level normalization statistics
     # ------------------------------------------------------------------
@@ -1640,40 +1657,53 @@ def train_transformer_world_model_v1(
             if idxs:
                 tensor_stats(f"TRAIN_X_{gname}", X_dbg[:, :, idxs])
         print("==============================================")
-
-        print("[dbg] No X scaler applied – potential mismatch with encoder input scaling.")
     except Exception as e:
         print(f"[dbg] Warning: could not compute feature-group stats: {e}")
 
-    X_train = torch.from_numpy(X_train_np).float()
+    # --------------------------------------------------------------
+    # Fit X scaler on TRAIN windows only, apply to train+val (and persist)
+    # --------------------------------------------------------------
+    try:
+        import os
+        from src.tools.x_scaler import fit_x_scaler, transform_x, save_scaler
+        from src.tools.debug_stats import tensor_stats
+
+        # Fit only on TRAIN split
+        X_tr_np_raw = X_train_np[train_indices]
+        x_scaler = fit_x_scaler(X_tr_np_raw, max_rows=2_000_000, random_state=42)
+        x_scaler_path = os.path.join(str(results_dir), "world_model_v1_x_scaler.pkl")
+        save_scaler(x_scaler_path, x_scaler)
+        print(f"[WorldModelV1] Saved X scaler to {x_scaler_path}")
+
+        # dbg before/after (small subset)
+        tensor_stats("TRAIN_X_before_scaler", X_tr_np_raw[:256])
+        X_tr_np = transform_x(x_scaler, X_tr_np_raw)
+        tensor_stats("TRAIN_X_after_scaler", X_tr_np[:256])
+
+        X_val_np_raw = X_train_np[val_indices]
+        X_val_np = transform_x(x_scaler, X_val_np_raw)
+
+    except Exception as e:
+        print(f"[WorldModelV1] Warning: failed to fit/apply X scaler; proceeding unscaled: {e}")
+        X_tr_np = X_train_np[train_indices]
+        X_val_np = X_train_np[val_indices]
+
+    # Targets + aux stay unscaled; only X is scaled.
     Y_sens_train = torch.from_numpy(Y_sens_np).float()
     Y_rul_train = torch.from_numpy(Y_rul_np).float()
     Y_hi_train = torch.from_numpy(Y_hi_np).float()
     future_cond_train = torch.from_numpy(future_cond_np).float()
     cond_ids = torch.tensor(cond_id_list, dtype=torch.long)
 
-    # Engine-level train/val split (no leakage across engines)
-    N = X_train.shape[0]
-    unit_ids_t = torch.from_numpy(unit_ids_np.astype(np.int64))
-    uniq = torch.unique(unit_ids_t)
-    gen = torch.Generator().manual_seed(42)
-    perm = uniq[torch.randperm(len(uniq), generator=gen)]
-    n_val_units = max(1, int(0.2 * len(uniq)))
-    val_units = perm[:n_val_units]
-    train_units = perm[n_val_units:]
-    train_mask = torch.isin(unit_ids_t, train_units)
-    val_mask = torch.isin(unit_ids_t, val_units)
-    train_indices = torch.nonzero(train_mask, as_tuple=False).view(-1).cpu().numpy()
-    val_indices = torch.nonzero(val_mask, as_tuple=False).view(-1).cpu().numpy()
+    X_tr = torch.from_numpy(X_tr_np).float()
+    X_val = torch.from_numpy(X_val_np).float()
 
-    X_tr = X_train[train_indices]
     Y_sens_tr = Y_sens_train[train_indices]
     Y_rul_tr = Y_rul_train[train_indices]
     Y_hi_tr = Y_hi_train[train_indices]
     future_cond_tr = future_cond_train[train_indices]
     cond_tr = cond_ids[train_indices]
 
-    X_val = X_train[val_indices]
     Y_sens_val = Y_sens_train[val_indices]
     Y_rul_val = Y_rul_train[val_indices]
     Y_hi_val = Y_hi_train[val_indices]
@@ -2323,6 +2353,7 @@ def train_transformer_world_model_v1(
             feature_cols=feature_cols,
             world_model_config=world_model_config,
             device=device,
+            results_dir=results_dir,
         )
     except Exception as exc:
         print(f"  Error while computing test metrics: {exc}")
@@ -2369,6 +2400,7 @@ def evaluate_transformer_world_model_v1_on_test(
     feature_cols: List[str],
     world_model_config: WorldModelTrainingConfig,
     device: torch.device,
+    results_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate TransformerWorldModelV1 on FD004 test set and compute
@@ -2434,6 +2466,26 @@ def evaluate_transformer_world_model_v1_on_test(
     Y_hi_np = np.stack(hi_seq_list, axis=0)  # (N, horizon)
     cond_ids_np = np.array(cond_id_list, dtype=np.int64)  # (N,)
     future_cond_np = np.stack(future_cond_list, axis=0).astype(np.float32)  # (N, horizon, cond_dim_actual)
+
+    # --------------------------------------------------------------
+    # Apply persisted X scaler (preferred: numpy before tensor creation)
+    # --------------------------------------------------------------
+    try:
+        import os
+        from src.tools.x_scaler import load_scaler, transform_x
+        from src.tools.debug_stats import tensor_stats
+
+        if results_dir is None:
+            raise RuntimeError("results_dir is None")
+        x_scaler_path = os.path.join(str(results_dir), "world_model_v1_x_scaler.pkl")
+        x_scaler = load_scaler(x_scaler_path)
+        print(f"[WorldModelV1] Loaded X scaler from {x_scaler_path}")
+
+        tensor_stats("TEST_X_before_scaler", X_np[:256])
+        X_np = transform_x(x_scaler, X_np)
+        tensor_stats("TEST_X_after_scaler", X_np[:256])
+    except Exception as e:
+        print(f"[WorldModelV1] Warning: could not load/apply X scaler for test eval: {e}")
 
     X = torch.from_numpy(X_np).float().to(device)
     Y_hi = torch.from_numpy(Y_hi_np).float().to(device)
