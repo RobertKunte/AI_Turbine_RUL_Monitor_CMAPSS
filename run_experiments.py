@@ -854,6 +854,12 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             world_model_config.encoder_lr_mult = world_model_params.get("encoder_lr_mult", 0.1)
             world_model_config.eol_scalar_loss_weight = world_model_params.get("eol_scalar_loss_weight", 0.0)
             world_model_config.grad_clip_norm = world_model_params.get("grad_clip_norm", None)
+            # WM-V1 RUL stabilization losses (optional)
+            world_model_config.rul_traj_weight = world_model_params.get("rul_traj_weight", None)
+            world_model_config.rul_traj_late_ramp = world_model_params.get("rul_traj_late_ramp", False)
+            world_model_config.rul_mono_future_weight = world_model_params.get("rul_mono_future_weight", 0.0)
+            world_model_config.rul_saturation_weight = world_model_params.get("rul_saturation_weight", 0.0)
+            world_model_config.rul_saturation_margin = world_model_params.get("rul_saturation_margin", 0.05)
 
             # If this is one of the Transformer World Model V1 experiments, route to
             # the dedicated training function; otherwise use the existing
@@ -1838,7 +1844,8 @@ def main():
             summary = run_single_experiment(config, device)
             all_summaries.append(summary)
         except Exception as e:
-            print(f"\n❌ Error running {config['experiment_name']}: {e}")
+            # Avoid unicode symbols here (Windows cp1252 consoles can crash on them)
+            print(f"\nERROR running {config['experiment_name']}: {e}")
             traceback.print_exc()
             # Best-effort: mark the latest running registry entry as failed.
             try:

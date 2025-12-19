@@ -1597,12 +1597,17 @@ def train_transformer_world_model_v1(
     # Debug: dataset-level normalization statistics
     # ------------------------------------------------------------------
     print("=== WorldModelV1 Debug: Dataset stats ===")
+    # IMPORTANT: Avoid full-array std() here (can allocate multiple GB).
+    # Use a small deterministic subset for stats.
+    n_stats = int(min(1024, X_train_np.shape[0]))
+    X_stats = X_train_np[:n_stats]
     print(
-        "X_train_np:  mean {:.3f}, std {:.3f}, min {:.3f}, max {:.3f}".format(
-            float(X_train_np.mean()),
-            float(X_train_np.std()),
-            float(X_train_np.min()),
-            float(X_train_np.max()),
+        "X_train_np(subset):  mean {:.3f}, std {:.3f}, min {:.3f}, max {:.3f} (n={})".format(
+            float(X_stats.mean()),
+            float(X_stats.std()),
+            float(X_stats.min()),
+            float(X_stats.max()),
+            n_stats,
         )
     )
     print(
@@ -2183,10 +2188,70 @@ def train_transformer_world_model_v1(
                 loss = loss + hi_w * hi_loss
 
             # RUL future loss (L1 on cycles)
-            if rul_w > 0.0 and pred_rul is not None:
-                # pred_rul: (B, H, 1), Y_rul_b: (B, H)
-                rul_loss = F.l1_loss(pred_rul.squeeze(-1), Y_rul_b)
-                loss = loss + rul_w * rul_loss
+            # Backwards compatible:
+            # - If new WM-V1 stabilizers are not enabled, keep legacy L1 loss with rul_future_loss_weight.
+            # - If enabled, use full-horizon MSE (+ optional late ramp) and add monotonic + anti-sat penalties.
+            if pred_rul is not None:
+                pred_rul_h = pred_rul.squeeze(-1)  # (B,H)
+                y_rul_h = Y_rul_b
+                if y_rul_h.dim() == 3 and y_rul_h.size(-1) == 1:
+                    y_rul_h = y_rul_h.squeeze(-1)
+
+                rul_traj_weight = getattr(world_model_config, "rul_traj_weight", None)
+                rul_traj_late_ramp = bool(getattr(world_model_config, "rul_traj_late_ramp", False))
+                rul_mono_future_weight = float(getattr(world_model_config, "rul_mono_future_weight", 0.0) or 0.0)
+                rul_saturation_weight = float(getattr(world_model_config, "rul_saturation_weight", 0.0) or 0.0)
+                margin = float(getattr(world_model_config, "rul_saturation_margin", 0.05) or 0.05)
+
+                use_new = (
+                    (rul_traj_weight is not None)
+                    or rul_traj_late_ramp
+                    or (rul_mono_future_weight > 0.0)
+                    or (rul_saturation_weight > 0.0)
+                )
+
+                if not use_new:
+                    if rul_w > 0.0:
+                        rul_loss = F.l1_loss(pred_rul_h, y_rul_h)
+                        loss = loss + float(rul_w) * rul_loss
+                else:
+                    w_traj = float(rul_traj_weight) if rul_traj_weight is not None else float(rul_w)
+                    if w_traj > 0.0:
+                        if rul_traj_late_ramp:
+                            w = torch.linspace(0.2, 1.0, steps=pred_rul_h.size(1), device=pred_rul_h.device)
+                            w = w / w.mean()
+                            loss_rul_traj = torch.mean(w[None, :] * (pred_rul_h - y_rul_h) ** 2)
+                        else:
+                            loss_rul_traj = torch.mean((pred_rul_h - y_rul_h) ** 2)
+                        loss = loss + w_traj * loss_rul_traj
+                    else:
+                        loss_rul_traj = torch.tensor(0.0, device=pred_rul_h.device)
+
+                    # Monotonic decreasing penalty over horizon
+                    if rul_mono_future_weight > 0.0:
+                        delta = pred_rul_h[:, 1:] - pred_rul_h[:, :-1]
+                        loss_mono_future = torch.mean(torch.relu(delta) ** 2)
+                        loss = loss + rul_mono_future_weight * loss_mono_future
+                    else:
+                        loss_mono_future = torch.tensor(0.0, device=pred_rul_h.device)
+
+                    # Anti-high-saturation penalty (only where target is below 1-margin)
+                    if rul_saturation_weight > 0.0:
+                        mask = (y_rul_h < (1.0 - margin)).float()
+                        loss_sat = torch.mean(mask * torch.relu(pred_rul_h - (1.0 - margin)) ** 2)
+                        loss = loss + rul_saturation_weight * loss_sat
+                    else:
+                        loss_sat = torch.tensor(0.0, device=pred_rul_h.device)
+
+                    if epoch == 0 and batch_idx == 0:
+                        print(
+                            "[WorldModelV1][dbg] rul_traj_weighted="
+                            f"{float(loss_rul_traj.detach().cpu()):.6f} "
+                            f"mono_future={float(loss_mono_future.detach().cpu()):.6f} "
+                            f"sat={float(loss_sat.detach().cpu()):.6f} "
+                            f"pred_mean={float(pred_rul_h.mean().detach().cpu()):.4f} "
+                            f"true_mean={float(y_rul_h.mean().detach().cpu()):.4f}"
+                        )
 
             # Optional: supervise the predicted EOL scalar (in [0,1]) against normalized current RUL
             if eol_scalar_loss_weight > 0.0 and pred_eol is not None:
@@ -2273,9 +2338,50 @@ def train_transformer_world_model_v1(
                     hi_loss = F.mse_loss(pred_hi.squeeze(-1), Y_hi_b)
                     loss = loss + hi_w * hi_loss
 
-                if rul_w > 0.0 and pred_rul is not None:
-                    rul_loss = F.l1_loss(pred_rul.squeeze(-1), Y_rul_b)
-                    loss = loss + rul_w * rul_loss
+                if pred_rul is not None:
+                    # Mirror training: use the same new-loss switch logic
+                    pred_rul_h = pred_rul.squeeze(-1)
+                    y_rul_h = Y_rul_b
+                    if y_rul_h.dim() == 3 and y_rul_h.size(-1) == 1:
+                        y_rul_h = y_rul_h.squeeze(-1)
+
+                    rul_traj_weight = getattr(world_model_config, "rul_traj_weight", None)
+                    rul_traj_late_ramp = bool(getattr(world_model_config, "rul_traj_late_ramp", False))
+                    rul_mono_future_weight = float(getattr(world_model_config, "rul_mono_future_weight", 0.0) or 0.0)
+                    rul_saturation_weight = float(getattr(world_model_config, "rul_saturation_weight", 0.0) or 0.0)
+                    margin = float(getattr(world_model_config, "rul_saturation_margin", 0.05) or 0.05)
+
+                    use_new = (
+                        (rul_traj_weight is not None)
+                        or rul_traj_late_ramp
+                        or (rul_mono_future_weight > 0.0)
+                        or (rul_saturation_weight > 0.0)
+                    )
+
+                    if not use_new:
+                        if float(rul_w) > 0.0:
+                            rul_loss = F.l1_loss(pred_rul_h, y_rul_h)
+                            loss = loss + float(rul_w) * rul_loss
+                    else:
+                        w_traj = float(rul_traj_weight) if rul_traj_weight is not None else float(rul_w)
+                        if w_traj > 0.0:
+                            if rul_traj_late_ramp:
+                                w = torch.linspace(0.2, 1.0, steps=pred_rul_h.size(1), device=pred_rul_h.device)
+                                w = w / w.mean()
+                                loss_rul_traj = torch.mean(w[None, :] * (pred_rul_h - y_rul_h) ** 2)
+                            else:
+                                loss_rul_traj = torch.mean((pred_rul_h - y_rul_h) ** 2)
+                            loss = loss + w_traj * loss_rul_traj
+
+                        if rul_mono_future_weight > 0.0:
+                            delta = pred_rul_h[:, 1:] - pred_rul_h[:, :-1]
+                            loss_mono_future = torch.mean(torch.relu(delta) ** 2)
+                            loss = loss + rul_mono_future_weight * loss_mono_future
+
+                        if rul_saturation_weight > 0.0:
+                            mask = (y_rul_h < (1.0 - margin)).float()
+                            loss_sat = torch.mean(mask * torch.relu(pred_rul_h - (1.0 - margin)) ** 2)
+                            loss = loss + rul_saturation_weight * loss_sat
 
                 if eol_scalar_loss_weight > 0.0 and pred_eol is not None:
                     eol_loss = F.mse_loss(pred_eol.view(-1), current_rul_b.view(-1))

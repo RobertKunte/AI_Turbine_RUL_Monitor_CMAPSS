@@ -1091,6 +1091,13 @@ def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_co
     wmp["rul_future_loss_weight"] = 3.0
     wmp["learning_rate"] = 2e-4
     wmp["freeze_encoder_epochs"] = 5
+    # RUL trajectory + monotonic + anti-saturation stabilizers (WM-V1)
+    # Keys must match run_experiments.py wiring.
+    wmp["rul_traj_weight"] = 6.0
+    wmp["rul_traj_late_ramp"] = True
+    wmp["rul_mono_future_weight"] = 1.0
+    wmp["rul_saturation_weight"] = 1.0
+    wmp["rul_saturation_margin"] = 0.05
     return cfg
 
 def get_fd003_transformer_encoder_ms_dt_v1_config() -> ExperimentConfig:

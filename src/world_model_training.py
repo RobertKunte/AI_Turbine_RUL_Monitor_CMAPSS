@@ -218,6 +218,21 @@ class WorldModelTrainingConfig:
     latent_decoder_nhead: int = 4
     eol_scalar_loss_weight: float = 0.0
 
+    # --------------------------------------------------
+    # Transformer World Model V1: RUL trajectory stabilization losses
+    # (default OFF for backwards compatibility)
+    # --------------------------------------------------
+    # If set, use full-horizon MSE trajectory loss with this weight.
+    # If None, legacy behavior uses `rul_future_loss_weight` (L1).
+    rul_traj_weight: Optional[float] = None
+    # If True, apply a late-horizon ramp weight to the MSE loss.
+    rul_traj_late_ramp: bool = False
+    # Penalize increases across the predicted future horizon (monotone decreasing).
+    rul_mono_future_weight: float = 0.0
+    # Penalize saturation near 1.0 when the target is clearly below 1.
+    rul_saturation_weight: float = 0.0
+    rul_saturation_margin: float = 0.05
+
     # Stage-1: additional HI shape losses (default off; enable via experiment config)
     hi_early_slope_weight: float = 0.0
     hi_early_slope_epsilon: float = 1e-3
