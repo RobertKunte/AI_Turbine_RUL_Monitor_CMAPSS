@@ -868,6 +868,8 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 "fd004_transformer_latent_worldmodel_dynamic_freeze_v1",
                 "fd004_transformer_latent_worldmodel_dynamic_delta_v2",
                 "fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659",
+                "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1",
+                "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1",
             ]:
                 print("\n[2] Training Transformer World Model V1 (Transformer encoder + GRU decoder)...")
                 summary = train_transformer_world_model_v1(

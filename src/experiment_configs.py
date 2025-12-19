@@ -1049,6 +1049,50 @@ def get_fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659_confi
 
     return cfg
 
+
+def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_config() -> ExperimentConfig:
+    """
+    Ablation to address mean-collapse: rebalance HI vs RUL losses + lower LR + earlier unfreeze.
+
+    Base: fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659
+    Changes:
+      - hi_future_loss_weight: 2.0 (was 10.0)
+      - rul_future_loss_weight: 3.0 (was 1.0)
+      - learning_rate: 2e-4 (was 5e-4)
+      - freeze_encoder_epochs: 5 (was 10)
+    """
+    cfg = copy.deepcopy(get_fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659_config())
+    cfg["experiment_name"] = "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1"
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["hi_future_loss_weight"] = 2.0
+    wmp["rul_future_loss_weight"] = 3.0
+    wmp["learning_rate"] = 2e-4
+    wmp["freeze_encoder_epochs"] = 5
+    return cfg
+
+
+def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config() -> ExperimentConfig:
+    """
+    Ablation to isolate collapse source: RUL-only (no HI anchor, no HI loss) + lower LR + earlier unfreeze.
+
+    Base: fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659
+    Changes:
+      - use_hi_anchor: False
+      - hi_future_loss_weight: 0.0
+      - rul_future_loss_weight: 3.0
+      - learning_rate: 2e-4
+      - freeze_encoder_epochs: 5
+    """
+    cfg = copy.deepcopy(get_fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659_config())
+    cfg["experiment_name"] = "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1"
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["use_hi_anchor"] = False
+    wmp["hi_future_loss_weight"] = 0.0
+    wmp["rul_future_loss_weight"] = 3.0
+    wmp["learning_rate"] = 2e-4
+    wmp["freeze_encoder_epochs"] = 5
+    return cfg
+
 def get_fd003_transformer_encoder_ms_dt_v1_config() -> ExperimentConfig:
     """
     Multi-Scale + Digital-Twin Transformer-Encoder experiment on FD003.
@@ -3825,6 +3869,10 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_latent_worldmodel_dynamic_delta_v2_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659":
         return get_fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659_config()
+    if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1":
+        return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_config()
+    if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1":
+        return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config()
     # Check for world model phase 5 v3 experiments first
     if "world" in experiment_name and "phase5" in experiment_name and "v3" in experiment_name:
         for dataset in ["FD001", "FD002", "FD003", "FD004"]:
