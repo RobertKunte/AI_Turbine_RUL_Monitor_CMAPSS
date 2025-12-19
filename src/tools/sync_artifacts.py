@@ -85,9 +85,9 @@ def resolve_run_id(
     reg = _resolve_registry(db_path)
     try:
         if run_name:
-            rid = reg.find_latest_run_id_any(experiment_name=run_name, prefer_success=True)
-            if rid is None:
-                rid = reg.find_latest_run_id_any(experiment_name=run_name, prefer_success=False)
+            # Resolve to the most recent registry row matching experiment_name == run_name,
+            # regardless of status (do NOT fall back to "latest overall").
+            rid = reg.find_latest_run_id_any(experiment_name=run_name, prefer_success=False)
             if rid is None:
                 raise RuntimeError(f"Could not resolve run_id for run_name='{run_name}'")
             return rid
@@ -207,8 +207,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("\n=== Artifact Sync Summary ===")
     print(f"Direction:   {direction}")
     print(f"run_id:      {rid}")
+    print(f"status:      {str(rec.get('status') or '')}")
     print(f"dataset:     {dataset}")
     print(f"run_name:    {run_name_resolved}")
+    print(f"artifact_root_local: {artifact_root_local}")
     for label, src, dst, res in results:
         print(f"\n[{label}]")
         print(f"  Source:      {src}")

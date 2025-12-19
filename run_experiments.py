@@ -989,19 +989,101 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
         print(f"World Model Experiment Complete: {experiment_name}")
         print("=" * 80)
 
-        # For classic Universal V3 world models we have full EOL test metrics.
-        # For the new Transformer World Model V1 we currently only track val_loss
-        # and do not compute EOL RUL metrics yet, so 'test_metrics' may be absent.
-        if "test_metrics" in summary:
-            print(f"Test Metrics:")
-            print(f"  RMSE: {summary['test_metrics']['rmse']:.2f} cycles")
-            print(f"  MAE:  {summary['test_metrics']['mae']:.2f} cycles")
-            print(f"  Bias: {summary['test_metrics']['bias']:.2f} cycles")
-            print(f"  R²:   {summary['test_metrics']['r2']:.4f}")
-            print(f"  NASA Mean: {summary['test_metrics']['nasa_mean']:.2f}")
+        def _ensure_legacy_metric_aliases(m: dict) -> dict:
+            """
+            Backward-compat for legacy consumers expecting:
+              rmse/mae/bias/r2 + nasa_mean/nasa_sum
+
+            Prefer LAST metrics when present, otherwise fall back to existing keys,
+            and finally ALL metrics if that is all we have.
+            """
+            if not isinstance(m, dict):
+                return {}
+
+            def _pick(base: str):
+                return (
+                    m.get(f"{base}_last")
+                    if m.get(f"{base}_last") is not None
+                    else (m.get(base) if m.get(base) is not None else m.get(f"{base}_all"))
+                )
+
+            # Prefer LAST for legacy aliases when available
+            if m.get("rmse") is None:
+                v = _pick("rmse")
+                if v is not None:
+                    m["rmse"] = v
+            if m.get("mae") is None:
+                v = _pick("mae")
+                if v is not None:
+                    m["mae"] = v
+            if m.get("bias") is None:
+                v = _pick("bias")
+                if v is not None:
+                    m["bias"] = v
+            if m.get("r2") is None:
+                v = _pick("r2")
+                if v is not None:
+                    m["r2"] = v
+
+            # NASA legacy aliases
+            if m.get("nasa_mean") is None:
+                v = m.get("nasa_last_mean", m.get("nasa_mean", m.get("nasa_all_mean")))
+                if v is not None:
+                    m["nasa_mean"] = v
+            if m.get("nasa_sum") is None:
+                v = m.get("nasa_last_sum", m.get("nasa_sum", m.get("nasa_all_sum")))
+                if v is not None:
+                    m["nasa_sum"] = v
+
+            return m
+
+        # Robust metric printing (must not fail runs)
+        test_metrics = summary.get("test_metrics") if isinstance(summary, dict) else None
+        if isinstance(test_metrics, dict) and test_metrics:
+            test_metrics = _ensure_legacy_metric_aliases(test_metrics)
+            summary["test_metrics"] = test_metrics  # keep canonical dict, with added aliases
+
+            def _fmt(x, digits=2):
+                try:
+                    return f"{float(x):.{digits}f}"
+                except Exception:
+                    return "n/a"
+
+            print("Test Metrics:")
+            # Prefer LAST, show ALL if present, never throw
+            if test_metrics.get("rmse_last") is not None:
+                print(f"  RMSE_LAST: {_fmt(test_metrics.get('rmse_last'), 2)} cycles")
+            if test_metrics.get("rmse_all") is not None:
+                print(f"  RMSE_ALL:  {_fmt(test_metrics.get('rmse_all'), 2)} cycles")
+            if test_metrics.get("rmse") is not None and test_metrics.get("rmse_last") is None:
+                print(f"  RMSE:      {_fmt(test_metrics.get('rmse'), 2)} cycles")
+
+            if test_metrics.get("mae_last") is not None:
+                print(f"  MAE_LAST:  {_fmt(test_metrics.get('mae_last'), 2)} cycles")
+            if test_metrics.get("mae_all") is not None:
+                print(f"  MAE_ALL:   {_fmt(test_metrics.get('mae_all'), 2)} cycles")
+
+            if test_metrics.get("bias_last") is not None:
+                print(f"  Bias_LAST: {_fmt(test_metrics.get('bias_last'), 2)} cycles")
+            if test_metrics.get("bias_all") is not None:
+                print(f"  Bias_ALL:  {_fmt(test_metrics.get('bias_all'), 2)} cycles")
+
+            if test_metrics.get("r2_last") is not None:
+                print(f"  R2_LAST:   {_fmt(test_metrics.get('r2_last'), 4)}")
+            if test_metrics.get("r2_all") is not None:
+                print(f"  R2_ALL:    {_fmt(test_metrics.get('r2_all'), 4)}")
+
+            if test_metrics.get("nasa_last_mean") is not None:
+                print(f"  NASA_LAST_MEAN: {_fmt(test_metrics.get('nasa_last_mean'), 4)}")
+            if test_metrics.get("nasa_last_sum") is not None:
+                print(f"  NASA_LAST_SUM:  {_fmt(test_metrics.get('nasa_last_sum'), 2)}")
+            if test_metrics.get("nasa_all_mean") is not None:
+                print(f"  NASA_ALL_MEAN:  {_fmt(test_metrics.get('nasa_all_mean'), 4)}")
+            if test_metrics.get("nasa_all_sum") is not None:
+                print(f"  NASA_ALL_SUM:   {_fmt(test_metrics.get('nasa_all_sum'), 2)}")
         else:
-            print("Test Metrics: (not computed for Transformer World Model V1 yet)")
-            print(f"  Best val_loss (train_transformer_world_model_v1): {summary.get('val_loss', float('nan')):.4f}")
+            print("Test Metrics: (not computed / not available)")
+            print(f"  Best val_loss: {summary.get('val_loss', float('nan')):.4f}")
         print("=" * 80)
 
         _registry_finish(summary, results_dir=results_dir, summary_path=results_dir / "summary.json")
