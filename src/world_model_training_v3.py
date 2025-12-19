@@ -1618,6 +1618,33 @@ def train_transformer_world_model_v1(
         )
     print("=========================================")
 
+    # --------------------------------------------------------------
+    # [dbg] Feature-group stats + scaler sanity (once per run)
+    # --------------------------------------------------------------
+    try:
+        from src.additional_features import group_feature_columns
+        from src.tools.debug_stats import tensor_stats
+
+        groups = group_feature_columns(feature_cols)
+        group_indices: dict[str, list[int]] = {}
+        for gname, cols in groups.items():
+            idxs = [i for i, c in enumerate(feature_cols) if c in set(cols)]
+            group_indices[gname] = idxs
+
+        print("=== [dbg] TRAIN feature group stats (subset) ===")
+        # Use a small subset to keep this cheap even for large N
+        n_dbg = int(min(512, X_train_np.shape[0]))
+        X_dbg = X_train_np[:n_dbg]
+        tensor_stats("TRAIN_X_all", X_dbg)
+        for gname, idxs in group_indices.items():
+            if idxs:
+                tensor_stats(f"TRAIN_X_{gname}", X_dbg[:, :, idxs])
+        print("==============================================")
+
+        print("[dbg] No X scaler applied – potential mismatch with encoder input scaling.")
+    except Exception as e:
+        print(f"[dbg] Warning: could not compute feature-group stats: {e}")
+
     X_train = torch.from_numpy(X_train_np).float()
     Y_sens_train = torch.from_numpy(Y_sens_np).float()
     Y_rul_train = torch.from_numpy(Y_rul_np).float()
@@ -2363,6 +2390,7 @@ def evaluate_transformer_world_model_v1_on_test(
     hi_seq_list: List[np.ndarray] = []
     true_rul_last_list: List[float] = []
     cond_id_list: List[int] = []
+    future_cond_list: List[np.ndarray] = []
 
     # Ensure we have a RUL column clipped to [0, max_rul]
     if "RUL" not in df_test.columns:
@@ -2375,6 +2403,7 @@ def evaluate_transformer_world_model_v1_on_test(
             continue
 
         cond_id_unit = int(df_unit["ConditionID"].iloc[0])
+        cond_cols = [c for c in feature_cols if c.startswith("Cond_")]
 
         for start in range(0, num_rows - past_len - horizon + 1):
             past = df_unit.iloc[start : start + past_len]
@@ -2391,6 +2420,11 @@ def evaluate_transformer_world_model_v1_on_test(
             hi_seq_list.append(hi_future.astype(np.float32))
 
             cond_id_list.append(cond_id_unit)
+            # Future conditions aligned to horizon (if present; else zeros)
+            if cond_cols:
+                future_cond_list.append(future[cond_cols].to_numpy(dtype=np.float32, copy=True))
+            else:
+                future_cond_list.append(np.zeros((horizon, int(getattr(world_model_config, "cond_dim", 9))), dtype=np.float32))
 
     if not X_list:
         print("[WorldModelV1-Test] No valid test samples could be built.")
@@ -2399,13 +2433,15 @@ def evaluate_transformer_world_model_v1_on_test(
     X_np = np.stack(X_list, axis=0)  # (N, past_len, F)
     Y_hi_np = np.stack(hi_seq_list, axis=0)  # (N, horizon)
     cond_ids_np = np.array(cond_id_list, dtype=np.int64)  # (N,)
+    future_cond_np = np.stack(future_cond_list, axis=0).astype(np.float32)  # (N, horizon, cond_dim_actual)
 
     X = torch.from_numpy(X_np).float().to(device)
     Y_hi = torch.from_numpy(Y_hi_np).float().to(device)
     cond_ids = torch.from_numpy(cond_ids_np).long().to(device)
+    future_cond = torch.from_numpy(future_cond_np).float().to(device)
 
     batch_size = int(getattr(world_model_config, "batch_size", 256))
-    ds = TensorDataset(X, Y_hi, cond_ids)
+    ds = TensorDataset(X, Y_hi, cond_ids, future_cond)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
     all_true_rul_last: List[float] = []
@@ -2415,7 +2451,7 @@ def evaluate_transformer_world_model_v1_on_test(
     cond_dim = getattr(world_model_config, "cond_dim", 9)
 
     with torch.no_grad():
-        for X_b, Y_hi_b, cond_b in loader:
+        for X_b, Y_hi_b, cond_b, future_cond_b in loader:
             B, _, _ = X_b.shape
             cond_vec = torch.zeros(B, cond_dim, device=device)
 
@@ -2431,6 +2467,7 @@ def evaluate_transformer_world_model_v1_on_test(
                 teacher_forcing_targets=None,
                 current_rul=current_rul_b,
                 current_hi=current_hi_b,
+                future_conds=future_cond_b if bool(getattr(world_model_config, "use_future_conds", False)) else None,
             )
             pred_sensors = None
             pred_hi = None
@@ -2466,6 +2503,28 @@ def evaluate_transformer_world_model_v1_on_test(
 
             # Eval sanity logging for first batch
             if idx_offset == 0:
+                from src.tools.debug_stats import tensor_stats, batch_time_std, compare_two_samples
+
+                tensor_stats("TEST_X_b", X_b)
+                tensor_stats("TEST_future_cond_b", future_cond_b)
+
+                tensor_stats("pred_rul_seq_norm", pred_rul)
+                batch_time_std("pred_rul_seq_norm", pred_rul)
+                compare_two_samples("pred_rul_seq_norm", pred_rul, t_steps=5)
+
+                if pred_hi is not None:
+                    tensor_stats("pred_hi_seq_norm", pred_hi)
+                    batch_time_std("pred_hi_seq_norm", pred_hi)
+                    compare_two_samples("pred_hi_seq_norm", pred_hi, t_steps=5)
+
+                if pred_eol is not None:
+                    tensor_stats("pred_eol", pred_eol)
+                    if isinstance(pred_eol, torch.Tensor) and pred_eol.numel() > 1:
+                        print(f"[dbg][pred_eol] std={pred_eol.detach().float().std().item():.8f}")
+
+                print(f"[dbg] pred_rul_seq shape={tuple(pred_rul.shape)}")
+                print(f"[dbg] pred_rul_last shape={tuple(pred_rul_last.shape)}")
+
                 pr = pred_rul.detach()
                 print(
                     "[WorldModelV1-Test][debug] pred_rul_seq (normalized) "
