@@ -1746,6 +1746,10 @@ def train_transformer_world_model_v1(
                 model: nn.Module,
                 allowed_substrings: Optional[list[str]] = None,
             ) -> None:
+                # Conservative backbone loader:
+                # 1) Keep shared_head always (even though it contains "head")
+                # 2) Else, drop obvious task heads / aux modules
+                # 3) Else, keep only known backbone components
                 drop_tokens = [
                     "fc_rul",
                     "fc_health",
@@ -1755,13 +1759,15 @@ def train_transformer_world_model_v1(
                     "damage",
                     "calib",
                     "risk",
-                    "head",
                     "sigma",
                     "quantile",
+                    # Generic "head" is OK as long as we special-case shared_head above.
+                    "head",
                 ]
-                allow = allowed_substrings or [
+                keep_tokens = allowed_substrings or [
                     "input_proj",
                     "pos_encoding",
+                    "pos_emb",
                     "transformer",
                     "attn_pool",
                     "condition_embedding",
@@ -1773,23 +1779,38 @@ def train_transformer_world_model_v1(
                 ]
 
                 selected: dict[str, torch.Tensor] = {}
+                selected_names: list[str] = []
                 skipped_names: list[str] = []
                 for k, v in state_dict.items():
                     ks = str(k)
+
+                    # Special-case: shared_head is part of the representation trunk
+                    if "shared_head" in ks:
+                        selected[k] = v
+                        selected_names.append(ks)
+                        continue
+
                     if any(tok in ks for tok in drop_tokens):
                         skipped_names.append(ks)
                         continue
-                    if any(tok in ks for tok in allow):
+
+                    if any(tok in ks for tok in keep_tokens):
                         selected[k] = v
-                    else:
-                        skipped_names.append(ks)
+                        selected_names.append(ks)
+                        continue
+
+                    skipped_names.append(ks)
 
                 print(
                     f"[WorldModelV1] Encoder ckpt tensors: total={len(state_dict)} | selected(backbone)={len(selected)} | skipped={len(skipped_names)}"
                 )
+                if selected_names:
+                    print("[WorldModelV1] Selected backbone tensors (first 20):")
+                    for name in selected_names[:20]:
+                        print(f"  + {name}")
                 if skipped_names:
-                    print("[WorldModelV1] Skipped tensors (first 10):")
-                    for name in skipped_names[:10]:
+                    print("[WorldModelV1] Skipped tensors (first 20):")
+                    for name in skipped_names[:20]:
                         print(f"  - {name}")
 
                 model.load_state_dict(selected, strict=False)
@@ -1868,32 +1889,46 @@ def train_transformer_world_model_v1(
         latent_decoder_nhead=latent_decoder_nhead,
     ).to(device)
 
-    def _set_encoder_trainability(*, frozen: bool, unfreeze_last_k: int = 0) -> None:
+    def count_trainable_params(module: nn.Module) -> int:
+        return int(sum(p.numel() for p in module.parameters() if p.requires_grad))
+
+    def _freeze_encoder() -> None:
+        for p in world_model.encoder.parameters():
+            p.requires_grad = False
+        world_model.encoder.eval()
+
+    def _partial_unfreeze_encoder(*, unfreeze_last_k: int) -> list[str]:
+        """
+        Unfreeze only:
+        - last K transformer blocks (if discoverable)
+        - shared_head (always, if present)
+        """
         # Freeze everything first
         for p in world_model.encoder.parameters():
-            p.requires_grad = not frozen
-        if frozen:
-            world_model.encoder.eval()
-            return
+            p.requires_grad = False
 
-        # Partial unfreeze: freeze all then unfreeze last K transformer layers if possible
-        if unfreeze_last_k > 0:
-            for p in world_model.encoder.parameters():
-                p.requires_grad = False
-            # Common structure: encoder.transformer.layers is a ModuleList
-            layers = None
-            if hasattr(world_model.encoder, "transformer") and hasattr(world_model.encoder.transformer, "layers"):
-                layers = world_model.encoder.transformer.layers
-            if layers is not None:
-                k = min(int(unfreeze_last_k), len(layers))
-                for layer in list(layers)[-k:]:
-                    for p in layer.parameters():
-                        p.requires_grad = True
-            else:
-                # Fallback: unfreeze whole encoder if we can't identify layers
-                for p in world_model.encoder.parameters():
+        unfrozen_modules: list[str] = []
+
+        # Unfreeze last K transformer layers if possible
+        layers = None
+        if hasattr(world_model.encoder, "transformer") and hasattr(world_model.encoder.transformer, "layers"):
+            layers = world_model.encoder.transformer.layers
+        if layers is not None and unfreeze_last_k > 0:
+            k = min(int(unfreeze_last_k), len(layers))
+            # Mark last k layers trainable
+            for idx, layer in enumerate(list(layers)[-k:], start=len(layers) - k):
+                for p in layer.parameters():
                     p.requires_grad = True
+                unfrozen_modules.append(f"encoder.transformer.layers[{idx}]")
+
+        # Always unfreeze shared_head if present (part of encoder trunk)
+        if hasattr(world_model.encoder, "shared_head") and world_model.encoder.shared_head is not None:
+            for p in world_model.encoder.shared_head.parameters():
+                p.requires_grad = True
+            unfrozen_modules.append("encoder.shared_head")
+
         world_model.encoder.train()
+        return unfrozen_modules
 
     # Stage A: freeze encoder (either explicit freeze_encoder, or for first N epochs)
     if freeze_encoder or freeze_encoder_epochs > 0:
@@ -1901,12 +1936,18 @@ def train_transformer_world_model_v1(
             f"[WorldModelV1] Stage-A encoder freeze enabled (freeze_encoder={freeze_encoder}, "
             f"freeze_encoder_epochs={freeze_encoder_epochs})"
         )
-        _set_encoder_trainability(frozen=True)
+        _freeze_encoder()
     print(
         f"[WorldModelV1] Encoder configuration -> "
         f"checkpoint: {encoder_ckpt_path if encoder_ckpt_path else 'None'}, "
         f"freeze_encoder: {freeze_encoder}, freeze_encoder_epochs: {freeze_encoder_epochs}, "
         f"unfreeze_encoder_layers: {unfreeze_encoder_layers}, encoder_lr_mult: {encoder_lr_mult}"
+    )
+
+    print(
+        f"[WorldModelV1] Trainable params after Stage-A: "
+        f"encoder={count_trainable_params(world_model.encoder):,} "
+        f"total={count_trainable_params(world_model):,}"
     )
 
     def _make_optimizer() -> torch.optim.Optimizer:
@@ -1932,12 +1973,35 @@ def train_transformer_world_model_v1(
     hi_w = world_model_config.__dict__.get("hi_future_loss_weight", 0.0)
     rul_w = world_model_config.__dict__.get("rul_future_loss_weight", 0.0)
 
+    did_stage_b_unfreeze = False
+
     for epoch in range(num_epochs):
-        # Stage B: unfreeze encoder after N epochs (if configured and not permanently frozen)
-        if (not freeze_encoder) and freeze_encoder_epochs > 0 and epoch == freeze_encoder_epochs:
-            print(f"[WorldModelV1] Stage-B unfreeze at epoch {epoch+1}: unfreeze_last_k={unfreeze_encoder_layers}")
-            _set_encoder_trainability(frozen=False, unfreeze_last_k=unfreeze_encoder_layers)
+        # Stage B: unfreeze encoder after N epochs (epoch is 0-based; epoch+1 is human-readable)
+        if (not did_stage_b_unfreeze) and freeze_encoder_epochs > 0 and epoch == freeze_encoder_epochs:
+            unfrozen = _partial_unfreeze_encoder(unfreeze_last_k=unfreeze_encoder_layers)
+            did_stage_b_unfreeze = True
+            print(
+                f"[WorldModelV1] Stage-B unfreeze at epoch {epoch+1} "
+                f"(freeze_encoder_epochs={freeze_encoder_epochs}): "
+                f"unfroze={unfrozen if unfrozen else ['<none detected>']}"
+            )
+            print(
+                f"[WorldModelV1] Trainable params after Stage-B: "
+                f"encoder={count_trainable_params(world_model.encoder):,} "
+                f"total={count_trainable_params(world_model):,}"
+            )
             optimizer = _make_optimizer()
+
+        # Per-epoch sanity log (trainable encoder params + lrs)
+        try:
+            lrs = [float(pg.get("lr", 0.0)) for pg in optimizer.param_groups]
+        except Exception:
+            lrs = []
+        print(
+            f"[WorldModelV1][epoch {epoch+1}/{num_epochs}] "
+            f"trainable_encoder_params={count_trainable_params(world_model.encoder):,} "
+            f"lrs={lrs}"
+        )
 
         world_model.train()
         running_train = 0.0
@@ -2368,10 +2432,30 @@ def evaluate_transformer_world_model_v1_on_test(
                 current_rul=current_rul_b,
                 current_hi=current_hi_b,
             )
-            if isinstance(out, (tuple, list)) and len(out) == 4:
-                pred_sensors, pred_hi, pred_rul, _pred_eol = out
+            pred_sensors = None
+            pred_hi = None
+            pred_rul = None
+            pred_eol = None
+
+            # Robust output mapping:
+            # - tuple/list: (pred_sensors, pred_hi_seq, pred_rul_seq, pred_eol_scalar?)  (current WM-V1)
+            # - dict: keys like pred_rul/pred_hi/pred_eol (future-proof)
+            if isinstance(out, dict):
+                pred_sensors = out.get("pred_sensors", None)
+                pred_hi = out.get("pred_hi", out.get("hi", None))
+                pred_rul = out.get("pred_rul", out.get("rul", None))
+                pred_eol = out.get("pred_eol", out.get("eol", None))
+            elif isinstance(out, (tuple, list)):
+                if len(out) >= 3:
+                    pred_sensors = out[0]
+                    pred_hi = out[1]
+                    pred_rul = out[2]
+                if len(out) >= 4:
+                    pred_eol = out[3]
             else:
-                pred_sensors, pred_hi, pred_rul = out
+                raise RuntimeError(
+                    f"[WorldModelV1-Test] Unexpected model output type: {type(out)}"
+                )
 
             if pred_rul is None:
                 continue
@@ -2379,6 +2463,24 @@ def evaluate_transformer_world_model_v1_on_test(
             # Model predicts normalized RUL; take last horizon step and denormalize
             pred_rul_last_norm = pred_rul[:, -1, 0]  # (B,)
             pred_rul_last = (pred_rul_last_norm * max_rul).cpu().numpy()
+
+            # Eval sanity logging for first batch
+            if idx_offset == 0:
+                pr = pred_rul.detach()
+                print(
+                    "[WorldModelV1-Test][debug] pred_rul_seq (normalized) "
+                    f"min={float(pr.min()):.4f} mean={float(pr.mean()):.4f} max={float(pr.max()):.4f}"
+                )
+                print(
+                    "[WorldModelV1-Test][debug] pred_rul_last (cycles, unclipped) "
+                    f"min={float(pred_rul_last.min()):.2f} mean={float(pred_rul_last.mean()):.2f} max={float(pred_rul_last.max()):.2f}"
+                )
+                if pred_eol is not None:
+                    pe = pred_eol.detach()
+                    print(
+                        "[WorldModelV1-Test][debug] pred_eol (NOT used for RUL metrics) "
+                        f"shape={tuple(pe.shape)} min={float(pe.min()):.4f} mean={float(pe.mean()):.4f} max={float(pe.max()):.4f}"
+                    )
 
             true_rul_last_batch = np.array(true_rul_last_list[idx_offset : idx_offset + B], dtype=np.float32)
             idx_offset += B
@@ -2392,6 +2494,14 @@ def evaluate_transformer_world_model_v1_on_test(
 
     y_true = np.concatenate(all_true_rul_last, axis=0)
     y_pred = np.concatenate(all_pred_rul_last, axis=0)
+
+    # Log unclipped vs clipped stats (clip happens inside evaluate_eol_metrics when clip_y_pred=True)
+    y_pred_clip = np.clip(y_pred, 0.0, float(max_rul))
+    print(
+        "[WorldModelV1-Test][debug] y_pred cycles stats: "
+        f"unclipped(min/mean/max)={float(y_pred.min()):.2f}/{float(y_pred.mean()):.2f}/{float(y_pred.max()):.2f} | "
+        f"clipped(min/mean/max)={float(y_pred_clip.min()):.2f}/{float(y_pred_clip.mean()):.2f}/{float(y_pred_clip.max()):.2f}"
+    )
 
     m = evaluate_eol_metrics(
         y_true=y_true,
