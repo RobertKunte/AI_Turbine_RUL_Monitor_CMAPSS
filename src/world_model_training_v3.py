@@ -1704,6 +1704,64 @@ def train_transformer_world_model_v1(
     train_indices = torch.nonzero(train_mask, as_tuple=False).view(-1).cpu().numpy()
     val_indices = torch.nonzero(val_mask, as_tuple=False).view(-1).cpu().numpy()
 
+    # --------------------------------------------------------------
+    # Informative window sampling (WM-V1 only): keep all informative windows and
+    # only a fraction of non-informative (fully capped) windows.
+    # Default OFF (backwards compatible).
+    # --------------------------------------------------------------
+    informative_stats: Dict[str, Any] = {
+        "informative_sampling_enable": bool(getattr(world_model_config, "informative_sampling_enable", False)),
+        "informative_sampling_mode": str(getattr(world_model_config, "informative_sampling_mode", "future_min_lt_cap")),
+        "informative_eps_norm": float(getattr(world_model_config, "informative_eps_norm", 1e-6) or 1e-6),
+        "keep_prob_noninformative": float(getattr(world_model_config, "keep_prob_noninformative", 0.1) or 0.1),
+    }
+    if bool(getattr(world_model_config, "informative_sampling_enable", False)) and train_indices.size > 0:
+        mode = str(getattr(world_model_config, "informative_sampling_mode", "future_min_lt_cap") or "future_min_lt_cap")
+        eps = float(getattr(world_model_config, "informative_eps_norm", 1e-6) or 1e-6)
+        keep_p = float(getattr(world_model_config, "keep_prob_noninformative", 0.1) or 0.1)
+        keep_p = float(np.clip(keep_p, 0.0, 1.0))
+
+        # Use normalized future RUL targets if available; otherwise normalize from cycles.
+        y_tr = Y_rul_np[train_indices]  # expected (N_tr, H) normalized
+        if y_tr.ndim != 2:
+            y_tr = y_tr.reshape(y_tr.shape[0], -1)
+        is_norm = bool(float(np.max(y_tr)) <= 1.0 + 1e-3)
+        y_tr_norm = np.clip(y_tr, 0.0, 1.0) if is_norm else np.clip(y_tr / float(max_rul if max_rul is not None else 125.0), 0.0, 1.0)
+
+        future_min = y_tr_norm.min(axis=1)  # (N_tr,)
+        if mode == "future_has_zero":
+            is_inf = future_min <= float(eps)
+        else:
+            # "future_min_lt_cap" (default): informative if not fully capped across horizon
+            is_inf = future_min < (1.0 - float(eps))
+        inf_frac = float(is_inf.mean()) if is_inf.size > 0 else 0.0
+
+        rng = np.random.default_rng(42)
+        keep_rand = rng.random(is_inf.shape[0]) < keep_p
+        keep = is_inf | keep_rand
+        kept_frac = float(keep.mean()) if keep.size > 0 else 0.0
+
+        # Update train_indices (val stays unchanged)
+        train_indices = train_indices[keep]
+
+        # Log + stash for summary
+        informative_stats.update(
+            {
+                "train_informative_frac_before": inf_frac,
+                "train_keep_frac": kept_frac,
+                "train_n_before": int(is_inf.shape[0]),
+                "train_n_after": int(train_indices.shape[0]),
+            }
+        )
+        if bool(getattr(world_model_config, "log_informative_stats", True)):
+            all_one_frac = float((future_min >= (1.0 - float(eps))).mean()) if future_min.size > 0 else 0.0
+            print(
+                "[WorldModelV1][infwin] "
+                f"mode={mode} eps_norm={eps:g} keep_p_noninf={keep_p:.3f} "
+                f"train_n={int(is_inf.shape[0])}->{int(train_indices.shape[0])} "
+                f"informative_frac={inf_frac:.6f} all_one_future_frac={all_one_frac:.6f}"
+            )
+
     # ------------------------------------------------------------------
     # Debug: dataset-level normalization statistics
     # ------------------------------------------------------------------
@@ -2229,6 +2287,11 @@ def train_transformer_world_model_v1(
         pred_future_min_count = 0
         pred_future_min_min = None
         pred_future_min_max = None
+        # Informative-window batch diagnostics
+        inf_frac_sum = 0.0
+        inf_batches = 0
+        all_one_frac_sum = 0.0
+        all_one_batches = 0
 
         for batch_idx, (X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b) in enumerate(train_loader):
             X_b = X_b.to(device)
@@ -2393,6 +2456,25 @@ def train_transformer_world_model_v1(
                     tensor_stats("true_rul_seq_norm", y_rul_seq_norm)
                     batch_time_std("true_rul_seq_norm", y_rul_seq_norm)
                     compare_two_samples("true_rul_seq_norm", y_rul_seq_norm, t_steps=10)
+
+                # Informative-window batch stats (cheap): fraction of non-capped horizons in this batch.
+                try:
+                    yb = y_rul_h.detach()
+                    is_norm_b = bool(float(yb.max().cpu()) <= 1.0 + 1e-3)
+                    yb_norm = yb.clamp(0.0, 1.0) if is_norm_b else (yb / max(float(getattr(world_model_config, "max_rul", 125.0)), 1e-6)).clamp(0.0, 1.0)
+                    eps_inf = float(getattr(world_model_config, "informative_eps_norm", 1e-6) or 1e-6)
+                    mode_inf = str(getattr(world_model_config, "informative_sampling_mode", "future_min_lt_cap") or "future_min_lt_cap")
+                    fut_min_b = yb_norm.min(dim=1).values  # (B,)
+                    if mode_inf == "future_has_zero":
+                        is_inf_b = (fut_min_b <= eps_inf)
+                    else:
+                        is_inf_b = (fut_min_b < (1.0 - eps_inf))
+                    inf_frac_sum += float(is_inf_b.float().mean().cpu())
+                    inf_batches += 1
+                    all_one_frac_sum += float((fut_min_b >= (1.0 - eps_inf)).float().mean().cpu())
+                    all_one_batches += 1
+                except Exception:
+                    pass
 
                 rul_traj_weight = getattr(world_model_config, "rul_traj_weight", None)
                 rul_traj_late_ramp = bool(getattr(world_model_config, "rul_traj_late_ramp", False))
@@ -2662,6 +2744,13 @@ def train_transformer_world_model_v1(
                 )
             except Exception:
                 pass
+        if bool(getattr(world_model_config, "log_informative_stats", True)) and inf_batches > 0:
+            # Per-epoch batch composition diagnostics (train)
+            print(
+                f"[WorldModelV1][epoch {epoch+1}] "
+                f"informative_frac_in_batches={inf_frac_sum / inf_batches:.6f} "
+                f"frac_all_one_future_targets={all_one_frac_sum / all_one_batches:.6f}"
+            )
         if late_batches > 0 and (epoch == 0 or ((epoch + 1) % 5 == 0)):
             # Print sparsely (every 5 epochs + epoch 1) to keep logs readable.
             tfm = true_future_min_sum / max(1, true_future_min_count)
@@ -3022,6 +3111,8 @@ def train_transformer_world_model_v1(
         "encoder_checkpoint": encoder_ckpt_path if encoder_ckpt_path else None,
         "freeze_encoder": freeze_encoder,
     }
+    # Include informative sampling config + measured fractions for reproducibility/debugging
+    summary["informative_sampling"] = informative_stats
     if test_metrics:
         summary["test_metrics"] = test_metrics
 

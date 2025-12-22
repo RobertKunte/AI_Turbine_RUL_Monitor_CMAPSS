@@ -1092,6 +1092,27 @@ def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v
     return cfg
 
 
+def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_infwin_config() -> ExperimentConfig:
+    """
+    Quick A/B experiment: informative window sampling to avoid RUL-cap saturation collapse.
+
+    Base: fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1
+    Changes:
+      - informative_sampling_enable: True
+      - informative_sampling_mode: "future_min_lt_cap"
+      - keep_prob_noninformative: 0.1
+    """
+    cfg = copy.deepcopy(get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_config())
+    cfg["experiment_name"] = "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_infwin"
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["informative_sampling_enable"] = True
+    wmp["informative_sampling_mode"] = "future_min_lt_cap"
+    wmp["informative_eps_norm"] = 1e-6
+    wmp["keep_prob_noninformative"] = 0.1
+    wmp["log_informative_stats"] = True
+    return cfg
+
+
 def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config() -> ExperimentConfig:
     """
     Ablation to isolate collapse source: RUL-only (no HI anchor, no HI loss) + lower LR + earlier unfreeze.
@@ -3912,6 +3933,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_latew10":
         return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_latew10_config()
+    if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_infwin":
+        return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_infwin_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1":
         return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config()
     # Check for world model phase 5 v3 experiments first

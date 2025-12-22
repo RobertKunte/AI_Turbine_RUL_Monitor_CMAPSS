@@ -868,6 +868,12 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             world_model_config.late_weight_mode = str(world_model_params.get("late_weight_mode", "future_has_zero"))
             world_model_config.late_weight_eps_norm = float(world_model_params.get("late_weight_eps_norm", 1e-6))
             world_model_config.late_weight_apply_hi = bool(world_model_params.get("late_weight_apply_hi", False))
+            # WM-V1 informative window sampling (optional; default off)
+            world_model_config.informative_sampling_enable = bool(world_model_params.get("informative_sampling_enable", False))
+            world_model_config.informative_sampling_mode = str(world_model_params.get("informative_sampling_mode", "future_min_lt_cap"))
+            world_model_config.informative_eps_norm = float(world_model_params.get("informative_eps_norm", 1e-6))
+            world_model_config.keep_prob_noninformative = float(world_model_params.get("keep_prob_noninformative", 0.1))
+            world_model_config.log_informative_stats = bool(world_model_params.get("log_informative_stats", True))
             # WM-V1 RUL training hardening (optional)
             world_model_config.rul_train_max_cycles = world_model_params.get("rul_train_max_cycles", None)
             world_model_config.rul_r0_only = bool(world_model_params.get("rul_r0_only", False))
@@ -891,6 +897,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 "fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659",
                 "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1",
                 "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_latew10",
+                "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_infwin",
                 "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1",
             ]:
                 print("\n[2] Training Transformer World Model V1 (Transformer encoder + GRU decoder)...")

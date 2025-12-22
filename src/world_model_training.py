@@ -261,6 +261,20 @@ class WorldModelTrainingConfig:
     # Optional: also apply the same per-sample late-weight to HI future loss (default False).
     late_weight_apply_hi: bool = False
 
+    # --------------------------------------------------
+    # Transformer World Model V1: Informative window sampling / filtering
+    # (default OFF for backwards compatibility)
+    # --------------------------------------------------
+    # Motivation: many windows have fully capped future RUL targets (all ones in normalized space),
+    # which encourages a trivial "always healthy" solution. This sampler keeps all informative windows
+    # and only a fraction of non-informative windows.
+    informative_sampling_enable: bool = False
+    informative_sampling_mode: Literal["future_min_lt_cap", "future_has_zero"] = "future_min_lt_cap"
+    informative_eps_norm: float = 1e-6
+    # Probability to keep a non-informative window (mixing). 0.0 => strict filter.
+    keep_prob_noninformative: float = 0.1
+    log_informative_stats: bool = True
+
     # --- WM-V1 RUL training hardening (defaults OFF) ---
     # If set: ignore (mask out) targets with true_rul_cycles >= this.
     rul_train_max_cycles: Optional[float] = None
