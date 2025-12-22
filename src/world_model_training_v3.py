@@ -2211,6 +2211,11 @@ def train_transformer_world_model_v1(
         early_drop_frac_sum = 0.0
         mask_keep_frac_sum = 0.0
         mask_batches = 0
+        # Per-epoch prediction stats (normalized RUL seq); helps diagnose sat_mask_frac_mean==0
+        pred_rul_sum = 0.0
+        pred_rul_count = 0
+        pred_rul_min = None
+        pred_rul_max = None
 
         for batch_idx, (X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b) in enumerate(train_loader):
             X_b = X_b.to(device)
@@ -2326,6 +2331,18 @@ def train_transformer_world_model_v1(
                 y_rul_h = Y_rul_b
                 if y_rul_h.dim() == 3 and y_rul_h.size(-1) == 1:
                     y_rul_h = y_rul_h.squeeze(-1)
+
+                # Aggregate pred stats for the epoch (normalized space)
+                try:
+                    pr = pred_rul_h.detach()
+                    pred_rul_sum += float(pr.mean().cpu())
+                    pred_rul_count += 1
+                    pr_min = float(pr.min().cpu())
+                    pr_max = float(pr.max().cpu())
+                    pred_rul_min = pr_min if pred_rul_min is None else min(pred_rul_min, pr_min)
+                    pred_rul_max = pr_max if pred_rul_max is None else max(pred_rul_max, pr_max)
+                except Exception:
+                    pass
 
                 # [dbg] Print true RUL sequence stats once (same tensor used for loss)
                 if epoch == 0 and batch_idx == 0:
@@ -2516,13 +2533,24 @@ def train_transformer_world_model_v1(
         else:
             print(f"[WorldModelV1][epoch {epoch+1}] sat_loss_mean=0.000000 sat_mask_frac_mean=0.000000")
         if cap_batches > 0:
-            print(f"[WorldModelV1][epoch {epoch+1}] rul_cap_frac_train={cap_frac_sum / cap_batches:.6f}")
+            print(f"[WorldModelV1][epoch {epoch+1}] true_rul_cap_frac_train={cap_frac_sum / cap_batches:.6f}")
         if mask_batches > 0:
             print(
                 f"[WorldModelV1][epoch {epoch+1}] "
                 f"rul_early_drop_frac_train={early_drop_frac_sum / mask_batches:.6f} "
                 f"rul_mask_keep_frac_train={mask_keep_frac_sum / mask_batches:.6f}"
             )
+        if pred_rul_count > 0:
+            pm = pred_rul_sum / max(1, pred_rul_count)
+            try:
+                print(
+                    f"[WorldModelV1][epoch {epoch+1}] pred_rul_seq_norm(mean/min/max)="
+                    f"{pm:.6f}/"
+                    f"{float(pred_rul_min) if pred_rul_min is not None else float('nan'):.6f}/"
+                    f"{float(pred_rul_max) if pred_rul_max is not None else float('nan'):.6f}"
+                )
+            except Exception:
+                pass
 
         # Validation
         world_model.eval()

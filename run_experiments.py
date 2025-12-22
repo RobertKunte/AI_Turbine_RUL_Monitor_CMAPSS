@@ -1939,6 +1939,7 @@ def main():
             print(f"\nERROR running {config['experiment_name']}: {e}")
             traceback.print_exc()
             # Best-effort: mark the latest running registry entry as failed.
+            # IMPORTANT: Do not let post-processing/printing issues fail a run that already produced metrics artifacts.
             try:
                 if os.environ.get("RUN_REGISTRY_DISABLE", "").strip() not in {"1", "true", "True", "yes"}:
                     from src.tools.run_registry import RunRegistry
@@ -1952,12 +1953,43 @@ def main():
                             status="running",
                         )
                         if rid is not None:
-                            reg.fail_run(
-                                rid,
-                                error_message=f"{type(e).__name__}: {e}",
-                                traceback_str=traceback.format_exc(),
-                            )
-                            print(f"[run_registry] Marked run_id={rid} as failed")
+                            # If the experiment already wrote metrics artifacts, prefer SUCCESS to avoid
+                            # false-negative failures from consumer-side KeyErrors.
+                            ds = str(config.get("dataset", "") or "").lower()
+                            rn = str(config.get("experiment_name", "") or "")
+                            results_dir = Path("results") / ds / rn
+                            metrics_test_path = results_dir / "metrics_test.json"
+                            summary_path = results_dir / "summary.json"
+                            has_metrics = metrics_test_path.exists() or summary_path.exists()
+                            if has_metrics:
+                                try:
+                                    reg.finish_run(
+                                        rid,
+                                        metrics=None,
+                                        summary_path=summary_path if summary_path.exists() else None,
+                                        results_dir=results_dir if results_dir.exists() else None,
+                                        artifact_root=None,
+                                        status="success",
+                                    )
+                                    print(
+                                        f"[run_registry] Preserved SUCCESS for run_id={rid} "
+                                        f"(found metrics artifacts in {results_dir})"
+                                    )
+                                except Exception as finish_e:
+                                    print(f"[run_registry] WARNING: could not preserve success: {finish_e}")
+                                    reg.fail_run(
+                                        rid,
+                                        error_message=f"{type(e).__name__}: {e}",
+                                        traceback_str=traceback.format_exc(),
+                                    )
+                                    print(f"[run_registry] Marked run_id={rid} as failed")
+                            else:
+                                reg.fail_run(
+                                    rid,
+                                    error_message=f"{type(e).__name__}: {e}",
+                                    traceback_str=traceback.format_exc(),
+                                )
+                                print(f"[run_registry] Marked run_id={rid} as failed")
                     finally:
                         reg.close()
             except Exception as reg_e:

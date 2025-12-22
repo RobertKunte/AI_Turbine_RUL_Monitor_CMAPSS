@@ -77,6 +77,7 @@ def resolve_run_id(
     db_path: Path,
     run_id: Optional[str],
     run_name: Optional[str],
+    dataset: Optional[str],
     latest: bool,
 ) -> str:
     if run_id:
@@ -87,12 +88,13 @@ def resolve_run_id(
         if run_name:
             # Resolve to the most recent registry row matching experiment_name == run_name,
             # regardless of status (do NOT fall back to "latest overall").
-            rid = reg.find_latest_run_id_any(experiment_name=run_name, prefer_success=False)
+            rid = reg.find_latest_run_id_any(experiment_name=run_name, dataset=dataset, prefer_success=False)
             if rid is None:
-                raise RuntimeError(f"Could not resolve run_id for run_name='{run_name}'")
+                ds = f" dataset='{dataset}'" if dataset else ""
+                raise RuntimeError(f"Could not resolve run_id for run_name='{run_name}'{ds}")
             return rid
         if latest:
-            rid = reg.find_latest_run_id_any(prefer_success=False)
+            rid = reg.find_latest_run_id_any(dataset=dataset, prefer_success=False)
             if rid is None:
                 raise RuntimeError("Could not resolve latest run_id (registry empty?)")
             return rid
@@ -133,6 +135,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--pull", action="store_true", help="Pull Drive -> local")
     parser.add_argument("--run_id", type=str, default=None, help="Explicit run_id")
     parser.add_argument("--run_name", type=str, default=None, help="Resolve run_id via registry by experiment_name")
+    parser.add_argument("--dataset", type=str, default=None, help="Optional dataset filter when resolving by name/latest (e.g. FD004)")
     parser.add_argument("--latest", action="store_true", help="Use latest run in registry")
     # Tolerate older Colab cells that accidentally pass training flags through.
     parser.add_argument("--device", type=str, default=None, help=argparse.SUPPRESS)
@@ -152,7 +155,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise SystemExit("Must specify exactly one of --push or --pull")
 
     db_path = Path(args.db)
-    rid = resolve_run_id(db_path=db_path, run_id=args.run_id, run_name=args.run_name, latest=bool(args.latest))
+    ds = str(args.dataset).strip() if args.dataset is not None else None
+    rid = resolve_run_id(db_path=db_path, run_id=args.run_id, run_name=args.run_name, dataset=ds, latest=bool(args.latest))
+    if args.run_name:
+        dmsg = f" dataset={ds}" if ds else ""
+        print(f"[sync_artifacts] resolved run_name={args.run_name}{dmsg} -> run_id={rid}")
 
     # Registry record: needed for results sync
     from src.tools.run_registry import RunRegistry
