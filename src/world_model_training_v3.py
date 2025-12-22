@@ -2843,6 +2843,53 @@ def train_transformer_world_model_v1(
                 continue
 
             loss.backward()
+
+            # Wiring proof: gradient-flow verification (encoder vs decoder).
+            # Only runs for a tiny number of batches/epochs when enabled.
+            if debug_wiring_enable and epoch < debug_wiring_epochs and batch_idx < debug_wiring_batches:
+                try:
+                    import numpy as _np
+
+                    def _grad_norm(params) -> float:
+                        s = 0.0
+                        for p in params:
+                            if (p is None) or (p.grad is None):
+                                continue
+                            g = p.grad.detach()
+                            if not torch.isfinite(g).all():
+                                continue
+                            s += float((g * g).sum().cpu())
+                        return float(_np.sqrt(max(s, 0.0)))
+
+                    enc_params = [p for p in world_model.encoder.parameters() if p.requires_grad]
+                    dec_params = [
+                        p for n, p in world_model.named_parameters() if (not n.startswith("encoder.")) and p.requires_grad
+                    ]
+                    gn_enc = _grad_norm(enc_params)
+                    gn_dec = _grad_norm(dec_params)
+
+                    gn_inproj = None
+                    if hasattr(world_model.encoder, "input_proj") and getattr(world_model.encoder, "input_proj") is not None:
+                        try:
+                            gn_inproj = _grad_norm(list(world_model.encoder.input_proj.parameters()))
+                        except Exception:
+                            gn_inproj = None
+
+                    wiring_debug.setdefault("epoch0_batch0", {})
+                    wiring_debug["epoch0_batch0"]["grad_norms"] = {
+                        "encoder_grad_norm": float(gn_enc),
+                        "decoder_grad_norm": float(gn_dec),
+                        "input_proj_grad_norm": float(gn_inproj) if gn_inproj is not None else None,
+                        "encoder_trainable_params": int(sum(p.numel() for p in enc_params)),
+                        "decoder_trainable_params": int(sum(p.numel() for p in dec_params)),
+                    }
+                    print(
+                        f"[WorldModelV1][wiring] grad_norms: enc={gn_enc:.6f} dec={gn_dec:.6f}"
+                        + (f" input_proj={float(gn_inproj):.6f}" if gn_inproj is not None else "")
+                    )
+                except Exception as e:
+                    wiring_debug.setdefault("epoch0_batch0", {})
+                    wiring_debug["epoch0_batch0"]["grad_norms_error"] = str(e)
             # Optional: grad clipping for stability (WM-V1 path)
             grad_clip_norm = getattr(world_model_config, "grad_clip_norm", None)
             if grad_clip_norm is not None:

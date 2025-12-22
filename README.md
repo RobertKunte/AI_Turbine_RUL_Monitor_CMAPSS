@@ -113,6 +113,17 @@ python run_experiments.py --experiments fd004_transformer_latent_worldmodel_dyna
 python run_experiments.py --experiments fd004_transformer_latent_worldmodel_dynamic_delta_v2 --device cuda
 ```
 
+## WM‑V1 Wiring Audit (debug targets/weights/gradients)
+
+Run a one-batch end-to-end wiring audit (1 train batch + 1 test batch) for a trained WM‑V1 run:
+
+```bash
+python -m src.analysis.wm_v1_wiring_audit --experiment fd004_wm_v1_infwin_wiringcheck_k0 --dataset FD004 --device cuda
+```
+
+This writes:
+- `results/fd004/<experiment>/wiring_audit_report.json`
+
 ### 0.3 Relation to literature (FD001 perspective)
 
 Recent works on FD001 (EOL RMSE):
