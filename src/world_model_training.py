@@ -275,6 +275,15 @@ class WorldModelTrainingConfig:
     keep_prob_noninformative: float = 0.1
     log_informative_stats: bool = True
 
+    # --------------------------------------------------
+    # WM-V1: "wiring proof" debug instrumentation
+    # (default OFF; prints only a small number of batches/epochs)
+    # --------------------------------------------------
+    debug_wiring_enable: bool = False
+    debug_wiring_batches: int = 1
+    debug_wiring_epochs: int = 1
+    debug_wiring_save_json: bool = True
+
     # --- WM-V1 RUL training hardening (defaults OFF) ---
     # If set: ignore (mask out) targets with true_rul_cycles >= this.
     rul_train_max_cycles: Optional[float] = None
