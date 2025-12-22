@@ -2206,6 +2206,8 @@ def train_transformer_world_model_v1(
         sat_loss_sum = 0.0
         sat_mask_frac_sum = 0.0
         sat_batches = 0
+        sat_below_thr_frac_sum = 0.0
+        sat_below_thr_batches = 0
         cap_frac_sum = 0.0
         cap_batches = 0
         early_drop_frac_sum = 0.0
@@ -2216,6 +2218,17 @@ def train_transformer_world_model_v1(
         pred_rul_count = 0
         pred_rul_min = None
         pred_rul_max = None
+        # Late-window (future hits zero) diagnostics
+        late_frac_sum = 0.0
+        late_batches = 0
+        true_future_min_sum = 0.0
+        true_future_min_count = 0
+        true_future_min_min = None
+        true_future_min_max = None
+        pred_future_min_sum = 0.0
+        pred_future_min_count = 0
+        pred_future_min_min = None
+        pred_future_min_max = None
 
         for batch_idx, (X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b) in enumerate(train_loader):
             X_b = X_b.to(device)
@@ -2319,7 +2332,32 @@ def train_transformer_world_model_v1(
             # HI future loss (piecewise HI targets already built into Y_hi_b)
             if hi_w > 0.0 and pred_hi is not None:
                 # pred_hi: (B, H, 1), Y_hi_b: (B, H)
-                hi_loss = F.mse_loss(pred_hi.squeeze(-1), Y_hi_b)
+                # Optional WM-V1 late-window weighting (per sample) to emphasize late-life degradation.
+                late_weight_enable = bool(getattr(world_model_config, "late_weight_enable", False))
+                late_weight_apply_hi = bool(getattr(world_model_config, "late_weight_apply_hi", False))
+                late_weight_factor = float(getattr(world_model_config, "late_weight_factor", 5.0) or 5.0)
+                late_weight_eps_norm = float(getattr(world_model_config, "late_weight_eps_norm", 1e-6) or 1e-6)
+                max_rul_cycles = float(getattr(world_model_config, "max_rul", 125.0))
+
+                if late_weight_enable and late_weight_apply_hi and late_weight_factor > 1.0:
+                    # Detect normalized targets from RUL horizon (unit-safe).
+                    y_rul_seq = Y_rul_b
+                    if y_rul_seq.dim() == 3 and y_rul_seq.size(-1) == 1:
+                        y_rul_seq = y_rul_seq.squeeze(-1)
+                    is_norm = bool(float(y_rul_seq.detach().max().cpu()) <= 1.0 + 1e-3)
+                    if is_norm:
+                        true_rul_norm = y_rul_seq.clamp(0.0, 1.0)
+                    else:
+                        true_rul_norm = (y_rul_seq / max(max_rul_cycles, 1e-6)).clamp(0.0, 1.0)
+                    fut_min = true_rul_norm.min(dim=1).values  # (B,)
+                    late_mask = (fut_min <= float(late_weight_eps_norm))
+                    w = 1.0 + late_mask.float() * (float(late_weight_factor) - 1.0)  # (B,)
+
+                    hi_err2 = (pred_hi.squeeze(-1) - Y_hi_b) ** 2  # (B,H)
+                    hi_loss_per_sample = hi_err2.mean(dim=1)  # (B,)
+                    hi_loss = (w * hi_loss_per_sample).mean()
+                else:
+                    hi_loss = F.mse_loss(pred_hi.squeeze(-1), Y_hi_b)
                 loss = loss + hi_w * hi_loss
 
             # RUL future loss (L1 on cycles)
@@ -2332,9 +2370,12 @@ def train_transformer_world_model_v1(
                 if y_rul_h.dim() == 3 and y_rul_h.size(-1) == 1:
                     y_rul_h = y_rul_h.squeeze(-1)
 
-                # Aggregate pred stats for the epoch (normalized space)
+                # Aggregate pred stats for the epoch (normalized space; unit-safe)
                 try:
-                    pr = pred_rul_h.detach()
+                    pr_raw = pred_rul_h.detach()
+                    max_rul_cycles = float(getattr(world_model_config, "max_rul", 125.0))
+                    is_norm = bool(float(pr_raw.max().cpu()) <= 1.0 + 1e-3)
+                    pr = pr_raw.clamp(0.0, 1.0) if is_norm else (pr_raw / max(max_rul_cycles, 1e-6)).clamp(0.0, 1.0)
                     pred_rul_sum += float(pr.mean().cpu())
                     pred_rul_count += 1
                     pr_min = float(pr.min().cpu())
@@ -2380,8 +2421,22 @@ def train_transformer_world_model_v1(
                         loss = loss + float(rul_w) * rul_loss
                 else:
                     # Build masks in normalized + cycles space
-                    true_rul_seq_norm = y_rul_h.unsqueeze(-1)  # (B,H,1)
-                    pred_rul_seq_norm = pred_rul_h.unsqueeze(-1)  # (B,H,1)
+                    # Unit-safe normalization:
+                    # - If targets are already normalized (<= ~1): use as-is.
+                    # - Else assume cycles in [0, max_rul] and normalize by max_rul.
+                    true_seq = y_rul_h  # (B,H)
+                    pred_seq = pred_rul_h  # (B,H)
+                    is_norm = bool(float(true_seq.detach().max().cpu()) <= 1.0 + 1e-3)
+                    if is_norm:
+                        true_rul_norm = true_seq.clamp(0.0, 1.0)
+                        pred_rul_norm = pred_seq.clamp(0.0, 1.0)
+                    else:
+                        denom = max(max_rul_cycles, 1e-6)
+                        true_rul_norm = (true_seq / denom).clamp(0.0, 1.0)
+                        pred_rul_norm = (pred_seq / denom).clamp(0.0, 1.0)
+
+                    true_rul_seq_norm = true_rul_norm.unsqueeze(-1)  # (B,H,1)
+                    pred_rul_seq_norm = pred_rul_norm.unsqueeze(-1)  # (B,H,1)
                     true_rul_cycles = true_rul_seq_norm * max(max_rul_cycles, 1e-6)
 
                     cap_mask = (true_rul_seq_norm < cap_thr)  # bool (B,H,1)
@@ -2390,6 +2445,12 @@ def train_transformer_world_model_v1(
                         early_mask = (true_rul_cycles < float(rul_train_max_cycles))
                     mask = cap_mask & early_mask
                     mask_f = mask.float()
+
+                    # Late-window weighting: upweight samples whose FUTURE horizon contains failure (RUL ~ 0).
+                    late_weight_enable = bool(getattr(world_model_config, "late_weight_enable", False))
+                    late_weight_factor = float(getattr(world_model_config, "late_weight_factor", 5.0) or 5.0)
+                    late_weight_mode = str(getattr(world_model_config, "late_weight_mode", "future_has_zero") or "future_has_zero")
+                    late_weight_eps_norm = float(getattr(world_model_config, "late_weight_eps_norm", 1e-6) or 1e-6)
 
                     # Fractions for logging
                     cap_frac = float((~cap_mask).float().mean().detach().cpu())
@@ -2409,6 +2470,38 @@ def train_transformer_world_model_v1(
                     else:
                         w_b = torch.ones(true_rul_seq_norm.size(0), device=true_rul_seq_norm.device, dtype=true_rul_seq_norm.dtype)
 
+                    # Apply late-window weighting per sample (after time reduction).
+                    # We define "future hits zero" using the normalized target horizon.
+                    if late_weight_enable and late_weight_factor > 1.0:
+                        fut_min = true_rul_seq_norm[:, :, 0].min(dim=1).values  # (B,)
+                        if late_weight_mode in {"future_min_below_eps", "future_has_zero"}:
+                            late_mask = (fut_min <= float(late_weight_eps_norm))
+                        else:
+                            late_mask = (fut_min <= float(late_weight_eps_norm))
+                        w_late = 1.0 + late_mask.float() * (float(late_weight_factor) - 1.0)  # (B,)
+                        w_b = w_b * w_late
+
+                        # Epoch diagnostics (train): fraction + true/pred future-min stats
+                        try:
+                            late_frac_sum += float(late_mask.float().mean().detach().cpu())
+                            late_batches += 1
+                            true_min_b = fut_min.detach()
+                            pred_min_b = pred_rul_seq_norm[:, :, 0].min(dim=1).values.detach()
+                            true_future_min_sum += float(true_min_b.mean().cpu())
+                            true_future_min_count += 1
+                            tmn = float(true_min_b.min().cpu())
+                            tmx = float(true_min_b.max().cpu())
+                            true_future_min_min = tmn if true_future_min_min is None else min(true_future_min_min, tmn)
+                            true_future_min_max = tmx if true_future_min_max is None else max(true_future_min_max, tmx)
+                            pred_future_min_sum += float(pred_min_b.mean().cpu())
+                            pred_future_min_count += 1
+                            pmn = float(pred_min_b.min().cpu())
+                            pmx = float(pred_min_b.max().cpu())
+                            pred_future_min_min = pmn if pred_future_min_min is None else min(pred_future_min_min, pmn)
+                            pred_future_min_max = pmx if pred_future_min_max is None else max(pred_future_min_max, pmx)
+                        except Exception:
+                            pass
+
                     # r0-only supervision when linear decay is used
                     if bool(getattr(world_model_config, "rul_linear_decay", False)) and rul_r0_only:
                         points = rul_r0_points
@@ -2420,21 +2513,27 @@ def train_transformer_world_model_v1(
                         mask_sel = mask_f[:, idx, :]             # (B,K,1)
                         w_bk = w_b.view(-1, 1, 1).expand(-1, pred_sel.size(1), -1)
                         diff2 = (pred_sel - true_sel) ** 2
-                        loss_rul_traj = (w_bk * diff2 * mask_sel).sum() / (mask_sel.sum() + 1e-6)
+                        # Per-sample normalized MSE on selected points, then apply per-sample weights.
+                        num_i = (diff2 * mask_sel).sum(dim=(1, 2))  # (B,)
+                        den_i = mask_sel.sum(dim=(1, 2)).clamp_min(1e-6)  # (B,)
+                        loss_i = num_i / den_i  # (B,)
+                        loss_rul_traj = (w_b * loss_i).mean()
                     else:
                         # Full-horizon masked MSE (optionally late-ramped)
                         diff2 = (pred_rul_seq_norm - true_rul_seq_norm) ** 2
-                        w_bt = w_b.view(-1, 1, 1)  # (B,1,1)
                         if rul_traj_late_ramp:
                             w_t = torch.linspace(0.2, 1.0, steps=pred_rul_seq_norm.size(1), device=pred_rul_seq_norm.device)
                             w_t = (w_t / w_t.mean()).view(1, -1, 1)  # (1,H,1)
-                            num = (w_bt * w_t * diff2 * mask_f).sum()
-                            den = (w_t * mask_f).sum() + 1e-6
-                            loss_rul_traj = num / den
+                            wt = (w_t * mask_f)
+                            num_i = (diff2 * wt).sum(dim=(1, 2))  # (B,)
+                            den_i = wt.sum(dim=(1, 2)).clamp_min(1e-6)  # (B,)
+                            loss_i = num_i / den_i
+                            loss_rul_traj = (w_b * loss_i).mean()
                         else:
-                            num = (w_bt * diff2 * mask_f).sum()
-                            den = mask_f.sum() + 1e-6
-                            loss_rul_traj = num / den
+                            num_i = (diff2 * mask_f).sum(dim=(1, 2))  # (B,)
+                            den_i = mask_f.sum(dim=(1, 2)).clamp_min(1e-6)  # (B,)
+                            loss_i = num_i / den_i
+                            loss_rul_traj = (w_b * loss_i).mean()
 
                     w_traj = float(rul_traj_weight) if rul_traj_weight is not None else float(rul_w)
                     if w_traj > 0.0:
@@ -2453,12 +2552,17 @@ def train_transformer_world_model_v1(
 
                     # Anti-high-saturation penalty (only where target is below 1-margin)
                     if rul_saturation_weight > 0.0:
-                        mask_sat = ((true_rul_seq_norm < (1.0 - margin)) & mask).float()  # (B,H,1)
+                        # IMPORTANT: sat-mask is defined in NORMALIZED units (0..1), even if inputs were cycles.
+                        thr_norm = float(1.0 - margin)
+                        mask_sat = ((true_rul_seq_norm < thr_norm) & mask).float()  # (B,H,1)
                         sat_err2 = torch.relu(pred_rul_seq_norm - (1.0 - margin)) ** 2
                         loss_sat = (sat_err2 * mask_sat).sum() / (mask_sat.sum() + 1e-6)
                         loss = loss + rul_saturation_weight * loss_sat
                         sat_loss_sum += float(loss_sat.detach().cpu())
                         sat_mask_frac_sum += float(mask_sat.detach().mean().cpu())
+                        # Debug: how often does the "below threshold" condition even hold?
+                        sat_below_thr_frac_sum += float((true_rul_seq_norm < thr_norm).float().mean().detach().cpu())
+                        sat_below_thr_batches += 1
                         sat_batches += 1
                     else:
                         loss_sat = torch.tensor(0.0, device=pred_rul_h.device)
@@ -2532,6 +2636,13 @@ def train_transformer_world_model_v1(
             )
         else:
             print(f"[WorldModelV1][epoch {epoch+1}] sat_loss_mean=0.000000 sat_mask_frac_mean=0.000000")
+        if sat_below_thr_batches > 0 and (epoch == 0 or ((epoch + 1) % 5 == 0)):
+            thr_norm = float(1.0 - float(getattr(world_model_config, "rul_saturation_margin", 0.05) or 0.05))
+            cap_thr = float(getattr(world_model_config, "rul_cap_threshold", 0.999999) or 0.999999)
+            print(
+                f"[WorldModelV1][epoch {epoch+1}] sat_debug: thr_norm={thr_norm:.6f} cap_thr_norm={cap_thr:.6f} "
+                f"true_below_thr_frac_mean={sat_below_thr_frac_sum / sat_below_thr_batches:.6f}"
+            )
         if cap_batches > 0:
             print(f"[WorldModelV1][epoch {epoch+1}] true_rul_cap_frac_train={cap_frac_sum / cap_batches:.6f}")
         if mask_batches > 0:
@@ -2551,6 +2662,19 @@ def train_transformer_world_model_v1(
                 )
             except Exception:
                 pass
+        if late_batches > 0 and (epoch == 0 or ((epoch + 1) % 5 == 0)):
+            # Print sparsely (every 5 epochs + epoch 1) to keep logs readable.
+            tfm = true_future_min_sum / max(1, true_future_min_count)
+            pfm = pred_future_min_sum / max(1, pred_future_min_count)
+            print(
+                f"[WorldModelV1][epoch {epoch+1}] late_frac_train={late_frac_sum / late_batches:.6f} "
+                f"true_future_min(norm mean/min/max)={tfm:.6f}/"
+                f"{float(true_future_min_min) if true_future_min_min is not None else float('nan'):.6f}/"
+                f"{float(true_future_min_max) if true_future_min_max is not None else float('nan'):.6f} "
+                f"pred_future_min(norm mean/min/max)={pfm:.6f}/"
+                f"{float(pred_future_min_min) if pred_future_min_min is not None else float('nan'):.6f}/"
+                f"{float(pred_future_min_max) if pred_future_min_max is not None else float('nan'):.6f}"
+            )
 
         # Validation
         world_model.eval()
@@ -2655,8 +2779,20 @@ def train_transformer_world_model_v1(
                             rul_loss = F.l1_loss(pred_rul_h, y_rul_h)
                             loss = loss + float(rul_w) * rul_loss
                     else:
-                        true_rul_seq_norm = y_rul_h.unsqueeze(-1)  # (B,H,1)
-                        pred_rul_seq_norm = pred_rul_h.unsqueeze(-1)  # (B,H,1)
+                        # Unit-safe normalization (val): define masks and saturation in normalized space.
+                        true_seq = y_rul_h  # (B,H)
+                        pred_seq = pred_rul_h  # (B,H)
+                        is_norm = bool(float(true_seq.detach().max().cpu()) <= 1.0 + 1e-3)
+                        if is_norm:
+                            true_rul_norm = true_seq.clamp(0.0, 1.0)
+                            pred_rul_norm = pred_seq.clamp(0.0, 1.0)
+                        else:
+                            denom = max(max_rul_cycles, 1e-6)
+                            true_rul_norm = (true_seq / denom).clamp(0.0, 1.0)
+                            pred_rul_norm = (pred_seq / denom).clamp(0.0, 1.0)
+
+                        true_rul_seq_norm = true_rul_norm.unsqueeze(-1)  # (B,H,1)
+                        pred_rul_seq_norm = pred_rul_norm.unsqueeze(-1)  # (B,H,1)
                         true_rul_cycles = true_rul_seq_norm * max(max_rul_cycles, 1e-6)
 
                         cap_mask = (true_rul_seq_norm < cap_thr)
@@ -2679,6 +2815,16 @@ def train_transformer_world_model_v1(
                         else:
                             w_b = torch.ones(true_rul_seq_norm.size(0), device=true_rul_seq_norm.device, dtype=true_rul_seq_norm.dtype)
 
+                        # Late-window weighting (val): keep consistent with train when enabled.
+                        late_weight_enable = bool(getattr(world_model_config, "late_weight_enable", False))
+                        late_weight_factor = float(getattr(world_model_config, "late_weight_factor", 5.0) or 5.0)
+                        late_weight_eps_norm = float(getattr(world_model_config, "late_weight_eps_norm", 1e-6) or 1e-6)
+                        if late_weight_enable and late_weight_factor > 1.0:
+                            fut_min = true_rul_seq_norm[:, :, 0].min(dim=1).values  # (B,)
+                            late_mask = (fut_min <= float(late_weight_eps_norm))
+                            w_late = 1.0 + late_mask.float() * (float(late_weight_factor) - 1.0)
+                            w_b = w_b * w_late
+
                         w_traj = float(rul_traj_weight) if rul_traj_weight is not None else float(rul_w)
                         if w_traj > 0.0:
                             # r0-only supervision when linear decay is used
@@ -2692,20 +2838,25 @@ def train_transformer_world_model_v1(
                                 mask_sel = mask_f[:, idx, :]
                                 w_bk = w_b.view(-1, 1, 1).expand(-1, pred_sel.size(1), -1)
                                 diff2 = (pred_sel - true_sel) ** 2
-                                loss_rul_traj = (w_bk * diff2 * mask_sel).sum() / (mask_sel.sum() + 1e-6)
+                                num_i = (diff2 * mask_sel).sum(dim=(1, 2))
+                                den_i = mask_sel.sum(dim=(1, 2)).clamp_min(1e-6)
+                                loss_i = num_i / den_i
+                                loss_rul_traj = (w_b * loss_i).mean()
                             else:
                                 diff2 = (pred_rul_seq_norm - true_rul_seq_norm) ** 2
-                                w_bt = w_b.view(-1, 1, 1)
                                 if rul_traj_late_ramp:
                                     w_t = torch.linspace(0.2, 1.0, steps=pred_rul_seq_norm.size(1), device=pred_rul_seq_norm.device)
                                     w_t = (w_t / w_t.mean()).view(1, -1, 1)
-                                    num = (w_bt * w_t * diff2 * mask_f).sum()
-                                    den = (w_t * mask_f).sum() + 1e-6
-                                    loss_rul_traj = num / den
+                                    wt = (w_t * mask_f)
+                                    num_i = (diff2 * wt).sum(dim=(1, 2))
+                                    den_i = wt.sum(dim=(1, 2)).clamp_min(1e-6)
+                                    loss_i = num_i / den_i
+                                    loss_rul_traj = (w_b * loss_i).mean()
                                 else:
-                                    num = (w_bt * diff2 * mask_f).sum()
-                                    den = mask_f.sum() + 1e-6
-                                    loss_rul_traj = num / den
+                                    num_i = (diff2 * mask_f).sum(dim=(1, 2))
+                                    den_i = mask_f.sum(dim=(1, 2)).clamp_min(1e-6)
+                                    loss_i = num_i / den_i
+                                    loss_rul_traj = (w_b * loss_i).mean()
                             loss = loss + w_traj * loss_rul_traj
 
                         if rul_mono_future_weight > 0.0:
@@ -2715,7 +2866,8 @@ def train_transformer_world_model_v1(
                             loss = loss + rul_mono_future_weight * loss_mono_future
 
                         if rul_saturation_weight > 0.0:
-                            mask_sat = ((true_rul_seq_norm < (1.0 - margin)) & mask).float()
+                            thr_norm = float(1.0 - margin)
+                            mask_sat = ((true_rul_seq_norm < thr_norm) & mask).float()
                             sat_err2 = torch.relu(pred_rul_seq_norm - (1.0 - margin)) ** 2
                             loss_sat = (sat_err2 * mask_sat).sum() / (mask_sat.sum() + 1e-6)
                             loss = loss + rul_saturation_weight * loss_sat

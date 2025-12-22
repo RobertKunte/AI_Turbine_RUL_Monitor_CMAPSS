@@ -245,6 +245,22 @@ class WorldModelTrainingConfig:
     # If true_rul >= rul_cap_threshold, we treat it as "capped/plateau" and exclude from traj loss.
     rul_cap_threshold: float = 0.999999
 
+    # --------------------------------------------------
+    # Transformer World Model V1: Late-window weighting (anti "always healthy" collapse)
+    # (default OFF for backwards compatibility)
+    # --------------------------------------------------
+    # If enabled: upweight samples whose FUTURE horizon contains failure (RUL ~ 0).
+    # This is applied per-sample after reducing the horizon loss.
+    late_weight_enable: bool = False
+    late_weight_factor: float = 5.0
+    # - "future_has_zero": true if any future step is <= eps (in normalized space)
+    # - "future_min_below_eps": same as above but explicitly uses min over horizon (identical for eps>=0)
+    late_weight_mode: Literal["future_has_zero", "future_min_below_eps"] = "future_has_zero"
+    # Threshold used for normalized detection (RUL in [0,1]).
+    late_weight_eps_norm: float = 1e-6
+    # Optional: also apply the same per-sample late-weight to HI future loss (default False).
+    late_weight_apply_hi: bool = False
+
     # --- WM-V1 RUL training hardening (defaults OFF) ---
     # If set: ignore (mask out) targets with true_rul_cycles >= this.
     rul_train_max_cycles: Optional[float] = None

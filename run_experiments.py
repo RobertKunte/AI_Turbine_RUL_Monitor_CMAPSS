@@ -862,6 +862,12 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             world_model_config.rul_saturation_margin = world_model_params.get("rul_saturation_margin", 0.05)
             world_model_config.rul_linear_decay = bool(world_model_params.get("rul_linear_decay", False))
             world_model_config.rul_cap_threshold = float(world_model_params.get("rul_cap_threshold", 0.999999))
+            # WM-V1 late-window weighting (optional; default off)
+            world_model_config.late_weight_enable = bool(world_model_params.get("late_weight_enable", False))
+            world_model_config.late_weight_factor = float(world_model_params.get("late_weight_factor", 5.0))
+            world_model_config.late_weight_mode = str(world_model_params.get("late_weight_mode", "future_has_zero"))
+            world_model_config.late_weight_eps_norm = float(world_model_params.get("late_weight_eps_norm", 1e-6))
+            world_model_config.late_weight_apply_hi = bool(world_model_params.get("late_weight_apply_hi", False))
             # WM-V1 RUL training hardening (optional)
             world_model_config.rul_train_max_cycles = world_model_params.get("rul_train_max_cycles", None)
             world_model_config.rul_r0_only = bool(world_model_params.get("rul_r0_only", False))
@@ -884,6 +890,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 "fd004_transformer_latent_worldmodel_dynamic_delta_v2",
                 "fd004_transformer_latent_worldmodel_dynamic_v1_from_encoder_v5_659",
                 "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1",
+                "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_latew10",
                 "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1",
             ]:
                 print("\n[2] Training Transformer World Model V1 (Transformer encoder + GRU decoder)...")
