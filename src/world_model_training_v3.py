@@ -3267,6 +3267,11 @@ def train_transformer_world_model_v1(
         n_val_samples = 0
         cap_frac_val_sum = 0.0
         cap_val_batches = 0
+        # Cap/plateau (all-cap future horizon) diagnostics (val)
+        all_cap_frac_val_sum = 0.0
+        all_cap_val_batches = 0
+        cap_weight_mean_val_sum = 0.0
+        cap_weight_val_batches = 0
         early_drop_frac_val_sum = 0.0
         mask_keep_frac_val_sum = 0.0
         mask_val_batches = 0
@@ -3384,6 +3389,25 @@ def train_transformer_world_model_v1(
                         pred_rul_seq_norm = pred_rul_norm.unsqueeze(-1)  # (B,H,1)
                         true_rul_cycles = true_rul_seq_norm * max(max_rul_cycles, 1e-6)
 
+                        # Cap/plateau reweighting (val) – mirror train semantics (default OFF).
+                        cap_rw_enable = bool(getattr(world_model_config, "cap_reweight_enable", False))
+                        cap_rw_eps = float(getattr(world_model_config, "cap_reweight_eps", 1e-6) or 1e-6)
+                        cap_rw_weight = float(getattr(world_model_config, "cap_reweight_weight", 0.05) or 0.05)
+                        cap_rw_apply_to = str(getattr(world_model_config, "cap_reweight_apply_to", "rul") or "rul").lower()
+                        all_cap_mask = (true_rul_seq_norm[:, :, 0].min(dim=1).values >= (1.0 - cap_rw_eps))  # (B,)
+                        w_cap = torch.where(
+                            all_cap_mask,
+                            torch.full_like(all_cap_mask.float(), float(cap_rw_weight)),
+                            torch.ones_like(all_cap_mask.float()),
+                        )  # (B,)
+                        try:
+                            all_cap_frac_val_sum += float(all_cap_mask.float().mean().detach().cpu())
+                            all_cap_val_batches += 1
+                            cap_weight_mean_val_sum += float(w_cap.detach().mean().cpu())
+                            cap_weight_val_batches += 1
+                        except Exception:
+                            pass
+
                         cap_mask = (true_rul_seq_norm < cap_thr)
                         early_mask = torch.ones_like(cap_mask, dtype=torch.bool)
                         if rul_train_max_cycles is not None:
@@ -3430,7 +3454,10 @@ def train_transformer_world_model_v1(
                                 num_i = (diff2 * mask_sel).sum(dim=(1, 2))
                                 den_i = mask_sel.sum(dim=(1, 2)).clamp_min(1e-6)
                                 loss_i = num_i / den_i
-                                loss_rul_traj = (w_b * loss_i).mean()
+                                w_final = w_b
+                                if cap_rw_enable and (cap_rw_apply_to in {"rul", "both"}):
+                                    w_final = w_b * w_cap
+                                loss_rul_traj = (w_final * loss_i).sum() / (w_final.sum() + 1e-6)
                             else:
                                 diff2 = (pred_rul_seq_norm - true_rul_seq_norm) ** 2
                                 if rul_traj_late_ramp:
@@ -3440,12 +3467,18 @@ def train_transformer_world_model_v1(
                                     num_i = (diff2 * wt).sum(dim=(1, 2))
                                     den_i = wt.sum(dim=(1, 2)).clamp_min(1e-6)
                                     loss_i = num_i / den_i
-                                    loss_rul_traj = (w_b * loss_i).mean()
+                                    w_final = w_b
+                                    if cap_rw_enable and (cap_rw_apply_to in {"rul", "both"}):
+                                        w_final = w_b * w_cap
+                                    loss_rul_traj = (w_final * loss_i).sum() / (w_final.sum() + 1e-6)
                                 else:
                                     num_i = (diff2 * mask_f).sum(dim=(1, 2))
                                     den_i = mask_f.sum(dim=(1, 2)).clamp_min(1e-6)
                                     loss_i = num_i / den_i
-                                    loss_rul_traj = (w_b * loss_i).mean()
+                                    w_final = w_b
+                                    if cap_rw_enable and (cap_rw_apply_to in {"rul", "both"}):
+                                        w_final = w_b * w_cap
+                                    loss_rul_traj = (w_final * loss_i).sum() / (w_final.sum() + 1e-6)
                             loss = loss + w_traj * loss_rul_traj
 
                         if rul_mono_future_weight > 0.0:
@@ -3472,6 +3505,12 @@ def train_transformer_world_model_v1(
 
         if cap_val_batches > 0:
             print(f"[WorldModelV1][epoch {epoch+1}] rul_cap_frac_val={cap_frac_val_sum / cap_val_batches:.6f}")
+        if all_cap_val_batches > 0:
+            print(
+                f"[WorldModelV1][epoch {epoch+1}] "
+                f"frac_all_cap_future_val={all_cap_frac_val_sum / all_cap_val_batches:.6f} "
+                f"cap_weight_mean_val={cap_weight_mean_val_sum / max(1, cap_weight_val_batches):.6f}"
+            )
         if mask_val_batches > 0:
             print(
                 f"[WorldModelV1][epoch {epoch+1}] "
