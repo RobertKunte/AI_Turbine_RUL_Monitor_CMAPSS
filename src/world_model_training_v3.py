@@ -2271,6 +2271,27 @@ def train_transformer_world_model_v1(
             )
             optimizer = _make_optimizer()
 
+        # Wiring-probe selection helpers (must be defined regardless of HI/RUL loss presence).
+        def _should_wiring_probe(batch_i: int) -> bool:
+            if not debug_wiring_enable:
+                return False
+            if batch_i >= debug_wiring_batches:
+                return False
+            # Always probe epoch 0, and also probe first Stage-B epoch (after unfreeze).
+            if epoch == 0:
+                return True
+            if stage_b_epoch0 is not None and epoch == stage_b_epoch0:
+                return True
+            # Optional additional probing for early epochs
+            return epoch < debug_wiring_epochs
+
+        def _probe_key(batch_i: int) -> str:
+            # Keep backward-compat for epoch0_batch0
+            if epoch == 0 and batch_i == 0:
+                return "epoch0_batch0"
+            # Human-readable epoch index (epoch is 0-based)
+            return f"epoch{epoch+1}_batch{batch_i}"
+
         # Per-epoch sanity log (trainable encoder params + lrs)
         try:
             lrs = [float(pg.get("lr", 0.0)) for pg in optimizer.param_groups]
@@ -2448,33 +2469,13 @@ def train_transformer_world_model_v1(
                     hi_loss = F.mse_loss(pred_hi.squeeze(-1), Y_hi_b)
                 loss = loss + hi_w * hi_loss
 
-                def _should_wiring_probe(epoch_i: int, batch_i: int) -> bool:
-                    if not debug_wiring_enable:
-                        return False
-                    if batch_i >= debug_wiring_batches:
-                        return False
-                    # Always probe epoch 0, and also probe first Stage-B epoch (after unfreeze).
-                    if epoch_i == 0:
-                        return True
-                    if stage_b_epoch0 is not None and epoch_i == stage_b_epoch0:
-                        return True
-                    # Optional additional probing for early epochs
-                    return epoch_i < debug_wiring_epochs
-
-                def _probe_key(epoch_i: int, batch_i: int) -> str:
-                    # Keep backward-compat for epoch0_batch0
-                    if epoch_i == 0 and batch_i == 0:
-                        return "epoch0_batch0"
-                    # Use human-readable epoch index for the Stage-B probe (e.g. epoch6_batch0 if epoch_i==5).
-                    return f"epoch{epoch_i+1}_batch{batch_i}"
-
                 # Wiring proof (HI): print/record only a tiny summary
-                if _should_wiring_probe(epoch, batch_idx):
+                if _should_wiring_probe(batch_idx):
                     try:
                         pred_hi_seq_norm = pred_hi.squeeze(-1)  # (B,H)
                         true_hi_seq_norm = Y_hi_b               # (B,H)
                         hi_loss_per_sample_dbg = ((pred_hi_seq_norm - true_hi_seq_norm) ** 2).mean(dim=1)
-                        k = _probe_key(epoch, batch_idx)
+                        k = _probe_key(batch_idx)
                         wiring_debug.setdefault(k, {})
                         wiring_debug[k]["hi"] = {
                             "pred_hi_seq_norm_shape": list(pred_hi_seq_norm.shape),
@@ -2502,7 +2503,7 @@ def train_transformer_world_model_v1(
                             f"loss_per_sample_mean={float(hi_loss_per_sample_dbg.detach().mean().cpu()):.6f}"
                         )
                     except Exception as e:
-                        k = _probe_key(epoch, batch_idx)
+                        k = _probe_key(batch_idx)
                         wiring_debug.setdefault(k, {})
                         wiring_debug[k]["hi_error"] = str(e)
 
@@ -2670,7 +2671,7 @@ def train_transformer_world_model_v1(
                     # ----------------------------------------------------------
                     # Wiring proof (RUL): prove masks/weights + loss reductions
                     # ----------------------------------------------------------
-                    if _should_wiring_probe(epoch, batch_idx):
+                    if _should_wiring_probe(batch_idx):
                         try:
                             # This mirrors the loss reduction path:
                             # per-element -> per-sample (masked mean) -> weighted batch mean.
@@ -2706,7 +2707,7 @@ def train_transformer_world_model_v1(
                                     return float("nan")
                                 return float(v[m].mean().detach().cpu())
 
-                            k = _probe_key(epoch, batch_idx)
+                            k = _probe_key(batch_idx)
                             wiring_debug.setdefault(k, {})
                             wiring_debug[k]["rul"] = {
                                 "pred_rul_seq_norm_shape": list(pred_rul_seq_norm.shape),
@@ -2804,7 +2805,7 @@ def train_transformer_world_model_v1(
                                 f"weighted_mean={weighted_mean_dbg:.6f}"
                             )
                         except Exception as e:
-                            k = _probe_key(epoch, batch_idx)
+                            k = _probe_key(batch_idx)
                             wiring_debug.setdefault(k, {})
                             wiring_debug[k]["rul_error"] = str(e)
 
@@ -2923,7 +2924,7 @@ def train_transformer_world_model_v1(
 
             # Wiring proof: gradient-flow verification (encoder vs decoder).
             # Only runs for a tiny number of batches/epochs when enabled.
-            if _should_wiring_probe(epoch, batch_idx):
+            if _should_wiring_probe(batch_idx):
                 try:
                     import numpy as _np
 
@@ -2976,7 +2977,7 @@ def train_transformer_world_model_v1(
                     except Exception:
                         last_layer_mod = None
 
-                    k = _probe_key(epoch, batch_idx)
+                    k = _probe_key(batch_idx)
                     wiring_debug.setdefault(k, {})
                     wiring_debug[k]["grad_norms"] = {
                         "encoder_grad_norm": float(gn_enc),
@@ -2996,7 +2997,7 @@ def train_transformer_world_model_v1(
                         + (f" input_proj={float(gn_inproj):.6f}" if gn_inproj is not None else "")
                     )
                 except Exception as e:
-                    k = _probe_key(epoch, batch_idx)
+                    k = _probe_key(batch_idx)
                     wiring_debug.setdefault(k, {})
                     wiring_debug[k]["grad_norms_error"] = str(e)
             # Optional: grad clipping for stability (WM-V1 path)
