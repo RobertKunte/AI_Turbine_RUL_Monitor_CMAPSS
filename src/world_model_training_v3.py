@@ -2250,11 +2250,14 @@ def train_transformer_world_model_v1(
     rul_w = world_model_config.__dict__.get("rul_future_loss_weight", 0.0)
 
     did_stage_b_unfreeze = False
+    stage_b_epoch0 = int(freeze_encoder_epochs) if int(freeze_encoder_epochs) > 0 else None
+    stage_b_unfrozen_modules: list[str] = []
 
     for epoch in range(num_epochs):
         # Stage B: unfreeze encoder after N epochs (epoch is 0-based; epoch+1 is human-readable)
         if (not did_stage_b_unfreeze) and freeze_encoder_epochs > 0 and epoch == freeze_encoder_epochs:
             unfrozen = _partial_unfreeze_encoder(unfreeze_last_k=unfreeze_encoder_layers)
+            stage_b_unfrozen_modules = list(unfrozen)
             did_stage_b_unfreeze = True
             print(
                 f"[WorldModelV1] Stage-B unfreeze at epoch {epoch+1} "
@@ -2445,14 +2448,35 @@ def train_transformer_world_model_v1(
                     hi_loss = F.mse_loss(pred_hi.squeeze(-1), Y_hi_b)
                 loss = loss + hi_w * hi_loss
 
+                def _should_wiring_probe(epoch_i: int, batch_i: int) -> bool:
+                    if not debug_wiring_enable:
+                        return False
+                    if batch_i >= debug_wiring_batches:
+                        return False
+                    # Always probe epoch 0, and also probe first Stage-B epoch (after unfreeze).
+                    if epoch_i == 0:
+                        return True
+                    if stage_b_epoch0 is not None and epoch_i == stage_b_epoch0:
+                        return True
+                    # Optional additional probing for early epochs
+                    return epoch_i < debug_wiring_epochs
+
+                def _probe_key(epoch_i: int, batch_i: int) -> str:
+                    # Keep backward-compat for epoch0_batch0
+                    if epoch_i == 0 and batch_i == 0:
+                        return "epoch0_batch0"
+                    # Use human-readable epoch index for the Stage-B probe (e.g. epoch6_batch0 if epoch_i==5).
+                    return f"epoch{epoch_i+1}_batch{batch_i}"
+
                 # Wiring proof (HI): print/record only a tiny summary
-                if debug_wiring_enable and epoch < debug_wiring_epochs and batch_idx < debug_wiring_batches:
+                if _should_wiring_probe(epoch, batch_idx):
                     try:
                         pred_hi_seq_norm = pred_hi.squeeze(-1)  # (B,H)
                         true_hi_seq_norm = Y_hi_b               # (B,H)
                         hi_loss_per_sample_dbg = ((pred_hi_seq_norm - true_hi_seq_norm) ** 2).mean(dim=1)
-                        wiring_debug.setdefault("epoch0_batch0", {})
-                        wiring_debug["epoch0_batch0"]["hi"] = {
+                        k = _probe_key(epoch, batch_idx)
+                        wiring_debug.setdefault(k, {})
+                        wiring_debug[k]["hi"] = {
                             "pred_hi_seq_norm_shape": list(pred_hi_seq_norm.shape),
                             "true_hi_seq_norm_shape": list(true_hi_seq_norm.shape),
                             "pred_hi_requires_grad": bool(pred_hi_seq_norm.requires_grad),
@@ -2478,8 +2502,9 @@ def train_transformer_world_model_v1(
                             f"loss_per_sample_mean={float(hi_loss_per_sample_dbg.detach().mean().cpu()):.6f}"
                         )
                     except Exception as e:
-                        wiring_debug.setdefault("epoch0_batch0", {})
-                        wiring_debug["epoch0_batch0"]["hi_error"] = str(e)
+                        k = _probe_key(epoch, batch_idx)
+                        wiring_debug.setdefault(k, {})
+                        wiring_debug[k]["hi_error"] = str(e)
 
             # RUL future loss (L1 on cycles)
             # Backwards compatible:
@@ -2645,7 +2670,7 @@ def train_transformer_world_model_v1(
                     # ----------------------------------------------------------
                     # Wiring proof (RUL): prove masks/weights + loss reductions
                     # ----------------------------------------------------------
-                    if debug_wiring_enable and epoch < debug_wiring_epochs and batch_idx < debug_wiring_batches:
+                    if _should_wiring_probe(epoch, batch_idx):
                         try:
                             # This mirrors the loss reduction path:
                             # per-element -> per-sample (masked mean) -> weighted batch mean.
@@ -2681,24 +2706,36 @@ def train_transformer_world_model_v1(
                                     return float("nan")
                                 return float(v[m].mean().detach().cpu())
 
-                            wiring_debug.setdefault("epoch0_batch0", {})
-                            wiring_debug["epoch0_batch0"]["rul"] = {
+                            k = _probe_key(epoch, batch_idx)
+                            wiring_debug.setdefault(k, {})
+                            wiring_debug[k]["rul"] = {
                                 "pred_rul_seq_norm_shape": list(pred_rul_seq_norm.shape),
                                 "true_rul_seq_norm_shape": list(true_rul_seq_norm.shape),
                                 "pred_rul_requires_grad": bool(pred_rul_seq_norm.requires_grad),
+                                "pred_rul_min_mean_max": [
+                                    float(pred_rul_seq_norm.detach().min().cpu()),
+                                    float(pred_rul_seq_norm.detach().mean().cpu()),
+                                    float(pred_rul_seq_norm.detach().max().cpu()),
+                                ],
+                                "true_rul_min_mean_max": [
+                                    float(true_rul_seq_norm.detach().min().cpu()),
+                                    float(true_rul_seq_norm.detach().mean().cpu()),
+                                    float(true_rul_seq_norm.detach().max().cpu()),
+                                ],
                                 "mask_keep_frac": float(mask_f.detach().mean().cpu()),
                                 "w_b_min_mean_max": [
                                     float(w_b.detach().min().cpu()),
                                     float(w_b.detach().mean().cpu()),
                                     float(w_b.detach().max().cpu()),
                                 ],
+                                "w_first16": [float(x) for x in w_b.detach().cpu().view(-1)[:16].numpy().astype(float).tolist()],
                                 "late_weight_enable": bool(late_weight_enable),
                                 "late_weight_factor": float(late_weight_factor),
                                 "late_weight_eps_norm": float(late_weight_eps_norm),
                                 "late_mask_frac": float(late_frac_dbg),
                                 "frac_informative_batch": float(is_inf_b.float().mean().detach().cpu()),
                                 "frac_all_one_future_batch": float(all_one_b.float().mean().detach().cpu()),
-                                "loss_i_unweighted_mean": float(loss_i_dbg.detach().mean().cpu()),
+                                "rul_loss_per_sample_mean": float(loss_i_dbg.detach().mean().cpu()),
                                 "loss_i_mean_informative": _masked_mean(loss_i_dbg, is_inf_b),
                                 "loss_i_mean_noninformative": _masked_mean(loss_i_dbg, ~is_inf_b),
                                 "weighted_mean_debug": weighted_mean_dbg,
@@ -2709,8 +2746,47 @@ def train_transformer_world_model_v1(
                                 "pred_seq_s1_first10": pred_rul_seq_norm[1, :10, 0].detach().cpu().numpy().astype(float).tolist() if pred_rul_seq_norm.size(0) > 1 else None,
                             }
 
+                            # Masks/weights section (computed from SAME tensors used for weighting)
+                            wiring_debug[k]["masks_weights"] = {
+                                "informative_sampling": {
+                                    "informative_sampling_enable": bool(getattr(world_model_config, "informative_sampling_enable", False)),
+                                    "informative_sampling_mode": str(getattr(world_model_config, "informative_sampling_mode", "future_min_lt_cap")),
+                                    "keep_prob_noninformative": float(getattr(world_model_config, "keep_prob_noninformative", 0.1) or 0.1),
+                                    "informative_mask_frac_in_batch": float(is_inf_b.float().mean().detach().cpu()),
+                                    "frac_all_one_future_targets_in_batch": float(all_one_b.float().mean().detach().cpu()),
+                                },
+                                "late_weighting": {
+                                    "late_weight_enable": bool(late_weight_enable),
+                                    "late_weight_mode": str(getattr(world_model_config, "late_weight_mode", "future_has_zero") or "future_has_zero"),
+                                    "late_weight_factor": float(late_weight_factor),
+                                    "late_weight_mask_frac_in_batch": float(late_frac_dbg),
+                                },
+                                "final_sample_weights": {
+                                    "min_weight": float(w_b.detach().min().cpu()),
+                                    "mean_weight": float(w_b.detach().mean().cpu()),
+                                    "max_weight": float(w_b.detach().max().cpu()),
+                                    "first_16_weights": [float(x) for x in w_b.detach().cpu().view(-1)[:16].numpy().astype(float).tolist()],
+                                },
+                            }
+
+                            # EOL scalar head proof (if present / used)
+                            if pred_eol is not None:
+                                try:
+                                    pe = pred_eol.view(-1)
+                                    wiring_debug[k]["eol"] = {
+                                        "pred_eol_shape": list(pred_eol.shape),
+                                        "pred_eol_requires_grad": bool(pe.requires_grad),
+                                        "pred_eol_min_mean_max": [
+                                            float(pe.detach().min().cpu()),
+                                            float(pe.detach().mean().cpu()),
+                                            float(pe.detach().max().cpu()),
+                                        ],
+                                    }
+                                except Exception:
+                                    pass
+
                             # Assertions (record-only; do not crash)
-                            wiring_debug["epoch0_batch0"]["asserts"] = {
+                            wiring_debug[k]["asserts"] = {
                                 "pred_rul_requires_grad": bool(pred_rul_seq_norm.requires_grad),
                                 "loss_i_finite": bool(torch.isfinite(loss_i_dbg).all().item()),
                                 "loss_i_nonzero_mean": bool(float(loss_i_dbg.detach().mean().cpu()) > 0.0),
@@ -2728,8 +2804,9 @@ def train_transformer_world_model_v1(
                                 f"weighted_mean={weighted_mean_dbg:.6f}"
                             )
                         except Exception as e:
-                            wiring_debug.setdefault("epoch0_batch0", {})
-                            wiring_debug["epoch0_batch0"]["rul_error"] = str(e)
+                            k = _probe_key(epoch, batch_idx)
+                            wiring_debug.setdefault(k, {})
+                            wiring_debug[k]["rul_error"] = str(e)
 
                     # r0-only supervision when linear decay is used
                     if bool(getattr(world_model_config, "rul_linear_decay", False)) and rul_r0_only:
@@ -2846,7 +2923,7 @@ def train_transformer_world_model_v1(
 
             # Wiring proof: gradient-flow verification (encoder vs decoder).
             # Only runs for a tiny number of batches/epochs when enabled.
-            if debug_wiring_enable and epoch < debug_wiring_epochs and batch_idx < debug_wiring_batches:
+            if _should_wiring_probe(epoch, batch_idx):
                 try:
                     import numpy as _np
 
@@ -2875,11 +2952,42 @@ def train_transformer_world_model_v1(
                         except Exception:
                             gn_inproj = None
 
-                    wiring_debug.setdefault("epoch0_batch0", {})
-                    wiring_debug["epoch0_batch0"]["grad_norms"] = {
+                    def _module_grad_norm(m) -> float:
+                        if m is None:
+                            return 0.0
+                        ps = [p for p in m.parameters() if p.requires_grad]
+                        if not ps:
+                            return 0.0
+                        return _grad_norm(ps)
+
+                    # Heads (best-effort; different paths use different modules)
+                    hi_head_mod = getattr(world_model, "hi_head_latent", None) or getattr(world_model, "hi_head", None)
+                    rul_head_mod = getattr(world_model, "rul_head_latent", None) or getattr(world_model, "rul_head", None)
+                    eol_head_mod = getattr(world_model, "eol_scalar_head", None)
+
+                    # Encoder trunk parts
+                    shared_head_mod = getattr(world_model.encoder, "shared_head", None) if hasattr(world_model.encoder, "shared_head") else None
+                    last_layer_mod = None
+                    try:
+                        if hasattr(world_model.encoder, "transformer") and hasattr(world_model.encoder.transformer, "layers"):
+                            layers = world_model.encoder.transformer.layers
+                            if layers is not None and len(layers) > 0:
+                                last_layer_mod = list(layers)[-1]
+                    except Exception:
+                        last_layer_mod = None
+
+                    k = _probe_key(epoch, batch_idx)
+                    wiring_debug.setdefault(k, {})
+                    wiring_debug[k]["grad_norms"] = {
                         "encoder_grad_norm": float(gn_enc),
                         "decoder_grad_norm": float(gn_dec),
                         "input_proj_grad_norm": float(gn_inproj) if gn_inproj is not None else None,
+                        "hi_head_grad_norm": float(_module_grad_norm(hi_head_mod)),
+                        "rul_head_grad_norm": float(_module_grad_norm(rul_head_mod)),
+                        "eol_head_grad_norm": float(_module_grad_norm(eol_head_mod)),
+                        "encoder_shared_head_grad_norm": float(_module_grad_norm(shared_head_mod)),
+                        "encoder_last_block_grad_norm": float(_module_grad_norm(last_layer_mod)),
+                        "stage_b_unfrozen_modules": list(stage_b_unfrozen_modules),
                         "encoder_trainable_params": int(sum(p.numel() for p in enc_params)),
                         "decoder_trainable_params": int(sum(p.numel() for p in dec_params)),
                     }
@@ -2888,8 +2996,9 @@ def train_transformer_world_model_v1(
                         + (f" input_proj={float(gn_inproj):.6f}" if gn_inproj is not None else "")
                     )
                 except Exception as e:
-                    wiring_debug.setdefault("epoch0_batch0", {})
-                    wiring_debug["epoch0_batch0"]["grad_norms_error"] = str(e)
+                    k = _probe_key(epoch, batch_idx)
+                    wiring_debug.setdefault(k, {})
+                    wiring_debug[k]["grad_norms_error"] = str(e)
             # Optional: grad clipping for stability (WM-V1 path)
             grad_clip_norm = getattr(world_model_config, "grad_clip_norm", None)
             if grad_clip_norm is not None:
