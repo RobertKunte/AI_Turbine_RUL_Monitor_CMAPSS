@@ -1686,6 +1686,7 @@ def train_transformer_world_model_v1(
 
     cond_id_list = built["cond_ids"].tolist()
     unit_ids_np = built["unit_ids"]
+    t_end_pos_np = built.get("t_end_pos")
 
     # --------------------------------------------------------------
     # Train/val split (engine-level) BEFORE fitting X scaler
@@ -1929,12 +1930,29 @@ def train_transformer_world_model_v1(
     Y_hi_val = Y_hi_train[val_indices]
     cond_val = cond_ids[val_indices]
 
-    train_ds = torch.utils.data.TensorDataset(
-        X_tr, Y_sens_tr, Y_rul_tr, Y_hi_tr, cond_tr, future_cond_tr
-    )
-    val_ds = torch.utils.data.TensorDataset(
-        X_val, Y_sens_val, Y_rul_val, Y_hi_val, cond_val, future_cond_val
-    )
+    # Optional: include per-sample metadata for wiring audits (unit_id and window end position).
+    # Kept behind debug_wiring_enable so normal training data shape stays unchanged.
+    debug_wiring_enable = bool(getattr(world_model_config, "debug_wiring_enable", False))
+    if debug_wiring_enable and (t_end_pos_np is not None):
+        unit_ids_t_all = torch.from_numpy(unit_ids_np.astype(np.int64))
+        t_end_pos_t_all = torch.from_numpy(np.asarray(t_end_pos_np, dtype=np.int64))
+        unit_ids_tr = unit_ids_t_all[train_indices]
+        t_end_tr = t_end_pos_t_all[train_indices]
+        unit_ids_val = unit_ids_t_all[val_indices]
+        t_end_val = t_end_pos_t_all[val_indices]
+        train_ds = torch.utils.data.TensorDataset(
+            X_tr, Y_sens_tr, Y_rul_tr, Y_hi_tr, cond_tr, future_cond_tr, unit_ids_tr, t_end_tr
+        )
+        val_ds = torch.utils.data.TensorDataset(
+            X_val, Y_sens_val, Y_rul_val, Y_hi_val, cond_val, future_cond_val, unit_ids_val, t_end_val
+        )
+    else:
+        train_ds = torch.utils.data.TensorDataset(
+            X_tr, Y_sens_tr, Y_rul_tr, Y_hi_tr, cond_tr, future_cond_tr
+        )
+        val_ds = torch.utils.data.TensorDataset(
+            X_val, Y_sens_val, Y_rul_val, Y_hi_val, cond_val, future_cond_val
+        )
 
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, drop_last=False
@@ -2339,13 +2357,24 @@ def train_transformer_world_model_v1(
         all_one_frac_sum = 0.0
         all_one_batches = 0
 
-        for batch_idx, (X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b) in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_loader):
+            # Backwards-compatible unpacking (optionally includes unit_id and t_end_pos for audits)
+            unit_ids_b = None
+            t_end_b = None
+            if isinstance(batch, (tuple, list)) and len(batch) == 8:
+                X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b, unit_ids_b, t_end_b = batch
+            else:
+                X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b = batch
             X_b = X_b.to(device)
             Y_sens_b = Y_sens_b.to(device)
             Y_rul_b = Y_rul_b.to(device)
             Y_hi_b = Y_hi_b.to(device)
             cond_b = cond_b.to(device)
             future_cond_b = future_cond_b.to(device)
+            if unit_ids_b is not None:
+                unit_ids_b = unit_ids_b.to(device)
+            if t_end_b is not None:
+                t_end_b = t_end_b.to(device)
 
             if epoch == 0 and batch_idx == 0:
                 print("=== WorldModelV1 Debug: First batch stats ===")
@@ -2493,6 +2522,17 @@ def train_transformer_world_model_v1(
                             ],
                             "hi_loss_per_sample_mean": float(hi_loss_per_sample_dbg.detach().mean().cpu()),
                         }
+                        # Sample-index proof (if metadata is present)
+                        if unit_ids_b is not None and t_end_b is not None:
+                            ws = (t_end_b - int(past_len) + 1).detach().cpu().numpy().astype(int).tolist()
+                            wiring_debug[k].setdefault("sample_indices", {})
+                            wiring_debug[k]["sample_indices"].update(
+                                {
+                                    "unit_ids_first16": unit_ids_b.detach().cpu().numpy().astype(int).tolist()[:16],
+                                    "t_end_pos_first16": t_end_b.detach().cpu().numpy().astype(int).tolist()[:16],
+                                    "window_start_first16": ws[:16],
+                                }
+                            )
                         # Human-readable console log (small)
                         print(
                             f"[WorldModelV1][wiring] hi: pred_requires_grad={bool(pred_hi_seq_norm.requires_grad)} "
@@ -2746,6 +2786,55 @@ def train_transformer_world_model_v1(
                                 "true_seq_s1_first10": true_rul_seq_norm[1, :10, 0].detach().cpu().numpy().astype(float).tolist() if true_rul_seq_norm.size(0) > 1 else None,
                                 "pred_seq_s1_first10": pred_rul_seq_norm[1, :10, 0].detach().cpu().numpy().astype(float).tolist() if pred_rul_seq_norm.size(0) > 1 else None,
                             }
+
+                            # Additional target/index proof: last step stats (normalized + cycles)
+                            max_rul_cycles_dbg = float(getattr(world_model_config, "max_rul", 125.0))
+                            true_last = true_rul_seq_norm[:, -1, 0]
+                            pred_last = pred_rul_seq_norm[:, -1, 0]
+                            wiring_debug[k]["rul"].update(
+                                {
+                                    "true_rul_last_norm_min_mean_max": [
+                                        float(true_last.detach().min().cpu()),
+                                        float(true_last.detach().mean().cpu()),
+                                        float(true_last.detach().max().cpu()),
+                                    ],
+                                    "pred_rul_last_norm_min_mean_max": [
+                                        float(pred_last.detach().min().cpu()),
+                                        float(pred_last.detach().mean().cpu()),
+                                        float(pred_last.detach().max().cpu()),
+                                    ],
+                                    "true_rul_last_cycles_min_mean_max": [
+                                        float((true_last * max_rul_cycles_dbg).detach().min().cpu()),
+                                        float((true_last * max_rul_cycles_dbg).detach().mean().cpu()),
+                                        float((true_last * max_rul_cycles_dbg).detach().max().cpu()),
+                                    ],
+                                    "pred_rul_last_cycles_min_mean_max": [
+                                        float((pred_last * max_rul_cycles_dbg).detach().min().cpu()),
+                                        float((pred_last * max_rul_cycles_dbg).detach().mean().cpu()),
+                                        float((pred_last * max_rul_cycles_dbg).detach().max().cpu()),
+                                    ],
+                                }
+                            )
+
+                            # Assertions: informative mask definition sanity
+                            # all_one => NOT informative (for future_min_lt_cap mode)
+                            if mode_inf != "future_has_zero":
+                                mismatch_inf = int((all_one_b & is_inf_b).sum().item())
+                            else:
+                                mismatch_inf = 0
+                            # late_weight_mode=future_has_zero equivalence: True iff any timepoint <= eps
+                            late_mode = str(getattr(world_model_config, "late_weight_mode", "future_has_zero") or "future_has_zero")
+                            eps_lw = float(late_weight_eps_norm)
+                            has_zero_any = (true_rul_seq_norm[:, :, 0] <= eps_lw).any(dim=1)
+                            late_mask_cmp = has_zero_any if late_mode == "future_has_zero" else (true_rul_seq_norm[:, :, 0].min(dim=1).values <= eps_lw)
+                            late_mask_used = has_zero_any if late_mask_dbg is None else late_mask_dbg
+                            mismatch_late = float((late_mask_cmp != late_mask_used).float().mean().detach().cpu())
+                            wiring_debug[k]["rul"].update(
+                                {
+                                    "assert_all_one_implies_not_informative_mismatch_count": mismatch_inf,
+                                    "assert_late_mask_equivalence_mismatch_frac": float(mismatch_late),
+                                }
+                            )
 
                             # Masks/weights section (computed from SAME tensors used for weighting)
                             wiring_debug[k]["masks_weights"] = {
@@ -3079,7 +3168,11 @@ def train_transformer_world_model_v1(
         mask_keep_frac_val_sum = 0.0
         mask_val_batches = 0
         with torch.no_grad():
-            for X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b in val_loader:
+            for batch in val_loader:
+                if isinstance(batch, (tuple, list)) and len(batch) == 8:
+                    X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b, _unit_ids_b, _t_end_b = batch
+                else:
+                    X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b = batch
                 X_b = X_b.to(device)
                 Y_sens_b = Y_sens_b.to(device)
                 Y_rul_b = Y_rul_b.to(device)
