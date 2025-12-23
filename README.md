@@ -124,6 +124,15 @@ python -m src.analysis.wm_v1_wiring_audit --experiment fd004_wm_v1_infwin_wiring
 This writes:
 - `results/fd004/<experiment>/wiring_audit_report.json`
 
+### WM‑V1 Cap/Plateau Reweight (anti “always high RUL” collapse)
+
+WM‑V1 can be dominated by windows whose **entire future RUL horizon is capped** at 1.0 (normalized), encouraging the trivial solution “always healthy”.
+We provide an **optional** sample-level reweighting that down-weights all-cap windows for future losses.
+
+- **Config** (under `world_model_params`): `cap_reweight_enable`, `cap_reweight_eps`, `cap_reweight_weight`, `cap_reweight_apply_to`
+- **Proof output**: `wiring_debug.json` includes `cap_reweight.{frac_all_cap_future, mean_weight}` plus batch mean/std stats
+- **Example experiment**: `fd004_wm_v1_infwin_capweight_k1`
+
 ### 0.3 Relation to literature (FD001 perspective)
 
 Recent works on FD001 (EOL RMSE):

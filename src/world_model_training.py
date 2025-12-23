@@ -218,6 +218,15 @@ class WorldModelTrainingConfig:
     eol_fusion_mode: Literal["token", "feature"] = "token"
     predict_latent: bool = False
     latent_decoder_type: Literal["gru", "transformer"] = "gru"
+
+    # --------------------------------------------------
+    # WM-V1: Cap/plateau reweighting (default OFF)
+    # --------------------------------------------------
+    # Down-weight samples whose entire future RUL horizon is capped at 1.0 (normalized).
+    cap_reweight_enable: bool = False
+    cap_reweight_eps: float = 1e-6
+    cap_reweight_weight: float = 0.05
+    cap_reweight_apply_to: Literal["rul", "hi", "both"] = "rul"
     latent_decoder_num_layers: int = 2
     latent_decoder_nhead: int = 4
     eol_scalar_loss_weight: float = 0.0

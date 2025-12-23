@@ -1137,6 +1137,22 @@ def get_fd004_wm_v1_infwin_wiringcheck_k0_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd004_wm_v1_infwin_capweight_k1_config() -> ExperimentConfig:
+    """
+    WM-V1 plateau/cap reweighting check:
+      - same as wiringcheck_k0 but with cap/plateau down-weighting enabled
+      - keeps wiring debug enabled for proof
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_infwin_wiringcheck_k0_config())
+    cfg["experiment_name"] = "fd004_wm_v1_infwin_capweight_k1"
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["cap_reweight_enable"] = True
+    wmp["cap_reweight_eps"] = 1e-6
+    wmp["cap_reweight_weight"] = 0.05
+    wmp["cap_reweight_apply_to"] = "rul"
+    return cfg
+
+
 def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config() -> ExperimentConfig:
     """
     Ablation to isolate collapse source: RUL-only (no HI anchor, no HI loss) + lower LR + earlier unfreeze.
@@ -3961,6 +3977,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_infwin_config()
     if experiment_name == "fd004_wm_v1_infwin_wiringcheck_k0":
         return get_fd004_wm_v1_infwin_wiringcheck_k0_config()
+    if experiment_name == "fd004_wm_v1_infwin_capweight_k1":
+        return get_fd004_wm_v1_infwin_capweight_k1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1":
         return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config()
     # Check for world model phase 5 v3 experiments first
