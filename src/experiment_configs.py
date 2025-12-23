@@ -1123,7 +1123,7 @@ def get_fd004_wm_v1_infwin_wiringcheck_k0_config() -> ExperimentConfig:
     cfg = copy.deepcopy(get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_infwin_config())
     cfg["experiment_name"] = "fd004_wm_v1_infwin_wiringcheck_k0"
     cfg.setdefault("training_params", {})
-    cfg["training_params"]["num_epochs"] = 3
+    cfg["training_params"]["num_epochs"] = 20
     wmp = cfg.setdefault("world_model_params", {})
     wmp["keep_prob_noninformative"] = 0.0
     wmp["debug_wiring_enable"] = True
