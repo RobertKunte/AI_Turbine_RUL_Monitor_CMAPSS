@@ -227,6 +227,16 @@ class WorldModelTrainingConfig:
     cap_reweight_eps: float = 1e-6
     cap_reweight_weight: float = 0.05
     cap_reweight_apply_to: Literal["rul", "hi", "both"] = "rul"
+
+    # --------------------------------------------------
+    # WM-V1: Cap-aware loss masking (default ON)
+    # --------------------------------------------------
+    # Mask out time steps where the target is fully capped at 1.0 (normalized).
+    # This prevents plateau windows from dominating the regression loss.
+    cap_mask_enable: bool = True
+    cap_mask_eps: float = 1e-6
+    # Apply to: ["rul"] or ["hi"] or ["rul","hi"]
+    cap_mask_apply_to: list[str] = field(default_factory=lambda: ["rul"])
     latent_decoder_num_layers: int = 2
     latent_decoder_nhead: int = 4
     eol_scalar_loss_weight: float = 0.0

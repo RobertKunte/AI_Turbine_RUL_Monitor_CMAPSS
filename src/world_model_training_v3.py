@@ -2486,6 +2486,13 @@ def train_transformer_world_model_v1(
                 cap_rw_eps = float(getattr(world_model_config, "cap_reweight_eps", 1e-6) or 1e-6)
                 cap_rw_weight = float(getattr(world_model_config, "cap_reweight_weight", 0.05) or 0.05)
                 cap_rw_apply_to = str(getattr(world_model_config, "cap_reweight_apply_to", "rul") or "rul").lower()
+                # Optional cap-aware masking for HI future loss (default ON, but apply_to defaults to ["rul"])
+                cap_mask_enable = bool(getattr(world_model_config, "cap_mask_enable", True))
+                cap_mask_eps = float(getattr(world_model_config, "cap_mask_eps", 1e-6) or 1e-6)
+                cap_mask_apply_to = getattr(world_model_config, "cap_mask_apply_to", ["rul"])
+                if not isinstance(cap_mask_apply_to, (list, tuple, set)):
+                    cap_mask_apply_to = [str(cap_mask_apply_to)]
+                cap_mask_apply_set = {str(x).lower() for x in cap_mask_apply_to}
 
                 if late_weight_enable and late_weight_apply_hi and late_weight_factor > 1.0:
                     # Detect normalized targets from RUL horizon (unit-safe).
@@ -2510,8 +2517,15 @@ def train_transformer_world_model_v1(
                         w = w * w_cap
 
                     hi_err2 = (pred_hi.squeeze(-1) - Y_hi_b) ** 2  # (B,H)
-                    hi_loss_per_sample = hi_err2.mean(dim=1)  # (B,)
-                    hi_loss = (w * hi_loss_per_sample).mean()
+                    if cap_mask_enable and ("hi" in cap_mask_apply_set):
+                        m_t = (true_rul_norm < float(1.0 - cap_mask_eps)).float()  # (B,H)
+                        num_i = (hi_err2 * m_t).sum(dim=1)
+                        den_i = m_t.sum(dim=1).clamp_min(1e-6)
+                        hi_loss_per_sample = num_i / den_i
+                        hi_loss = (w * hi_loss_per_sample).sum() / (w.sum() + 1e-6)
+                    else:
+                        hi_loss_per_sample = hi_err2.mean(dim=1)  # (B,)
+                        hi_loss = (w * hi_loss_per_sample).mean()
                 else:
                     # Optional cap/plateau reweighting without late-weighting.
                     if cap_rw_enable and (cap_rw_apply_to in {"hi", "both"}):
@@ -2530,7 +2544,16 @@ def train_transformer_world_model_v1(
                         hi_loss_per_sample = hi_err2.mean(dim=1)  # (B,)
                         hi_loss = (w_cap * hi_loss_per_sample).sum() / (w_cap.sum() + 1e-6)
                     else:
-                        hi_loss = F.mse_loss(pred_hi.squeeze(-1), Y_hi_b)
+                        if cap_mask_enable and ("hi" in cap_mask_apply_set):
+                            y_rul_seq = Y_rul_b
+                            if y_rul_seq.dim() == 3 and y_rul_seq.size(-1) == 1:
+                                y_rul_seq = y_rul_seq.squeeze(-1)
+                            true_rul_norm = y_rul_seq.clamp(0.0, 1.0)
+                            m_t = (true_rul_norm < float(1.0 - cap_mask_eps)).float()  # (B,H)
+                            hi_err2 = (pred_hi.squeeze(-1) - Y_hi_b) ** 2
+                            hi_loss = (hi_err2 * m_t).sum() / (m_t.sum() + 1e-6)
+                        else:
+                            hi_loss = F.mse_loss(pred_hi.squeeze(-1), Y_hi_b)
                 loss = loss + hi_w * hi_loss
 
                 # Wiring proof (HI): print/record only a tiny summary
@@ -2702,7 +2725,22 @@ def train_transformer_world_model_v1(
                     except Exception:
                         pass
 
-                    cap_mask = (true_rul_seq_norm < cap_thr)  # bool (B,H,1)
+                    # ----------------------------------------------------------
+                    # Cap-aware loss masking (optional; default ON)
+                    # ----------------------------------------------------------
+                    # mask_uncapped := (true_rul_seq_norm < 1 - eps) per timestep.
+                    # If a sample has all timesteps capped, it contributes 0 (den=0 -> loss_i==0).
+                    cap_mask_enable = bool(getattr(world_model_config, "cap_mask_enable", True))
+                    cap_mask_eps = float(getattr(world_model_config, "cap_mask_eps", 1e-6) or 1e-6)
+                    cap_mask_apply_to = getattr(world_model_config, "cap_mask_apply_to", ["rul"])
+                    if not isinstance(cap_mask_apply_to, (list, tuple, set)):
+                        cap_mask_apply_to = [str(cap_mask_apply_to)]
+                    cap_mask_apply_set = {str(x).lower() for x in cap_mask_apply_to}
+                    cap_thr_norm = float(1.0 - cap_mask_eps)
+                    if cap_mask_enable and ("rul" in cap_mask_apply_set):
+                        cap_mask = (true_rul_seq_norm < cap_thr_norm)  # bool (B,H,1)
+                    else:
+                        cap_mask = torch.ones_like(true_rul_seq_norm, dtype=torch.bool)
                     early_mask = torch.ones_like(cap_mask, dtype=torch.bool)
                     if rul_train_max_cycles is not None:
                         early_mask = (true_rul_cycles < float(rul_train_max_cycles))
@@ -3408,7 +3446,18 @@ def train_transformer_world_model_v1(
                         except Exception:
                             pass
 
-                        cap_mask = (true_rul_seq_norm < cap_thr)
+                        # Cap-aware loss masking (val) – mirror train semantics (default ON).
+                        cap_mask_enable = bool(getattr(world_model_config, "cap_mask_enable", True))
+                        cap_mask_eps = float(getattr(world_model_config, "cap_mask_eps", 1e-6) or 1e-6)
+                        cap_mask_apply_to = getattr(world_model_config, "cap_mask_apply_to", ["rul"])
+                        if not isinstance(cap_mask_apply_to, (list, tuple, set)):
+                            cap_mask_apply_to = [str(cap_mask_apply_to)]
+                        cap_mask_apply_set = {str(x).lower() for x in cap_mask_apply_to}
+                        cap_thr_norm = float(1.0 - cap_mask_eps)
+                        if cap_mask_enable and ("rul" in cap_mask_apply_set):
+                            cap_mask = (true_rul_seq_norm < cap_thr_norm)
+                        else:
+                            cap_mask = torch.ones_like(true_rul_seq_norm, dtype=torch.bool)
                         early_mask = torch.ones_like(cap_mask, dtype=torch.bool)
                         if rul_train_max_cycles is not None:
                             early_mask = (true_rul_cycles < float(rul_train_max_cycles))
@@ -3889,9 +3938,9 @@ def evaluate_transformer_world_model_v1_on_test(
                 cap_thr = float(getattr(world_model_config, "rul_cap_threshold", 0.999999) or 0.999999)
                 true_rul_cap_frac_batch = float((y_rul_seq_norm >= cap_thr).float().mean().detach().cpu())
                 print(f"[dbg] true_rul_cap_frac_batch={true_rul_cap_frac_batch:.6f}")
-                cap_rw_eps = float(getattr(world_model_config, "cap_reweight_eps", 1e-6) or 1e-6)
+                cap_mask_eps = float(getattr(world_model_config, "cap_mask_eps", 1e-6) or 1e-6)
                 frac_all_cap_future_batch = float(
-                    (y_rul_seq_norm[:, :, 0].min(dim=1).values >= (1.0 - cap_rw_eps)).float().mean().detach().cpu()
+                    (y_rul_seq_norm[:, :, 0].min(dim=1).values >= (1.0 - cap_mask_eps)).float().mean().detach().cpu()
                 )
                 print(f"[dbg] frac_all_cap_future_batch={frac_all_cap_future_batch:.6f}")
 
@@ -3988,11 +4037,60 @@ def evaluate_transformer_world_model_v1_on_test(
     metrics_all = compute_all_samples_metrics(y_true, y_pred, unit_ids=unit_ids_all, clip=clip)
     metrics_last = compute_last_per_unit_metrics(unit_ids_all, y_true, y_pred, clip=clip)
 
+    # --------------------------------------------------------------
+    # Split LAST metrics: capped vs uncapped LAST targets (diagnostic)
+    # --------------------------------------------------------------
+    try:
+        # stable last index per unit: last occurrence wins (same as compute_last_per_unit_metrics)
+        last_idx: Dict[int, int] = {}
+        for i, uid in enumerate(unit_ids_all.tolist()):
+            last_idx[int(uid)] = int(i)
+        idxs = np.array(sorted(last_idx.values()), dtype=np.int64)
+        yt_last = np.asarray(y_true, dtype=float).reshape(-1)[idxs]
+        yp_last = np.asarray(y_pred, dtype=float).reshape(-1)[idxs]
+
+        eps = float(getattr(world_model_config, "cap_mask_eps", 1e-6) or 1e-6)
+        yt_last_norm = np.clip(yt_last / max(float(max_rul), 1e-6), 0.0, 1.0)
+        is_capped = yt_last_norm >= (1.0 - eps)
+        frac_last_capped = float(np.mean(is_capped)) if yt_last_norm.size else 0.0
+
+        def _basic_metrics(a_true: np.ndarray, a_pred: np.ndarray) -> Dict[str, float]:
+            if a_true.size == 0:
+                return {"rmse": float("nan"), "mae": float("nan"), "bias": float("nan")}
+            err = a_pred - a_true
+            return {
+                "rmse": float(np.sqrt(np.mean(err**2))),
+                "mae": float(np.mean(np.abs(err))),
+                "bias": float(np.mean(err)),
+            }
+
+        m_unc = _basic_metrics(yt_last[~is_capped], yp_last[~is_capped])
+        m_cap = _basic_metrics(yt_last[is_capped], yp_last[is_capped])
+        split_last = {
+            "frac_last_capped": float(frac_last_capped),
+            "n_last_uncapped": int((~is_capped).sum()),
+            "rmse_last_uncapped": float(m_unc["rmse"]),
+            "mae_last_uncapped": float(m_unc["mae"]),
+            "bias_last_uncapped": float(m_unc["bias"]),
+            "n_last_capped": int(is_capped.sum()),
+            "rmse_last_capped": float(m_cap["rmse"]),
+            "mae_last_capped": float(m_cap["mae"]),
+            "bias_last_capped": float(m_cap["bias"]),
+        }
+        print(
+            "[WorldModelV1-Test] LAST split: "
+            f"uncapped n={split_last['n_last_uncapped']} rmse={split_last['rmse_last_uncapped']:.2f} bias={split_last['bias_last_uncapped']:.2f} | "
+            f"capped n={split_last['n_last_capped']} rmse={split_last['rmse_last_capped']:.2f} bias={split_last['bias_last_capped']:.2f}"
+        )
+    except Exception as e:
+        split_last = {"split_last_error": str(e)}
+
     merged = {
         **metrics_last,
         **metrics_all,
         "dataset_split": "test",
         "last_definition": metrics_last.get("note_last_definition", "LAST_AVAILABLE_PER_UNIT (truncated-aware)"),
+        **(split_last if isinstance(split_last, dict) else {}),
     }
     return merged
 

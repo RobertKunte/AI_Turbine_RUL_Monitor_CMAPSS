@@ -868,6 +868,10 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             world_model_config.cap_reweight_eps = float(world_model_params.get("cap_reweight_eps", 1e-6))
             world_model_config.cap_reweight_weight = float(world_model_params.get("cap_reweight_weight", 0.05))
             world_model_config.cap_reweight_apply_to = str(world_model_params.get("cap_reweight_apply_to", "rul"))
+            # WM-V1 cap-aware loss masking (optional; default ON to match existing behavior)
+            world_model_config.cap_mask_enable = bool(world_model_params.get("cap_mask_enable", True))
+            world_model_config.cap_mask_eps = float(world_model_params.get("cap_mask_eps", 1e-6))
+            world_model_config.cap_mask_apply_to = world_model_params.get("cap_mask_apply_to", ["rul"])
             # WM-V1 late-window weighting (optional; default off)
             world_model_config.late_weight_enable = bool(world_model_params.get("late_weight_enable", False))
             world_model_config.late_weight_factor = float(world_model_params.get("late_weight_factor", 5.0))
@@ -911,6 +915,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_lossbalance_v1_infwin",
                 "fd004_wm_v1_infwin_wiringcheck_k0",
                 "fd004_wm_v1_infwin_capweight_k1",
+                "fd004_wm_v1_infwin_capmask_k2",
                 "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1",
             ]:
                 print("\n[2] Training Transformer World Model V1 (Transformer encoder + GRU decoder)...")

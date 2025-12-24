@@ -1153,6 +1153,24 @@ def get_fd004_wm_v1_infwin_capweight_k1_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd004_wm_v1_infwin_capmask_k2_config() -> ExperimentConfig:
+    """
+    WM-V1 cap-mask + split-metrics check:
+      - based on capweight_k1 (keeps informative sampling + late weighting + cap reweight)
+      - enables cap-aware masking for RUL future loss via cap_mask_* knobs
+      - keeps wiring debug enabled for proof
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_infwin_capweight_k1_config())
+    cfg["experiment_name"] = "fd004_wm_v1_infwin_capmask_k2"
+    cfg.setdefault("training_params", {})
+    cfg["training_params"]["num_epochs"] = 20
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["cap_mask_enable"] = True
+    wmp["cap_mask_apply_to"] = ["rul"]
+    wmp["cap_mask_eps"] = 1e-6
+    return cfg
+
+
 def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config() -> ExperimentConfig:
     """
     Ablation to isolate collapse source: RUL-only (no HI anchor, no HI loss) + lower LR + earlier unfreeze.
@@ -3979,6 +3997,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_wm_v1_infwin_wiringcheck_k0_config()
     if experiment_name == "fd004_wm_v1_infwin_capweight_k1":
         return get_fd004_wm_v1_infwin_capweight_k1_config()
+    if experiment_name == "fd004_wm_v1_infwin_capmask_k2":
+        return get_fd004_wm_v1_infwin_capmask_k2_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1":
         return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config()
     # Check for world model phase 5 v3 experiments first
