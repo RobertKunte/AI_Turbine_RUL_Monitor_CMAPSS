@@ -4044,6 +4044,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_wm_v1_infwin_capweight_k1_config()
     if experiment_name == "fd004_wm_v1_infwin_capmask_k2":
         return get_fd004_wm_v1_infwin_capmask_k2_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3":
+        return get_fd004_wm_v1_p0_softcap_k3_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1":
         return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config()
     # Check for world model phase 5 v3 experiments first
