@@ -1171,6 +1171,51 @@ def get_fd004_wm_v1_infwin_capmask_k2_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd004_wm_v1_p0_softcap_k3_config() -> ExperimentConfig:
+    """
+    P0 cap-collapse fix (ADR-0010):
+      - P0.1: soft_cap_enable=True (distance-based soft weighting, replaces binary masking)
+      - P0.2: informative_sampling_mode="uncapped_frac" with threshold=0.3
+      - keeps late weighting from previous experiments
+    
+    Based on capmask_k2.
+    
+    Go/No-Go criteria:
+      - Bias_LAST: +70 -> <+30 cycles
+      - R²_LAST: ~0 -> >0.3
+      - pred_rul_seq_std: ~0.02 -> >=0.10
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_infwin_capmask_k2_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3"
+    cfg.setdefault("training_params", {})
+    cfg["training_params"]["num_epochs"] = 30  # More epochs to see effect
+
+    wmp = cfg.setdefault("world_model_params", {})
+    
+    # P0.1: Soft cap weighting (replaces binary masking)
+    wmp["soft_cap_enable"] = True
+    wmp["soft_cap_power"] = 0.5  # sqrt gives gradual ramp
+    wmp["soft_cap_floor"] = 0.05  # minimum weight for capped timesteps
+    wmp["cap_mask_enable"] = False  # Disable binary masking (replaced by soft)
+    
+    # P0.2: Stricter informative sampling
+    wmp["informative_sampling_enable"] = True
+    wmp["informative_sampling_mode"] = "uncapped_frac"
+    wmp["informative_uncapped_frac_threshold"] = 0.3  # 30% of future must be uncapped
+    wmp["keep_prob_noninformative"] = 0.05  # Reduce from 0.1 to further filter capped windows
+    
+    # Keep late weighting (from parent config)
+    wmp["late_weight_enable"] = True
+    wmp["late_weight_factor"] = 10.0
+    
+    # Logging
+    wmp["debug_wiring_enable"] = True
+    wmp["debug_wiring_epochs"] = 1
+    wmp["log_informative_stats"] = True
+    
+    return cfg
+
+
 def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config() -> ExperimentConfig:
     """
     Ablation to isolate collapse source: RUL-only (no HI anchor, no HI loss) + lower LR + earlier unfreeze.

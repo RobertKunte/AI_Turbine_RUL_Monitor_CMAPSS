@@ -237,6 +237,16 @@ class WorldModelTrainingConfig:
     cap_mask_eps: float = 1e-6
     # Apply to: ["rul"] or ["hi"] or ["rul","hi"]
     cap_mask_apply_to: list[str] = field(default_factory=lambda: ["rul"])
+
+    # --------------------------------------------------
+    # WM-V1: Soft cap weighting (ADR-0010, replaces binary masking)
+    # --------------------------------------------------
+    # If True, use soft per-timestep weights based on distance from cap.
+    # Replaces binary cap_mask when enabled for RUL future loss ONLY.
+    soft_cap_enable: bool = False  # Default OFF for backwards compatibility
+    soft_cap_power: float = 0.5  # Weight = distance^power (0.5=sqrt gives gradual ramp)
+    soft_cap_floor: float = 0.05  # Minimum weight for capped timesteps (never zero)
+
     latent_decoder_num_layers: int = 2
     latent_decoder_nhead: int = 4
     eol_scalar_loss_weight: float = 0.0
@@ -288,11 +298,17 @@ class WorldModelTrainingConfig:
     # which encourages a trivial "always healthy" solution. This sampler keeps all informative windows
     # and only a fraction of non-informative windows.
     informative_sampling_enable: bool = False
-    informative_sampling_mode: Literal["future_min_lt_cap", "future_has_zero"] = "future_min_lt_cap"
+    # Modes:
+    # - "future_min_lt_cap": informative if ANY timestep is below cap (legacy)
+    # - "future_has_zero": informative if future contains RUL=0
+    # - "uncapped_frac": informative if >= X% of future timesteps are uncapped (ADR-0010)
+    informative_sampling_mode: Literal["future_min_lt_cap", "future_has_zero", "uncapped_frac"] = "future_min_lt_cap"
     informative_eps_norm: float = 1e-6
     # Probability to keep a non-informative window (mixing). 0.0 => strict filter.
     keep_prob_noninformative: float = 0.1
     log_informative_stats: bool = True
+    # Threshold for "uncapped_frac" mode: fraction of future timesteps that must be uncapped (ADR-0010)
+    informative_uncapped_frac_threshold: float = 0.3
 
     # --------------------------------------------------
     # WM-V1: "wiring proof" debug instrumentation

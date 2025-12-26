@@ -1746,10 +1746,19 @@ def train_transformer_world_model_v1(
         y_tr_norm = np.clip(y_tr, 0.0, 1.0) if is_norm else np.clip(y_tr / float(max_rul if max_rul is not None else 125.0), 0.0, 1.0)
 
         future_min = y_tr_norm.min(axis=1)  # (N_tr,)
+        # ----------------------------------------------------------
+        # P0.2: Stricter informative sampling (ADR-0010)
+        # ----------------------------------------------------------
         if mode == "future_has_zero":
             is_inf = future_min <= float(eps)
+        elif mode == "uncapped_frac":
+            # NEW (ADR-0010): Require at least X% of future timesteps to be uncapped
+            uncapped_frac_threshold = float(getattr(world_model_config, "informative_uncapped_frac_threshold", 0.3) or 0.3)
+            uncapped_mask = y_tr_norm < (1.0 - float(eps))  # (N_tr, H)
+            uncapped_frac = uncapped_mask.mean(axis=1)  # (N_tr,) fraction uncapped per sample
+            is_inf = uncapped_frac >= uncapped_frac_threshold
         else:
-            # "future_min_lt_cap" (default): informative if not fully capped across horizon
+            # Legacy: "future_min_lt_cap" - informative if ANY timestep is below cap
             is_inf = future_min < (1.0 - float(eps))
         inf_frac = float(is_inf.mean()) if is_inf.size > 0 else 0.0
 
@@ -2747,6 +2756,24 @@ def train_transformer_world_model_v1(
                     mask = cap_mask & early_mask
                     mask_f = mask.float()
 
+                    # ----------------------------------------------------------
+                    # P0.1: Soft cap weighting (ADR-0010)
+                    # Apply to RUL future loss ONLY, not to HI or other losses.
+                    # ----------------------------------------------------------
+                    soft_cap_enable = bool(getattr(world_model_config, "soft_cap_enable", False))
+                    soft_cap_power = float(getattr(world_model_config, "soft_cap_power", 0.5) or 0.5)
+                    soft_cap_floor = float(getattr(world_model_config, "soft_cap_floor", 0.05) or 0.05)
+
+                    if soft_cap_enable:
+                        # Distance from cap: 0 = fully capped, 1 = RUL=0
+                        cap_distance = (1.0 - true_rul_seq_norm).clamp(0.0, 1.0)  # (B, H, 1)
+                        
+                        # Soft weight: power gives gradual ramp from cap to low RUL
+                        soft_cap_weight = cap_distance.pow(soft_cap_power)
+                        soft_cap_weight = soft_cap_weight.clamp(soft_cap_floor, 1.0)  # Never fully zero
+                    else:
+                        soft_cap_weight = None  # Fall back to binary masking
+
                     # Late-window weighting: upweight samples whose FUTURE horizon contains failure (RUL ~ 0).
                     late_weight_enable = bool(getattr(world_model_config, "late_weight_enable", False))
                     late_weight_factor = float(getattr(world_model_config, "late_weight_factor", 5.0) or 5.0)
@@ -2946,6 +2973,7 @@ def train_transformer_world_model_v1(
                                     "informative_sampling_enable": bool(getattr(world_model_config, "informative_sampling_enable", False)),
                                     "informative_sampling_mode": str(getattr(world_model_config, "informative_sampling_mode", "future_min_lt_cap")),
                                     "keep_prob_noninformative": float(getattr(world_model_config, "keep_prob_noninformative", 0.1) or 0.1),
+                                    "informative_uncapped_frac_threshold": float(getattr(world_model_config, "informative_uncapped_frac_threshold", 0.3) or 0.3),
                                     "informative_mask_frac_in_batch": float(is_inf_b.float().mean().detach().cpu()),
                                     "frac_all_one_future_targets_in_batch": float(all_one_b.float().mean().detach().cpu()),
                                 },
@@ -2954,6 +2982,15 @@ def train_transformer_world_model_v1(
                                     "late_weight_mode": str(getattr(world_model_config, "late_weight_mode", "future_has_zero") or "future_has_zero"),
                                     "late_weight_factor": float(late_weight_factor),
                                     "late_weight_mask_frac_in_batch": float(late_frac_dbg),
+                                },
+                                # P0.1: Soft cap weighting stats (ADR-0010)
+                                "soft_cap_weighting": {
+                                    "soft_cap_enable": bool(soft_cap_enable),
+                                    "soft_cap_power": float(soft_cap_power) if soft_cap_enable else None,
+                                    "soft_cap_floor": float(soft_cap_floor) if soft_cap_enable else None,
+                                    "soft_cap_weight_min": float(soft_cap_weight.min().detach().cpu()) if (soft_cap_enable and soft_cap_weight is not None) else None,
+                                    "soft_cap_weight_mean": float(soft_cap_weight.mean().detach().cpu()) if (soft_cap_enable and soft_cap_weight is not None) else None,
+                                    "soft_cap_weight_max": float(soft_cap_weight.max().detach().cpu()) if (soft_cap_enable and soft_cap_weight is not None) else None,
                                 },
                                 "final_sample_weights": {
                                     "min_weight": float(w_b.detach().min().cpu()),
@@ -3058,8 +3095,15 @@ def train_transformer_world_model_v1(
                                 w_final = w_b * w_cap
                             loss_rul_traj = (w_final * loss_i).sum() / (w_final.sum() + 1e-6)
                         else:
-                            num_i = (diff2 * mask_f).sum(dim=(1, 2))  # (B,)
-                            den_i = mask_f.sum(dim=(1, 2)).clamp_min(1e-6)  # (B,)
+                            # P0.1: Use soft cap weighting when enabled (ADR-0010)
+                            if soft_cap_enable and soft_cap_weight is not None:
+                                # Soft-weighted MSE (replaces binary masking for RUL future loss)
+                                num_i = (diff2 * soft_cap_weight).sum(dim=(1, 2))  # (B,)
+                                den_i = soft_cap_weight.sum(dim=(1, 2)).clamp_min(1e-6)  # (B,)
+                            else:
+                                # Legacy binary masking path
+                                num_i = (diff2 * mask_f).sum(dim=(1, 2))  # (B,)
+                                den_i = mask_f.sum(dim=(1, 2)).clamp_min(1e-6)  # (B,)
                             loss_i = num_i / den_i
                             w_final = w_b
                             if cap_rw_enable and (cap_rw_apply_to in {"rul", "both"}):
@@ -3470,6 +3514,17 @@ def train_transformer_world_model_v1(
                         mask_keep_frac_val_sum += float(mask_f.mean().detach().cpu())
                         mask_val_batches += 1
 
+                        # P0.1: Soft cap weighting (val) – mirror train semantics (ADR-0010)
+                        soft_cap_enable = bool(getattr(world_model_config, "soft_cap_enable", False))
+                        soft_cap_power = float(getattr(world_model_config, "soft_cap_power", 0.5) or 0.5)
+                        soft_cap_floor = float(getattr(world_model_config, "soft_cap_floor", 0.05) or 0.05)
+                        if soft_cap_enable:
+                            cap_distance = (1.0 - true_rul_seq_norm).clamp(0.0, 1.0)
+                            soft_cap_weight = cap_distance.pow(soft_cap_power)
+                            soft_cap_weight = soft_cap_weight.clamp(soft_cap_floor, 1.0)
+                        else:
+                            soft_cap_weight = None
+
                         if w_power > 0.0:
                             base = (1.0 - true_rul_seq_norm[:, 0, 0]).clamp(0.0, 1.0)
                             w_b = (base + 1e-6) ** w_power
@@ -3521,8 +3576,13 @@ def train_transformer_world_model_v1(
                                         w_final = w_b * w_cap
                                     loss_rul_traj = (w_final * loss_i).sum() / (w_final.sum() + 1e-6)
                                 else:
-                                    num_i = (diff2 * mask_f).sum(dim=(1, 2))
-                                    den_i = mask_f.sum(dim=(1, 2)).clamp_min(1e-6)
+                                    # P0.1: Use soft cap weighting when enabled (val) (ADR-0010)
+                                    if soft_cap_enable and soft_cap_weight is not None:
+                                        num_i = (diff2 * soft_cap_weight).sum(dim=(1, 2))
+                                        den_i = soft_cap_weight.sum(dim=(1, 2)).clamp_min(1e-6)
+                                    else:
+                                        num_i = (diff2 * mask_f).sum(dim=(1, 2))
+                                        den_i = mask_f.sum(dim=(1, 2)).clamp_min(1e-6)
                                     loss_i = num_i / den_i
                                     w_final = w_b
                                     if cap_rw_enable and (cap_rw_apply_to in {"rul", "both"}):
