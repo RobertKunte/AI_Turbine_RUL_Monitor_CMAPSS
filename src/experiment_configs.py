@@ -1208,6 +1208,10 @@ def get_fd004_wm_v1_p0_softcap_k3_config() -> ExperimentConfig:
     wmp["late_weight_enable"] = True
     wmp["late_weight_factor"] = 10.0
     
+    # Enable horizon masking for padding-aware RUL loss (removes floor at ~24-30)
+    # This ensures padded future timesteps do NOT contribute to RUL future loss.
+    wmp["use_horizon_mask"] = True
+    
     # Logging
     wmp["debug_wiring_enable"] = True
     wmp["debug_wiring_epochs"] = 1
