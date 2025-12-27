@@ -470,6 +470,7 @@ def build_eval_data(
     feature_config: FeatureConfig,
     physics_config: PhysicsFeatureConfig,
     phys_features: Optional[Dict] = None,
+    feature_cols_json_path: Optional[Path] = None,
     ) -> Tuple[
     np.ndarray,        # X_test_scaled
     np.ndarray,        # y_true_eol (capped)
@@ -568,12 +569,47 @@ def build_eval_data(
     df_train_fe = create_all_features(df_train_fe, "UnitNumber", "TimeInCycles", feature_config, inplace=False, physics_config=physics_config)
     df_test_fe = create_all_features(df_test_fe, "UnitNumber", "TimeInCycles", feature_config, inplace=False, physics_config=physics_config)
     
-    # Build feature columns
-    feature_cols = [
-        c for c in df_train_fe.columns
-        if c not in ["UnitNumber", "TimeInCycles", "RUL", "RUL_raw", "MaxTime", "ConditionID"]
-    ]
-    feature_cols, _ = remove_rul_leakage(feature_cols)
+    # Stage -1: Load feature columns from training artifact (exact order/selection)
+    if feature_cols_json_path is not None and feature_cols_json_path.exists():
+        with open(feature_cols_json_path, "r") as f:
+            feature_cols_training = json.load(f)
+        print(f"[Stage-1] Loaded feature_cols.json: {len(feature_cols_training)} features")
+        
+        # Build feature columns from training data (to verify they exist)
+        feature_cols_available = [
+            c for c in df_train_fe.columns
+            if c not in ["UnitNumber", "TimeInCycles", "RUL", "RUL_raw", "MaxTime", "ConditionID"]
+        ]
+        feature_cols_available, _ = remove_rul_leakage(feature_cols_available)
+        
+        # Verify all training features exist in diagnostics data
+        missing_features = set(feature_cols_training) - set(feature_cols_available)
+        if missing_features:
+            raise ValueError(
+                f"[Stage-1] Feature mismatch: {len(missing_features)} features from training "
+                f"not found in diagnostics data: {list(missing_features)[:10]}..."
+            )
+        
+        # Use exact training feature list (preserves order)
+        feature_cols = [c for c in feature_cols_training if c in feature_cols_available]
+        if len(feature_cols) != len(feature_cols_training):
+            raise ValueError(
+                f"[Stage-1] Feature count mismatch: training had {len(feature_cols_training)} features, "
+                f"diagnostics has {len(feature_cols)} after filtering"
+            )
+        print(f"[Stage-1] Using exact training feature list: {len(feature_cols)} features")
+    else:
+        # Fallback: build feature columns from data (legacy path)
+        if feature_cols_json_path is not None:
+            raise ValueError(
+                f"[Stage-1] feature_cols.json not found at {feature_cols_json_path}. "
+                f"Re-run training to generate this artifact, or regenerate diagnostics with feature reconstruction."
+            )
+        feature_cols = [
+            c for c in df_train_fe.columns
+            if c not in ["UnitNumber", "TimeInCycles", "RUL", "RUL_raw", "MaxTime", "ConditionID"]
+        ]
+        feature_cols, _ = remove_rul_leakage(feature_cols)
     
     # Build full EOL sequences from train data (for scaler fitting)
     result = build_full_eol_sequences_from_df(
@@ -1799,6 +1835,9 @@ def run_diagnostics_for_run(
         except Exception as e:
             print(f"  ⚠️  Could not load scaler from {scaler_path}: {e}")
     
+    # Stage -1: Load feature_cols.json for exact feature reconstruction
+    feature_cols_path = experiment_dir / "feature_cols.json"
+    
     (
         X_test_scaled,
         y_true_eol,
@@ -1815,6 +1854,7 @@ def run_diagnostics_for_run(
         feature_config=feature_config,
         physics_config=physics_config,
         phys_features=phys_features_cfg,
+        feature_cols_json_path=feature_cols_path,
     )
 
     # For damage_v3-style experiments, compute HI_phys_v3 on the test features
@@ -1870,18 +1910,26 @@ def run_diagnostics_for_run(
         f"twin={len(groups['twin'])}"
     )
     
-    # Verify feature count matches model expectations
+    # Stage -1: Hard check for feature dimension consistency (ADR)
     if is_world_model:
         expected_features = config.get("num_features")
         if expected_features is not None:
-            if len(feature_cols) != expected_features:
-                print(f"  ⚠️  WARNING: Feature count mismatch!")
-                print(f"     Expected: {expected_features} (from config)")
-                print(f"     Got: {len(feature_cols)} (from feature engineering)")
-                print(f"     This may cause model loading errors.")
-                print(f"     Attempting to continue anyway...")
-            else:
-                print(f"  ✓ Feature count matches model: {len(feature_cols)}")
+            actual_features = len(feature_cols)
+            if actual_features != expected_features:
+                raise ValueError(
+                    f"[Stage-1 Consistency] Feature dimension mismatch: "
+                    f"diagnostics has {actual_features} features, but model expects {expected_features} "
+                    f"(from summary.json:num_features). "
+                    f"This indicates feature configuration mismatch between training and diagnostics. "
+                    f"Check that diagnostics reconstructs the exact same features as training."
+                )
+            print(f"[Stage-1] Verified feature dimension: {actual_features} == {expected_features} ✓")
+        
+        # Stage -1: Log cap_targets consistency
+        target_cfg = config.get("target_cfg", {})
+        cap_targets_diag = target_cfg.get("cap_targets", True)  # Default True for FD004
+        max_rul_diag = target_cfg.get("max_rul", 125)
+        print(f"[Stage-1] Diagnostics cap_targets={cap_targets_diag} max_rul={max_rul_diag} (from summary.json)")
     
     # Evaluate using the same helpers as in the training loops.
     # - World models (v2/v3): evaluate_world_model_v3_eol

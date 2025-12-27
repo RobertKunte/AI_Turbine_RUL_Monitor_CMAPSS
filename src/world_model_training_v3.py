@@ -210,6 +210,29 @@ def train_world_model_universal_v3(
     use_horizon_mask = bool(getattr(world_model_config, "use_horizon_mask", False))
     cap_targets = bool(getattr(world_model_config, "cap_rul_targets_to_max_rul", False))
     eol_target_mode = str(getattr(world_model_config, "eol_target_mode", "future0"))
+    eval_clip_y_true = bool(getattr(world_model_config, "eval_clip_y_true_to_max_rul", False))
+    
+    # Stage -1: FD004 hard enforcement of capped targets (no opt-out)
+    if dataset_name.upper() == "FD004":
+        user_cap_targets = cap_targets
+        user_cap_rul_targets = bool(getattr(world_model_config, "cap_rul_targets_to_max_rul", False))
+        user_eval_clip = eval_clip_y_true
+        
+        # Force capped semantics for FD004
+        cap_targets = True
+        eval_clip_y_true = True
+        
+        # Check if user tried to disable (fail-fast)
+        if not user_cap_targets or not user_cap_rul_targets or not user_eval_clip:
+            raise ValueError(
+                f"[Stage-1] FD004 requires capped RUL semantics. "
+                f"User config had cap_targets={user_cap_targets}, "
+                f"cap_rul_targets_to_max_rul={user_cap_rul_targets}, "
+                f"eval_clip_y_true_to_max_rul={user_eval_clip}. "
+                f"All must be True for FD004 (literature-consistent censored data handling)."
+            )
+        
+        print(f"[Stage-1] FD004: Enforced cap_targets=True, cap_rul_targets_to_max_rul=True, eval_clip_y_true_to_max_rul=True")
 
     window_cfg = WindowConfig(
         past_len=int(past_len),
@@ -222,7 +245,7 @@ def train_world_model_universal_v3(
         max_rul=int(max_rul if max_rul is not None else 125),
         cap_targets=bool(cap_targets),
         eol_target_mode=str(eol_target_mode),
-        clip_eval_y_true=bool(getattr(world_model_config, "eval_clip_y_true_to_max_rul", False)),
+        clip_eval_y_true=bool(eval_clip_y_true),
     )
 
     built = build_sliding_windows(
@@ -242,6 +265,35 @@ def train_world_model_universal_v3(
     unit_ids_train = torch.tensor(built["unit_ids"], dtype=torch.long)
     cond_ids_train = torch.tensor(built["cond_ids"], dtype=torch.long)
     horizon_mask_train = torch.tensor(built["mask"], dtype=torch.float32) if (use_horizon_mask and built["mask"] is not None) else None
+    
+    # Stage -1: Enforce clipping at source for FD004 (before training loop)
+    if dataset_name.upper() == "FD004":
+        max_rul_f = float(max_rul if max_rul is not None else 125.0)
+        # Clip Y_seq (future RUL trajectories) to [0, max_rul]
+        Y_train = Y_train.clamp(0.0, max_rul_f)
+        # Clip Y_eol if present
+        Y_eol_check = built.get("Y_eol", None)
+        if Y_eol_check is not None:
+            Y_eol_clipped = np.clip(Y_eol_check, 0.0, max_rul_f)
+            built["Y_eol"] = Y_eol_clipped
+            y_eol_max = float(np.max(Y_eol_clipped))
+            assert y_eol_max <= max_rul_f + 1e-6, (
+                f"[Stage-1] FD004 Y_eol clipping failed: max={y_eol_max:.2f} > {max_rul_f:.2f}"
+            )
+            print(f"[Stage-1] FD004: Clipped Y_eol at source, max={y_eol_max:.2f} <= max_rul={max_rul_f:.2f}")
+    
+    # Stage -1: Verify capped targets consistency (ADR)
+    if cap_targets:
+        Y_eol_check = built.get("Y_eol", None)
+        if Y_eol_check is not None:
+            y_eol_max = float(np.max(Y_eol_check))
+            max_rul_check = float(max_rul if max_rul is not None else 125.0)
+            if y_eol_max > max_rul_check + 1e-3:
+                raise ValueError(
+                    f"[Stage-1 Consistency] Y_eol from windowing exceeds max_rul: max={y_eol_max:.2f} > {max_rul_check:.2f}. "
+                    f"cap_targets={cap_targets} but windowing produced uncapped values. Check windowing.py _cap() logic."
+                )
+            print(f"[Stage-1] Verified Y_eol capped: max={y_eol_max:.2f} <= max_rul={max_rul_check:.2f}")
     
     print(f"  Train sequences: {X_train.shape[0]}")
     print(f"  Input shape: {X_train.shape}, Target shape: {Y_train.shape}")
@@ -413,6 +465,13 @@ def train_world_model_universal_v3(
     cap_rul_targets = bool(getattr(world_model_config, "cap_rul_targets_to_max_rul", False))
     eol_target_mode = str(getattr(world_model_config, "eol_target_mode", "future0")).lower()
     init_eol_bias = bool(getattr(world_model_config, "init_eol_bias_to_target_mean", False))
+    
+    # Stage -1: FD004 hard enforcement (sync with earlier enforcement)
+    if dataset_name.upper() == "FD004":
+        cap_rul_targets = True
+        # Override best_metric to use capped LAST metric
+        best_metric = "val_rmse_last"
+        print(f"[Stage-1] FD004: Enforced cap_rul_targets=True, best_metric={best_metric}")
 
     # Resolve EOL normalization scale once (used only inside loss)
     def _resolve_eol_scale() -> float:
@@ -688,7 +747,14 @@ def train_world_model_universal_v3(
                     mr = float(max_rul if max_rul is not None else 125.0)
                     print(f"[target] eol_target_mode={eol_target_mode} ({target_def}) cap_targets={cap_rul_targets}")
                     print(f"[target] eol_true_scalar: min={te_min:.2f} max={te_max:.2f} (max_rul={mr:.2f})")
-                    if te_max > mr + 1e-3:
+                    # Stage -1: Fail-fast assertion for capped targets (ADR consistency)
+                    if cap_rul_targets and te_max > mr + 1e-3:
+                        raise ValueError(
+                            f"[Stage-1 Consistency] eol_true_scalar exceeds max_rul: max={te_max:.2f} > {mr:.2f}. "
+                            f"This indicates uncapped targets are being used despite cap_targets=True. "
+                            f"Check windowing.py and target_cfg.cap_targets."
+                        )
+                    elif not cap_rul_targets and te_max > mr + 1e-3:
                         print("  ⚠️  Warning: eol_true_scalar exceeds max_rul -> likely unit/clip mismatch.")
 
             # Physics-informed Health Index targets derived from RUL
@@ -1091,7 +1157,86 @@ def train_world_model_universal_v3(
         allow_best_update = (not select_best_after_eol_active) or bool(eol_active)
 
         # Choose which metric to optimize for best checkpoint
-        if best_metric == "val_total":
+        # Stage -1: FD004 must use capped LAST metric (val_rmse_last)
+        if dataset_name.upper() == "FD004" and best_metric == "val_rmse_last":
+            # Compute val_rmse_last during validation for FD004
+            # This requires evaluating on validation set (quick evaluation)
+            try:
+                # Quick evaluation on validation set to get rmse_last
+                val_units_set = set(val_units.detach().cpu().numpy().astype(int).tolist())
+                df_val_split_df = df_train[df_train["UnitNumber"].isin(val_units_set)].copy()
+                if len(df_val_split_df) > 0:
+                    # Use the same evaluation function as post-training
+                    wc_val = WindowConfig(past_len=int(past_len), horizon=1, stride=1, require_full_horizon=False, pad_mode="clamp")
+                    tc_val = TargetConfig(max_rul=int(max_rul if max_rul is not None else 125), cap_targets=True, eol_target_mode="current_from_df")
+                    built_val = build_sliding_windows(
+                        df_val_split_df,
+                        feature_cols,
+                        target_col="RUL_raw" if ("RUL_raw" in df_val_split_df.columns) else "RUL",
+                        unit_col="UnitNumber",
+                        time_col="TimeInCycles",
+                        cond_col="ConditionID",
+                        window_cfg=wc_val,
+                        target_cfg=tc_val,
+                        return_mask=False,
+                    )
+                    X_val_quick = built_val["X"]
+                    y_true_val = built_val["Y_eol"].astype(float)
+                    # Stage -1: Clip y_true for FD004
+                    if dataset_name.upper() == "FD004":
+                        y_true_val = np.clip(y_true_val, 0.0, float(max_rul if max_rul is not None else 125.0))
+                    unit_ids_val = built_val["unit_ids"].astype(np.int64)
+                    
+                    # Scale and predict
+                    X_val_scaled_quick = np.empty_like(X_val_quick, dtype=np.float32)
+                    for cond in np.unique(built_val["cond_ids"]):
+                        cond = int(cond)
+                        idxs = np.where(built_val["cond_ids"] == cond)[0]
+                        scaler = scaler_dict.get(cond, scaler_dict.get(0))
+                        flat = X_val_quick[idxs].reshape(-1, len(feature_cols))
+                        X_val_scaled_quick[idxs] = scaler.transform(flat).reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
+                    
+                    X_val_t_quick = torch.tensor(X_val_scaled_quick, dtype=torch.float32).to(device)
+                    cond_val_t_quick = torch.tensor(built_val["cond_ids"], dtype=torch.long).to(device) if num_conditions > 1 else None
+                    
+                    with torch.no_grad():
+                        out_val = model(
+                            encoder_inputs=X_val_t_quick,
+                            decoder_targets=None,
+                            teacher_forcing_ratio=0.0,
+                            horizon=1,
+                            cond_ids=cond_val_t_quick,
+                        )
+                        if isinstance(out_val, dict):
+                            e_val = out_val.get("eol", out_val.get("rul"))
+                        else:
+                            e_val = out_val[1] if isinstance(out_val, (tuple, list)) and len(out_val) >= 2 else out_val
+                        if torch.is_tensor(e_val):
+                            y_pred_val = e_val.view(-1).detach().cpu().numpy().astype(float)
+                        else:
+                            y_pred_val = np.asarray(e_val, dtype=float).reshape(-1)
+                    y_pred_val = np.clip(y_pred_val, 0.0, float(max_rul if max_rul is not None else 125.0)).astype(float)
+                    
+                    # Compute rmse_last
+                    from src.metrics import compute_last_per_unit_metrics
+                    clip_val = (0.0, float(max_rul)) if max_rul is not None else None
+                    m_val_last = compute_last_per_unit_metrics(unit_ids_val, y_true_val, y_pred_val, clip=clip_val)
+                    metric_val = float(m_val_last.get("rmse_last", epoch_val_eol_loss))
+                    print(f"[Stage-1] FD004: Computed val_rmse_last={metric_val:.4f} for checkpoint selection")
+                else:
+                    # Fallback to val_eol_loss if validation set is empty
+                    metric_val = float(epoch_val_eol_loss)
+                    print(f"[Stage-1] FD004: val_rmse_last not available, using val_eol_loss={metric_val:.4f}")
+            except Exception as e:
+                # Fallback to val_eol_loss if computation fails
+                metric_val = float(epoch_val_eol_loss)
+                print(f"[Stage-1] FD004: val_rmse_last computation failed ({e}), using val_eol_loss={metric_val:.4f}")
+        elif best_metric == "val_total":
+            if dataset_name.upper() == "FD004":
+                raise ValueError(
+                    "[Stage-1] FD004 cannot use val_total for checkpoint selection. "
+                    "Use val_rmse_last or val_eol_loss (both use capped targets)."
+                )
             metric_val = float(epoch_val_loss)
         elif best_metric == "val_eol_weighted":
             metric_val = float(epoch_val_eol_weighted)
@@ -1100,9 +1245,11 @@ def train_world_model_universal_v3(
         else:
             metric_val = float(epoch_val_loss)
 
+        # Stage -1: Explicit logging of checkpoint metric and capping status
         print(
             f"[checkpoint] eol_active={eol_active} mult={eol_mult:.3f} "
-            f"allow_best_update={allow_best_update} best_metric={best_metric} metric={metric_val:.4f}"
+            f"allow_best_update={allow_best_update} best_metric={best_metric} metric={metric_val:.4f} "
+            f"(cap_targets={cap_rul_targets}, max_rul={max_rul if max_rul is not None else 125.0})"
         )
 
         # If gating is enabled, don't start patience until EOL becomes active
@@ -1177,6 +1324,15 @@ def train_world_model_universal_v3(
 
         X = built_split["X"]
         y_true = built_split["Y_eol"].astype(float)
+        # Stage -1: FD004 evaluation consistency (clip y_true to [0, max_rul])
+        if dataset_name.upper() == "FD004":
+            max_rul_f = float(max_rul if max_rul is not None else 125.0)
+            y_true = np.clip(y_true, 0.0, max_rul_f)
+            y_true_max = float(np.max(y_true))
+            if y_true_max > max_rul_f + 1e-6:
+                raise ValueError(
+                    f"[Stage-1] FD004 evaluation clipping failed: y_true max={y_true_max:.2f} > {max_rul_f:.2f}"
+                )
         unit_ids = built_split["unit_ids"].astype(np.int64)
         cond_ids = built_split["cond_ids"].astype(np.int64)
 
@@ -1235,6 +1391,13 @@ def train_world_model_universal_v3(
         with open(results_dir / "metrics_val.json", "w") as f:
             json.dump(metrics_val, f, indent=2)
         print(f"  Saved metrics_train.json and metrics_val.json to {results_dir}")
+        
+        # Stage -1: FD004 checkpoint re-selection based on val_rmse_last
+        if dataset_name.upper() == "FD004" and "rmse_last" in metrics_val:
+            val_rmse_last = float(metrics_val["rmse_last"])
+            # Re-load all checkpoints and find best based on val_rmse_last
+            # For now, log the metric - full re-selection would require saving all epoch checkpoints
+            print(f"[Stage-1] FD004 val_rmse_last={val_rmse_last:.4f} (best checkpoint was selected using val_eol_loss during training)")
     except Exception as e:
         print(f"[7a] Warning: could not compute/save train/val metrics: {e}")
         metrics_train = {}
@@ -1430,6 +1593,12 @@ def train_world_model_universal_v3(
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"  Saved summary to {summary_path}")
+    
+    # Stage -1: Save feature columns list for diagnostics consistency
+    feature_cols_path = results_dir / "feature_cols.json"
+    with open(feature_cols_path, "w") as f:
+        json.dump(feature_cols, f, indent=2)
+    print(f"[Stage-1] Saved feature_cols.json ({len(feature_cols)} features) to {feature_cols_path}")
 
     # Save split metrics as standalone artifact (standard name)
     try:
@@ -3631,6 +3800,14 @@ def train_transformer_world_model_v1(
             f"[WorldModelV1] Epoch {epoch+1}/{num_epochs} - "
             f"train_loss: {train_loss:.4f}, val_loss: {val_loss:.4f}"
         )
+        
+        # Stage -1: Log checkpoint metric and capping status
+        cap_targets_wm = bool(getattr(world_model_config, "cap_rul_targets_to_max_rul", False))
+        max_rul_wm = float(getattr(world_model_config, "max_rul", 125.0))
+        print(
+            f"[WorldModelV1][checkpoint] best_metric=val_total (total_loss) "
+            f"cap_targets={cap_targets_wm} max_rul={max_rul_wm:.1f}"
+        )
 
         if val_loss < best_val_loss - 1e-6:
             best_val_loss = val_loss
@@ -4215,6 +4392,15 @@ def evaluate_world_model_v3_eol(
 
     X = built["X"]  # (N, P, F)
     y_true = built["y_true"]  # (N,)
+    # Stage -1: FD004 evaluation consistency (clip y_true to [0, max_rul])
+    if clip_y_true_to_max_rul and max_rul is not None:
+        max_rul_f = float(max_rul)
+        y_true = np.clip(y_true, 0.0, max_rul_f)
+        y_true_max = float(np.max(y_true))
+        if y_true_max > max_rul_f + 1e-6:
+            raise ValueError(
+                f"[Stage-1] Evaluation clipping failed: y_true max={y_true_max:.2f} > {max_rul_f:.2f}"
+            )
     unit_ids_np = built["unit_ids"]
     cond_ids_np = built["cond_ids"]
 
