@@ -297,6 +297,20 @@ def train_world_model_universal_v3(
     if horizon_mask_train is not None:
         print(f"  Horizon mask shape: {horizon_mask_train.shape} (use_horizon_mask={use_horizon_mask})")
     
+    # Log y_eol min and pad_frac for verification (Stage-1 padding check)
+    Y_eol_built = built.get("Y_eol", None)
+    if Y_eol_built is not None:
+        y_eol_min = float(np.min(Y_eol_built))
+        y_eol_max = float(np.max(Y_eol_built))
+        print(f"  [Stage-1] Y_eol range: min={y_eol_min:.2f}, max={y_eol_max:.2f}")
+    if horizon_mask_train is not None:
+        pad_frac = 1.0 - float(horizon_mask_train.mean().item())
+        print(f"  [Stage-1] pad_frac={pad_frac:.4f} (use_padded_horizon_targets={use_padded_horizon_targets})")
+        if pad_frac < 1e-4:
+            print("  [Stage-1] WARNING: No padding detected. Check use_padded_horizon_targets flag.")
+    else:
+        print(f"  [Stage-1] pad_frac=NA (use_horizon_mask={use_horizon_mask}, use_padded_horizon_targets={use_padded_horizon_targets})")
+    
     # Determine number of conditions
     unique_conditions = torch.unique(cond_ids_train).cpu().numpy()
     num_conditions = len(unique_conditions)

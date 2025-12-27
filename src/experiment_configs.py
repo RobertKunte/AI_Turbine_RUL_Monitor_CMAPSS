@@ -1220,6 +1220,39 @@ def get_fd004_wm_v1_p0_softcap_k3_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd004_wm_v1_p0_softcap_k3_hm_pad_config() -> ExperimentConfig:
+    """
+    P0 cap-collapse fix (ADR-0010) + Stage-1 horizon padding:
+      - P0.1: soft_cap_enable=True (distance-based soft weighting, replaces binary masking)
+      - P0.2: informative_sampling_mode="uncapped_frac" with threshold=0.3
+      - keeps late weighting from previous experiments
+      - NEW: use_padded_horizon_targets=True (enables near-EOL windows in Stage-1)
+      - NEW: use_horizon_mask=True (masks padded timesteps in RUL loss)
+    
+    Based on p0_softcap_k3, but with Stage-1 padding enabled to remove floor at ~24-30.
+    
+    Go/No-Go criteria:
+      - Bias_LAST: +70 -> <+30 cycles
+      - R²_LAST: ~0 -> >0.3
+      - pred_rul_seq_std: ~0.02 -> >=0.10
+      - Stage-1 pad_frac > 0.0 (confirms padding is active)
+      - Stage-1 y_eol min <= 5 (confirms near-EOL windows included)
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3_hm_pad"
+    
+    wmp = cfg.setdefault("world_model_params", {})
+    
+    # Enable Stage-1 padded horizon targets (allows near-EOL windows with RUL < H)
+    # This sets require_full_horizon=False in Stage-1 window builder
+    wmp["use_padded_horizon_targets"] = True
+    
+    # Ensure horizon masking is enabled (should already be set from parent, but be explicit)
+    wmp["use_horizon_mask"] = True
+    
+    return cfg
+
+
 def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config() -> ExperimentConfig:
     """
     Ablation to isolate collapse source: RUL-only (no HI anchor, no HI loss) + lower LR + earlier unfreeze.
@@ -4050,6 +4083,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_wm_v1_infwin_capmask_k2_config()
     if experiment_name == "fd004_wm_v1_p0_softcap_k3":
         return get_fd004_wm_v1_p0_softcap_k3_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad":
+        return get_fd004_wm_v1_p0_softcap_k3_hm_pad_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1":
         return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config()
     # Check for world model phase 5 v3 experiments first
