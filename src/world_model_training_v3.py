@@ -1919,6 +1919,13 @@ def train_transformer_world_model_v1(
     cond_id_list = built["cond_ids"].tolist()
     unit_ids_np = built["unit_ids"]
     t_end_pos_np = built.get("t_end_pos")
+    
+    # Extract horizon mask if available (for padding-aware loss computation)
+    horizon_mask_all = built.get("mask")  # (N, H, 1) or None
+    if horizon_mask_all is not None:
+        horizon_mask_all = torch.from_numpy(horizon_mask_all.astype(np.float32))
+    else:
+        horizon_mask_all = None
 
     # --------------------------------------------------------------
     # Train/val split (engine-level) BEFORE fitting X scaler
@@ -2170,6 +2177,23 @@ def train_transformer_world_model_v1(
     Y_rul_val = Y_rul_train[val_indices]
     Y_hi_val = Y_hi_train[val_indices]
     cond_val = cond_ids[val_indices]
+    
+    # Extract horizon masks for train/val splits if available
+    use_horizon_mask = bool(getattr(world_model_config, "use_horizon_mask", False))
+    if use_horizon_mask and horizon_mask_all is not None:
+        horizon_mask_tr = horizon_mask_all[train_indices]  # (N_tr, H, 1)
+        horizon_mask_val = horizon_mask_all[val_indices]   # (N_val, H, 1)
+        
+        # Pre-check: verify padding exists (Step 0.5)
+        pad_frac_tr = 1.0 - horizon_mask_tr.mean().item()
+        pad_frac_val = 1.0 - horizon_mask_val.mean().item()
+        print(f"[Pre-check] train padding fraction: {pad_frac_tr:.4f}")
+        print(f"[Pre-check] val padding fraction: {pad_frac_val:.4f}")
+        if pad_frac_tr < 1e-4:
+            print("[WARNING] No padding detected in training data. Horizon masking may be unnecessary.")
+    else:
+        horizon_mask_tr = None
+        horizon_mask_val = None
 
     # Optional: include per-sample metadata for wiring audits (unit_id and window end position).
     # Kept behind debug_wiring_enable so normal training data shape stays unchanged.
@@ -2181,19 +2205,35 @@ def train_transformer_world_model_v1(
         t_end_tr = t_end_pos_t_all[train_indices]
         unit_ids_val = unit_ids_t_all[val_indices]
         t_end_val = t_end_pos_t_all[val_indices]
-        train_ds = torch.utils.data.TensorDataset(
-            X_tr, Y_sens_tr, Y_rul_tr, Y_hi_tr, cond_tr, future_cond_tr, unit_ids_tr, t_end_tr
-        )
-        val_ds = torch.utils.data.TensorDataset(
-            X_val, Y_sens_val, Y_rul_val, Y_hi_val, cond_val, future_cond_val, unit_ids_val, t_end_val
-        )
+        if use_horizon_mask and horizon_mask_tr is not None:
+            train_ds = torch.utils.data.TensorDataset(
+                X_tr, Y_sens_tr, Y_rul_tr, Y_hi_tr, cond_tr, future_cond_tr, horizon_mask_tr, unit_ids_tr, t_end_tr
+            )
+            val_ds = torch.utils.data.TensorDataset(
+                X_val, Y_sens_val, Y_rul_val, Y_hi_val, cond_val, future_cond_val, horizon_mask_val, unit_ids_val, t_end_val
+            )
+        else:
+            train_ds = torch.utils.data.TensorDataset(
+                X_tr, Y_sens_tr, Y_rul_tr, Y_hi_tr, cond_tr, future_cond_tr, unit_ids_tr, t_end_tr
+            )
+            val_ds = torch.utils.data.TensorDataset(
+                X_val, Y_sens_val, Y_rul_val, Y_hi_val, cond_val, future_cond_val, unit_ids_val, t_end_val
+            )
     else:
-        train_ds = torch.utils.data.TensorDataset(
-            X_tr, Y_sens_tr, Y_rul_tr, Y_hi_tr, cond_tr, future_cond_tr
-        )
-        val_ds = torch.utils.data.TensorDataset(
-            X_val, Y_sens_val, Y_rul_val, Y_hi_val, cond_val, future_cond_val
-        )
+        if use_horizon_mask and horizon_mask_tr is not None:
+            train_ds = torch.utils.data.TensorDataset(
+                X_tr, Y_sens_tr, Y_rul_tr, Y_hi_tr, cond_tr, future_cond_tr, horizon_mask_tr
+            )
+            val_ds = torch.utils.data.TensorDataset(
+                X_val, Y_sens_val, Y_rul_val, Y_hi_val, cond_val, future_cond_val, horizon_mask_val
+            )
+        else:
+            train_ds = torch.utils.data.TensorDataset(
+                X_tr, Y_sens_tr, Y_rul_tr, Y_hi_tr, cond_tr, future_cond_tr
+            )
+            val_ds = torch.utils.data.TensorDataset(
+                X_val, Y_sens_val, Y_rul_val, Y_hi_val, cond_val, future_cond_val
+            )
 
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, drop_last=False
@@ -2604,11 +2644,19 @@ def train_transformer_world_model_v1(
         cap_weight_batches = 0
 
         for batch_idx, batch in enumerate(train_loader):
-            # Backwards-compatible unpacking (optionally includes unit_id and t_end_pos for audits)
+            # Backwards-compatible unpacking (optionally includes horizon_mask, unit_id and t_end_pos for audits)
             unit_ids_b = None
             t_end_b = None
-            if isinstance(batch, (tuple, list)) and len(batch) == 8:
-                X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b, unit_ids_b, t_end_b = batch
+            mask_batch = None
+            if isinstance(batch, (tuple, list)):
+                if len(batch) == 9:  # With horizon_mask + unit_ids + t_end
+                    X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b, mask_batch, unit_ids_b, t_end_b = batch
+                elif len(batch) == 8:  # With unit_ids + t_end (no mask)
+                    X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b, unit_ids_b, t_end_b = batch
+                elif len(batch) == 7:  # With horizon_mask only
+                    X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b, mask_batch = batch
+                else:  # Standard 6-tuple
+                    X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b = batch
             else:
                 X_b, Y_sens_b, Y_rul_b, Y_hi_b, cond_b, future_cond_b = batch
             X_b = X_b.to(device)
@@ -2617,6 +2665,8 @@ def train_transformer_world_model_v1(
             Y_hi_b = Y_hi_b.to(device)
             cond_b = cond_b.to(device)
             future_cond_b = future_cond_b.to(device)
+            if mask_batch is not None:
+                mask_batch = mask_batch.to(device)
             if unit_ids_b is not None:
                 unit_ids_b = unit_ids_b.to(device)
             if t_end_b is not None:
@@ -2989,6 +3039,29 @@ def train_transformer_world_model_v1(
                     mask_f = mask.float()
 
                     # ----------------------------------------------------------
+                    # Extract and prepare horizon mask (for padding-aware loss)
+                    # ----------------------------------------------------------
+                    if use_horizon_mask and mask_batch is not None:
+                        valid_mask_seq = mask_batch  # (B, H, 1) or (B, H)
+                    else:
+                        # No-op: create all-ones mask if horizon masking is disabled
+                        valid_mask_seq = torch.ones_like(true_rul_seq_norm[:, :, 0])  # (B, H)
+                    
+                    # Fix shape/broadcasting: ensure valid_mask_seq is (B, H)
+                    if valid_mask_seq.dim() == 3 and valid_mask_seq.size(-1) == 1:
+                        valid_mask_seq = valid_mask_seq.squeeze(-1)  # (B, H)
+                    elif valid_mask_seq.dim() == 2:
+                        pass  # Already (B, H)
+                    else:
+                        raise ValueError(f"Unexpected valid_mask_seq shape: {valid_mask_seq.shape}")
+                    
+                    # Expand to (B, H, 1) for multiplication with mask_f
+                    valid_mask_seq_exp = valid_mask_seq.unsqueeze(-1)  # (B, H, 1)
+                    
+                    # Combine masks: apply horizon mask to mask_f
+                    mask_rul = mask_f * valid_mask_seq_exp  # (B, H, 1)
+
+                    # ----------------------------------------------------------
                     # P0.1: Soft cap weighting (ADR-0010)
                     # Apply to RUL future loss ONLY, not to HI or other losses.
                     # ----------------------------------------------------------
@@ -3003,6 +3076,9 @@ def train_transformer_world_model_v1(
                         # Soft weight: power gives gradual ramp from cap to low RUL
                         soft_cap_weight = cap_distance.pow(soft_cap_power)
                         soft_cap_weight = soft_cap_weight.clamp(soft_cap_floor, 1.0)  # Never fully zero
+                        
+                        # IMPORTANT: Apply horizon mask to soft cap weights
+                        soft_cap_weight = soft_cap_weight * valid_mask_seq_exp  # Zero out padded timesteps
                     else:
                         soft_cap_weight = None  # Fall back to binary masking
 
@@ -3021,6 +3097,17 @@ def train_transformer_world_model_v1(
                     early_drop_frac_sum += early_drop_frac
                     mask_keep_frac_sum += mask_keep_frac
                     mask_batches += 1
+                    
+                    # Horizon mask statistics (for padding-aware loss) - log after loss computation
+                    valid_frac = float(mask_rul.mean().detach().cpu())
+                    pad_frac_batch = 1.0 - float(valid_mask_seq.mean().detach().cpu())
+                    
+                    # Log on first epoch / first batch (before loss computation)
+                    if epoch == 0 and batch_idx == 0:
+                        print(f"[HorizonMask] use_horizon_mask={use_horizon_mask}")
+                        print(f"[HorizonMask] valid_frac={valid_frac:.4f} pad_frac={pad_frac_batch:.4f}")
+                        if pad_frac_batch < 1e-4:
+                            print("[HorizonMask] WARNING: No padding detected in this batch")
 
                     # Sample weighting (late-life emphasis) – based on true RUL at t=0
                     if w_power > 0.0:
@@ -3032,12 +3119,18 @@ def train_transformer_world_model_v1(
 
                     # Apply late-window weighting per sample (after time reduction).
                     # We define "future hits zero" using the normalized target horizon.
+                    # IMPORTANT: Use only valid timesteps (exclude padded ones)
                     if late_weight_enable and late_weight_factor > 1.0:
-                        fut_min = true_rul_seq_norm[:, :, 0].min(dim=1).values  # (B,)
+                        # Compute fut_min using only valid timesteps
+                        invalid = (valid_mask_seq_exp == 0)
+                        true_rul_for_min = true_rul_seq_norm.clone()
+                        true_rul_for_min[invalid] = +1e9  # Set invalid timesteps to large value so they're ignored
+                        fut_min_valid = true_rul_for_min[:, :, 0].min(dim=1).values  # (B,)
+                        
                         if late_weight_mode in {"future_min_below_eps", "future_has_zero"}:
-                            late_mask = (fut_min <= float(late_weight_eps_norm))
+                            late_mask = (fut_min_valid <= float(late_weight_eps_norm))
                         else:
-                            late_mask = (fut_min <= float(late_weight_eps_norm))
+                            late_mask = (fut_min_valid <= float(late_weight_eps_norm))
                         w_late = 1.0 + late_mask.float() * (float(late_weight_factor) - 1.0)  # (B,)
                         w_b = w_b * w_late
 
@@ -3127,6 +3220,11 @@ def train_transformer_world_model_v1(
                                 ],
                                 "frac_all_cap_future_batch": float(all_cap_mask.float().mean().detach().cpu()),
                                 "mask_keep_frac": float(mask_f.detach().mean().cpu()),
+                                "horizon_mask_stats": {
+                                    "use_horizon_mask": bool(use_horizon_mask),
+                                    "valid_frac": float(mask_rul.mean().detach().cpu()),
+                                    "pad_frac": float(1.0 - valid_mask_seq.mean().detach().cpu()),
+                                },
                                 "w_b_min_mean_max": [
                                     float(w_b.detach().min().cpu()),
                                     float(w_b.detach().mean().cpu()),
@@ -3301,7 +3399,7 @@ def train_transformer_world_model_v1(
                         idx = torch.tensor(points, device=pred_rul_seq_norm.device, dtype=torch.long)
                         pred_sel = pred_rul_seq_norm[:, idx, :]  # (B,K,1)
                         true_sel = true_rul_seq_norm[:, idx, :]  # (B,K,1)
-                        mask_sel = mask_f[:, idx, :]             # (B,K,1)
+                        mask_sel = mask_rul[:, idx, :]             # (B,K,1) - use mask_rul (includes horizon mask)
                         w_bk = w_b.view(-1, 1, 1).expand(-1, pred_sel.size(1), -1)
                         diff2 = (pred_sel - true_sel) ** 2
                         # Per-sample normalized MSE on selected points, then apply per-sample weights.
@@ -3318,7 +3416,7 @@ def train_transformer_world_model_v1(
                         if rul_traj_late_ramp:
                             w_t = torch.linspace(0.2, 1.0, steps=pred_rul_seq_norm.size(1), device=pred_rul_seq_norm.device)
                             w_t = (w_t / w_t.mean()).view(1, -1, 1)  # (1,H,1)
-                            wt = (w_t * mask_f)
+                            wt = (w_t * mask_rul)  # Use mask_rul (includes horizon mask)
                             num_i = (diff2 * wt).sum(dim=(1, 2))  # (B,)
                             den_i = wt.sum(dim=(1, 2)).clamp_min(1e-6)  # (B,)
                             loss_i = num_i / den_i
@@ -3330,17 +3428,22 @@ def train_transformer_world_model_v1(
                             # P0.1: Use soft cap weighting when enabled (ADR-0010)
                             if soft_cap_enable and soft_cap_weight is not None:
                                 # Soft-weighted MSE (replaces binary masking for RUL future loss)
+                                # soft_cap_weight already has horizon mask applied
                                 num_i = (diff2 * soft_cap_weight).sum(dim=(1, 2))  # (B,)
                                 den_i = soft_cap_weight.sum(dim=(1, 2)).clamp_min(1e-6)  # (B,)
                             else:
-                                # Legacy binary masking path
-                                num_i = (diff2 * mask_f).sum(dim=(1, 2))  # (B,)
-                                den_i = mask_f.sum(dim=(1, 2)).clamp_min(1e-6)  # (B,)
+                                # Legacy binary masking path - use mask_rul (includes horizon mask)
+                                num_i = (diff2 * mask_rul).sum(dim=(1, 2))  # (B,)
+                                den_i = mask_rul.sum(dim=(1, 2)).clamp_min(1e-6)  # (B,)
                             loss_i = num_i / den_i
                             w_final = w_b
                             if cap_rw_enable and (cap_rw_apply_to in {"rul", "both"}):
                                 w_final = w_b * w_cap
                             loss_rul_traj = (w_final * loss_i).sum() / (w_final.sum() + 1e-6)
+                            
+                            # Log denom stats after computation (first epoch / first batch)
+                            if epoch == 0 and batch_idx == 0:
+                                print(f"[HorizonMask] denom(min/mean)={float(den_i.min().detach().cpu()):.2f}/{float(den_i.mean().detach().cpu()):.2f}")
 
                     w_traj = float(rul_traj_weight) if rul_traj_weight is not None else float(rul_w)
                     if w_traj > 0.0:
@@ -3351,7 +3454,8 @@ def train_transformer_world_model_v1(
                     # Monotonic decreasing penalty over horizon
                     if rul_mono_future_weight > 0.0:
                         delta = pred_rul_h[:, 1:] - pred_rul_h[:, :-1]
-                        mask_adj = (mask[:, 1:, 0] & mask[:, :-1, 0]).float()  # (B,H-1)
+                        # Use mask_rul for adjacent pairs (includes horizon mask)
+                        mask_adj = (mask_rul[:, 1:, 0] * mask_rul[:, :-1, 0]).float()  # (B,H-1)
                         loss_mono_future = (torch.relu(delta) ** 2 * mask_adj).sum() / (mask_adj.sum() + 1e-6)
                         loss = loss + rul_mono_future_weight * loss_mono_future
                     else:
@@ -3361,7 +3465,7 @@ def train_transformer_world_model_v1(
                     if rul_saturation_weight > 0.0:
                         # IMPORTANT: sat-mask is defined in NORMALIZED units (0..1), even if inputs were cycles.
                         thr_norm = float(1.0 - margin)
-                        mask_sat = ((true_rul_seq_norm < thr_norm) & mask).float()  # (B,H,1)
+                        mask_sat = ((true_rul_seq_norm < thr_norm) & (mask_rul > 0)).float()  # (B,H,1) - use mask_rul
                         sat_err2 = torch.relu(pred_rul_seq_norm - (1.0 - margin)) ** 2
                         loss_sat = (sat_err2 * mask_sat).sum() / (mask_sat.sum() + 1e-6)
                         loss = loss + rul_saturation_weight * loss_sat
