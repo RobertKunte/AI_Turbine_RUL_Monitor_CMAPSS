@@ -213,28 +213,16 @@ def train_world_model_universal_v3(
     eval_clip_y_true = bool(getattr(world_model_config, "eval_clip_y_true_to_max_rul", False))
     
     # Stage -1: FD004 hard enforcement of capped targets (no opt-out)
+    # Since WorldModelTrainingConfig is a dataclass with defaults, all attributes always exist.
+    # For FD004, we always enforce True regardless of user config.
     if dataset_name.upper() == "FD004":
-        # Check if user explicitly tried to disable (only if attribute exists and is False)
-        user_cap_rul_targets_attr = getattr(world_model_config, "cap_rul_targets_to_max_rul", None)
-        user_eval_clip_attr = getattr(world_model_config, "eval_clip_y_true_to_max_rul", None)
-        
-        # Force capped semantics for FD004 (regardless of user config)
+        # Force all capped semantics flags to True for FD004
         cap_targets = True
         eval_clip_y_true = True
         
-        # Only raise error if user EXPLICITLY set to False (attribute exists and is False)
-        if user_cap_rul_targets_attr is not None and not bool(user_cap_rul_targets_attr):
-            raise ValueError(
-                f"[Stage-1] FD004 requires capped RUL semantics. "
-                f"User config explicitly set cap_rul_targets_to_max_rul=False, "
-                f"but FD004 requires True (literature-consistent censored data handling)."
-            )
-        if user_eval_clip_attr is not None and not bool(user_eval_clip_attr):
-            raise ValueError(
-                f"[Stage-1] FD004 requires capped RUL semantics. "
-                f"User config explicitly set eval_clip_y_true_to_max_rul=False, "
-                f"but FD004 requires True (literature-consistent censored data handling)."
-            )
+        # Also set on the config object for consistency (used later in training loop)
+        world_model_config.cap_rul_targets_to_max_rul = True
+        world_model_config.eval_clip_y_true_to_max_rul = True
         
         print(f"[Stage-1] FD004: Enforced cap_targets=True, cap_rul_targets_to_max_rul=True, eval_clip_y_true_to_max_rul=True")
 
