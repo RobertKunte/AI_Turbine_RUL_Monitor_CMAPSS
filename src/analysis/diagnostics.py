@@ -53,6 +53,7 @@ from src.additional_features import (
     group_feature_columns,
 )
 from src.feature_safety import remove_rul_leakage, check_feature_dimensions
+from src.utils.feature_pipeline_contract import validate_feature_pipeline_config
 from src.eol_full_lstm import (
     build_full_eol_sequences_from_df,
     build_test_sequences_from_df,
@@ -476,6 +477,8 @@ def build_eval_data(
     extra_temporal_max_cols: Optional[int] = None,
     windows_short: Optional[Tuple[int, ...]] = None,
     windows_long: Optional[Tuple[int, ...]] = None,
+    extra_temporal_base_cols_selected: Optional[List[str]] = None,
+    experiment_dir: Optional[Path] = None,
     ) -> Tuple[
     np.ndarray,        # X_test_scaled
     np.ndarray,        # y_true_eol (capped)
@@ -577,19 +580,43 @@ def build_eval_data(
     # 4b) Extra temporal features for extra base columns (e.g., Twin_*, Resid_*)
     # This matches the exact sequence in run_experiments.py (lines 509-555)
     # Not a "special path" - this is part of the normal training pipeline
+    # IMPORTANT: Use explicit base columns list from config if available (schema_version=2)
     if extra_temporal_prefixes and feature_config.add_temporal_features:
         if windows_short is None:
             windows_short = (5, 10)
         if windows_long is None:
             windows_long = (30,)
-        prefixes = [str(p) for p in extra_temporal_prefixes]
-        candidates = [
-            c for c in df_train_fe.columns
-            if any(c.startswith(p) for p in prefixes)
-        ]
-        candidates = sorted(set(candidates))
-        if extra_temporal_max_cols is not None:
-            candidates = candidates[: int(extra_temporal_max_cols)]
+        
+        # Use explicit base columns list if available (schema_version=2)
+        if extra_temporal_base_cols_selected:
+            # Use exact base columns from training config
+            prefixes = [str(p) for p in extra_temporal_prefixes]
+            available_base_cols = [
+                c for c in df_train_fe.columns
+                if any(c.startswith(p) for p in prefixes)
+            ]
+            # Intersect with selected base cols (must exist in diagnostics data)
+            candidates = [col for col in extra_temporal_base_cols_selected if col in available_base_cols]
+            missing_base_cols = [col for col in extra_temporal_base_cols_selected if col not in available_base_cols]
+            if missing_base_cols:
+                raise ValueError(
+                    f"[Stage-1] Missing extra temporal base columns from config: {len(missing_base_cols)} missing. "
+                    f"First 20: {missing_base_cols[:20]}. "
+                    f"This indicates digital-twin/residual features were not generated correctly in diagnostics."
+                )
+            # Preserve order from config (or sort if needed for determinism)
+            candidates = sorted(candidates)  # Sort for determinism, but config order is preserved in selection
+        else:
+            # Legacy mode: search by prefix (may produce different count)
+            prefixes = [str(p) for p in extra_temporal_prefixes]
+            candidates = [
+                c for c in df_train_fe.columns
+                if any(c.startswith(p) for p in prefixes)
+            ]
+            candidates = sorted(set(candidates))
+            if extra_temporal_max_cols is not None:
+                candidates = candidates[: int(extra_temporal_max_cols)]
+        
         if candidates:
             print(
                 f"[Stage-1] Adding extra temporal features (normal pipeline): "
@@ -638,13 +665,30 @@ def build_eval_data(
         if missing_features:
             missing_list = sorted(list(missing_features))
             missing_sample = missing_list[:20]
+            
+            # Write debug dumps (if experiment_dir provided)
+            debug_available_path = None
+            debug_missing_path = None
+            if experiment_dir is not None:
+                debug_available_path = experiment_dir / "diagnostics_feature_cols_available.json"
+                debug_missing_path = experiment_dir / "diagnostics_feature_cols_missing.json"
+                try:
+                    with open(debug_available_path, "w") as f:
+                        json.dump(feature_cols_available[:2000] if len(feature_cols_available) > 2000 else feature_cols_available, f, indent=2)
+                    with open(debug_missing_path, "w") as f:
+                        json.dump(missing_list[:2000] if len(missing_list) > 2000 else missing_list, f, indent=2)
+                    print(f"[Stage-1] Debug dumps written: {debug_available_path}, {debug_missing_path}")
+                except Exception as e:
+                    print(f"[Stage-1] Failed to write debug dumps: {e}")
+            
+            debug_msg = f"\nDebug dumps: {debug_available_path}, {debug_missing_path}" if debug_available_path else ""
             raise ValueError(
                 f"[Stage-1] Feature contract violation: {len(missing_features)} features from training "
                 f"not found in diagnostics data.\n"
                 f"Missing features (first 20): {missing_sample}\n"
                 f"This indicates feature_pipeline_config.json was not applied correctly or "
                 f"feature builder mismatch. Check that digital-twin residuals, condition vectors, "
-                f"and extra temporal features are enabled as in training."
+                f"and extra temporal features are enabled as in training.{debug_msg}"
             )
         
         # Use exact training feature list (preserves order)
@@ -1807,11 +1851,24 @@ def run_diagnostics_for_run(
     combined_long = windows_medium + windows_long
     extra_temporal_base_prefixes = ms_cfg_pipeline.get("extra_temporal_base_prefixes", [])
     extra_temporal_base_max_cols = ms_cfg_pipeline.get("extra_temporal_base_max_cols", None)
+    extra_temporal_base_cols_selected = ms_cfg_pipeline.get("extra_temporal_base_cols_selected", [])
+    
+    # Validate config schema
+    issues = validate_feature_pipeline_config(feature_pipeline_config)
+    if issues:
+        raise ValueError(
+            f"[Stage-1] Invalid feature_pipeline_config.json: {issues}. "
+            f"Re-run training to regenerate with schema_version=2."
+        )
     
     print(f"[Stage-1] Applied pipeline config:")
     print(f"  multiscale={use_temporal_features} windows_short={windows_short} windows_medium={windows_medium} windows_long={windows_long}")
     if extra_temporal_base_prefixes:
-        print(f"  extra_temporal_base_prefixes={extra_temporal_base_prefixes} extra_temporal_base_max_cols={extra_temporal_base_max_cols}")
+        print(f"  extra_temporal_base_prefixes={extra_temporal_base_prefixes}")
+        if extra_temporal_base_cols_selected:
+            print(f"  extra_temporal_base_cols_selected: {len(extra_temporal_base_cols_selected)} columns (explicit list)")
+        else:
+            print(f"  extra_temporal_base_max_cols={extra_temporal_base_max_cols} (legacy mode)")
     
     # Feature configs - must match training pipeline exactly
     from src.config import ResidualFeatureConfig
@@ -1952,6 +2009,8 @@ def run_diagnostics_for_run(
         extra_temporal_max_cols=extra_temporal_base_max_cols,
         windows_short=windows_short,
         windows_long=combined_long if combined_long else (30,),
+        extra_temporal_base_cols_selected=extra_temporal_base_cols_selected,
+        experiment_dir=experiment_dir,
     )
 
     # For damage_v3-style experiments, compute HI_phys_v3 on the test features

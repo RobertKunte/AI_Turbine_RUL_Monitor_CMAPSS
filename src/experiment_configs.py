@@ -1188,7 +1188,7 @@ def get_fd004_wm_v1_p0_softcap_k3_config() -> ExperimentConfig:
     cfg = copy.deepcopy(get_fd004_wm_v1_infwin_capmask_k2_config())
     cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3"
     cfg.setdefault("training_params", {})
-    cfg["training_params"]["num_epochs"] = 30  # More epochs to see effect
+    cfg["training_params"]["num_epochs"] = 10
 
     wmp = cfg.setdefault("world_model_params", {})
     

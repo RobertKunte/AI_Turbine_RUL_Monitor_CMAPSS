@@ -61,6 +61,10 @@ from src.eval.eol_eval import evaluate_eol_metrics
 from src.metrics import compute_last_per_unit_metrics, compute_all_samples_metrics
 from src.models.transformer_eol import EOLFullTransformerEncoder
 from src.models.transformer_world_model_v1 import TransformerWorldModelV1
+from src.utils.feature_pipeline_contract import (
+    derive_feature_pipeline_config_from_feature_cols,
+    validate_feature_pipeline_config,
+)
 
 
 def train_world_model_universal_v3(
@@ -1594,45 +1598,51 @@ def train_world_model_universal_v3(
     print(f"[Stage-1] Saved feature_cols.json ({len(feature_cols)} features) to {feature_cols_path}")
     
     # Stage -1: Save feature pipeline config for diagnostics reconstruction
-    # Prefer using provided config (from effective experiment config); fallback to inference only if needed
+    # Use deterministic derivation from feature_cols to ensure exact reconstruction
     if feature_pipeline_config is None:
-        # Fallback: Infer minimal config from feature column names (unreliable, log warning)
-        has_resid = any("Resid_" in c for c in feature_cols)
-        has_twin = any("Twin_" in c for c in feature_cols)
-        has_cond = any("Cond_" in c for c in feature_cols)
-        has_multiscale = any("_roll_mean_" in c or "_trend_" in c or "_delta_" in c for c in feature_cols)
-        
-        print(f"⚠️ [Stage-1] feature_pipeline_config not provided; inferring from feature_cols (fallback; may be unreliable)")
-        print(f"   Inferred: resid={has_resid}, twin={has_twin}, cond={has_cond}, multiscale={has_multiscale}")
-        
-        # Minimal inference: only booleans, do NOT guess window sizes
-        feature_pipeline_config = {
-            "schema_version": 1,
-            "dataset": dataset_name,
-            "features": {
-                "use_multiscale_features": has_multiscale,
-                "multiscale": {
-                    "windows_short": [5, 10],  # Default, not inferred
-                    "windows_medium": [],
-                    "windows_long": [30],  # Default, not inferred
-                    "extra_temporal_base_prefixes": ["Twin_", "Resid_"] if (has_twin or has_resid) else [],
-                    "extra_temporal_base_max_cols": None,
-                }
-            },
-            "phys_features": {
-                "use_condition_vector": has_cond,
-                "condition_vector_version": 3 if has_cond else 2,  # Default to v3 if present
-                "use_digital_twin_residuals": has_twin,
-                "twin_baseline_len": 30,  # Default
-            },
-            "use_residuals": has_resid,  # Phase 4 residuals
-        }
+        # Derive config deterministically from actual feature columns
+        feature_pipeline_config = derive_feature_pipeline_config_from_feature_cols(
+            feature_cols=feature_cols,
+            dataset=dataset_name,
+            default_twin_baseline_len=30,
+            default_condition_vector_version=3,
+        )
+        ms_cfg = feature_pipeline_config["features"]["multiscale"]
+        print(f"[Stage-1] feature_pipeline_config not provided; derived from feature_cols (schema_version=2)")
+        print(f"   windows_short={ms_cfg['windows_short']}, windows_medium={ms_cfg['windows_medium']}, windows_long={ms_cfg['windows_long']}")
+        print(f"   extra_temporal_base_cols_selected=<{len(ms_cfg.get('extra_temporal_base_cols_selected', []))}>")
     else:
         # Ensure schema_version and dataset are set
         if "schema_version" not in feature_pipeline_config:
-            feature_pipeline_config["schema_version"] = 1
+            feature_pipeline_config["schema_version"] = 2
         if "dataset" not in feature_pipeline_config:
             feature_pipeline_config["dataset"] = dataset_name
+        
+        # If provided config lacks extra_temporal_base_cols_selected, derive and fill it
+        ms_cfg = feature_pipeline_config.get("features", {}).get("multiscale", {})
+        if "extra_temporal_base_cols_selected" not in ms_cfg:
+            print(f"[Stage-1] Provided config missing extra_temporal_base_cols_selected; deriving from feature_cols")
+            derived_config = derive_feature_pipeline_config_from_feature_cols(
+                feature_cols=feature_cols,
+                dataset=dataset_name,
+                default_twin_baseline_len=feature_pipeline_config.get("phys_features", {}).get("twin_baseline_len", 30),
+                default_condition_vector_version=feature_pipeline_config.get("phys_features", {}).get("condition_vector_version", 3),
+            )
+            ms_cfg["extra_temporal_base_cols_selected"] = derived_config["features"]["multiscale"]["extra_temporal_base_cols_selected"]
+            ms_cfg["extra_temporal_base_max_cols"] = len(ms_cfg["extra_temporal_base_cols_selected"])
+            feature_pipeline_config["schema_version"] = 2
+        
+        # Validate config
+        issues = validate_feature_pipeline_config(feature_pipeline_config)
+        if issues:
+            print(f"⚠️ [Stage-1] Config validation issues: {issues}")
+            print(f"   Deriving complete config from feature_cols to fix issues")
+            feature_pipeline_config = derive_feature_pipeline_config_from_feature_cols(
+                feature_cols=feature_cols,
+                dataset=dataset_name,
+                default_twin_baseline_len=feature_pipeline_config.get("phys_features", {}).get("twin_baseline_len", 30),
+                default_condition_vector_version=feature_pipeline_config.get("phys_features", {}).get("condition_vector_version", 3),
+            )
     
     # Log key toggles
     features_cfg = feature_pipeline_config.get("features", {})
@@ -1645,8 +1655,13 @@ def train_world_model_universal_v3(
     feature_pipeline_config_path = results_dir / "feature_pipeline_config.json"
     with open(feature_pipeline_config_path, "w") as f:
         json.dump(feature_pipeline_config, f, indent=2)
-    print(f"[Stage-1] Saved feature_pipeline_config.json (schema_version={feature_pipeline_config.get('schema_version', 1)}) to {feature_pipeline_config_path}")
+    schema_ver = feature_pipeline_config.get("schema_version", 1)
+    print(f"[Stage-1] Saved feature_pipeline_config.json (schema_version={schema_ver}) to {feature_pipeline_config_path}")
     print(f"   Config: multiscale={use_multiscale}, twin={use_twin}, resid={use_resid}, cond={use_cond}")
+    if schema_ver >= 2:
+        ms_cfg = feature_pipeline_config.get("features", {}).get("multiscale", {})
+        base_cols_count = len(ms_cfg.get("extra_temporal_base_cols_selected", []))
+        print(f"   extra_temporal_base_cols_selected: {base_cols_count} columns")
 
     # Save split metrics as standalone artifact (standard name)
     try:
