@@ -214,22 +214,26 @@ def train_world_model_universal_v3(
     
     # Stage -1: FD004 hard enforcement of capped targets (no opt-out)
     if dataset_name.upper() == "FD004":
-        user_cap_targets = cap_targets
-        user_cap_rul_targets = bool(getattr(world_model_config, "cap_rul_targets_to_max_rul", False))
-        user_eval_clip = eval_clip_y_true
+        # Check if user explicitly tried to disable (only if attribute exists and is False)
+        user_cap_rul_targets_attr = getattr(world_model_config, "cap_rul_targets_to_max_rul", None)
+        user_eval_clip_attr = getattr(world_model_config, "eval_clip_y_true_to_max_rul", None)
         
-        # Force capped semantics for FD004
+        # Force capped semantics for FD004 (regardless of user config)
         cap_targets = True
         eval_clip_y_true = True
         
-        # Check if user tried to disable (fail-fast)
-        if not user_cap_targets or not user_cap_rul_targets or not user_eval_clip:
+        # Only raise error if user EXPLICITLY set to False (attribute exists and is False)
+        if user_cap_rul_targets_attr is not None and not bool(user_cap_rul_targets_attr):
             raise ValueError(
                 f"[Stage-1] FD004 requires capped RUL semantics. "
-                f"User config had cap_targets={user_cap_targets}, "
-                f"cap_rul_targets_to_max_rul={user_cap_rul_targets}, "
-                f"eval_clip_y_true_to_max_rul={user_eval_clip}. "
-                f"All must be True for FD004 (literature-consistent censored data handling)."
+                f"User config explicitly set cap_rul_targets_to_max_rul=False, "
+                f"but FD004 requires True (literature-consistent censored data handling)."
+            )
+        if user_eval_clip_attr is not None and not bool(user_eval_clip_attr):
+            raise ValueError(
+                f"[Stage-1] FD004 requires capped RUL semantics. "
+                f"User config explicitly set eval_clip_y_true_to_max_rul=False, "
+                f"but FD004 requires True (literature-consistent censored data handling)."
             )
         
         print(f"[Stage-1] FD004: Enforced cap_targets=True, cap_rul_targets_to_max_rul=True, eval_clip_y_true_to_max_rul=True")
