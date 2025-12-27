@@ -44,6 +44,7 @@ from src.data_loading import load_cmapps_subset
 from src.additional_features import (
     create_physical_features,
     create_all_features,
+    add_temporal_features,
     FeatureConfig,
     TemporalFeatureConfig,
     PhysicsFeatureConfig,
@@ -471,6 +472,10 @@ def build_eval_data(
     physics_config: PhysicsFeatureConfig,
     phys_features: Optional[Dict] = None,
     feature_cols_json_path: Optional[Path] = None,
+    extra_temporal_prefixes: Optional[List[str]] = None,
+    extra_temporal_max_cols: Optional[int] = None,
+    windows_short: Optional[Tuple[int, ...]] = None,
+    windows_long: Optional[Tuple[int, ...]] = None,
     ) -> Tuple[
     np.ndarray,        # X_test_scaled
     np.ndarray,        # y_true_eol (capped)
@@ -565,9 +570,55 @@ def build_eval_data(
         )
         df_test_fe = twin_model.add_twin_and_residuals(df_test_fe)
 
-    # 4) Temporale/multi-scale Features
+    # 4) Temporale/multi-scale Features (normal pipeline, matches training)
     df_train_fe = create_all_features(df_train_fe, "UnitNumber", "TimeInCycles", feature_config, inplace=False, physics_config=physics_config)
     df_test_fe = create_all_features(df_test_fe, "UnitNumber", "TimeInCycles", feature_config, inplace=False, physics_config=physics_config)
+    
+    # 4b) Extra temporal features for extra base columns (e.g., Twin_*, Resid_*)
+    # This matches the exact sequence in run_experiments.py (lines 509-555)
+    # Not a "special path" - this is part of the normal training pipeline
+    if extra_temporal_prefixes and feature_config.add_temporal_features:
+        if windows_short is None:
+            windows_short = (5, 10)
+        if windows_long is None:
+            windows_long = (30,)
+        prefixes = [str(p) for p in extra_temporal_prefixes]
+        candidates = [
+            c for c in df_train_fe.columns
+            if any(c.startswith(p) for p in prefixes)
+        ]
+        candidates = sorted(set(candidates))
+        if extra_temporal_max_cols is not None:
+            candidates = candidates[: int(extra_temporal_max_cols)]
+        if candidates:
+            print(
+                f"[Stage-1] Adding extra temporal features (normal pipeline): "
+                f"prefixes={prefixes} count={len(candidates)}"
+            )
+            extra_temporal_cfg = TemporalFeatureConfig(
+                base_cols=candidates,
+                short_windows=windows_short,
+                long_windows=windows_long,
+                add_rolling_mean=True,
+                add_rolling_std=False,
+                add_trend=True,
+                add_delta=True,
+                delta_lags=(5, 10),
+            )
+            df_train_fe = add_temporal_features(
+                df_train_fe,
+                unit_col="UnitNumber",
+                cycle_col="TimeInCycles",
+                config=extra_temporal_cfg,
+                inplace=False,
+            )
+            df_test_fe = add_temporal_features(
+                df_test_fe,
+                unit_col="UnitNumber",
+                cycle_col="TimeInCycles",
+                config=extra_temporal_cfg,
+                inplace=False,
+            )
     
     # Stage -1: Load feature columns from training artifact (exact order/selection)
     if feature_cols_json_path is not None and feature_cols_json_path.exists():
@@ -582,12 +633,18 @@ def build_eval_data(
         ]
         feature_cols_available, _ = remove_rul_leakage(feature_cols_available)
         
-        # Verify all training features exist in diagnostics data
+        # Stage -1: Strict feature contract - verify ALL training features exist
         missing_features = set(feature_cols_training) - set(feature_cols_available)
         if missing_features:
+            missing_list = sorted(list(missing_features))
+            missing_sample = missing_list[:20]
             raise ValueError(
-                f"[Stage-1] Feature mismatch: {len(missing_features)} features from training "
-                f"not found in diagnostics data: {list(missing_features)[:10]}..."
+                f"[Stage-1] Feature contract violation: {len(missing_features)} features from training "
+                f"not found in diagnostics data.\n"
+                f"Missing features (first 20): {missing_sample}\n"
+                f"This indicates feature_pipeline_config.json was not applied correctly or "
+                f"feature builder mismatch. Check that digital-twin residuals, condition vectors, "
+                f"and extra temporal features are enabled as in training."
             )
         
         # Use exact training feature list (preserves order)
@@ -669,6 +726,12 @@ def build_eval_data(
             X_test_scaled[test_mask_cond] = scaler.transform(
                 X_test_np[test_mask_cond].reshape(-1, X_test_np.shape[-1])
             ).reshape(-1, past_len, len(feature_cols))
+    
+    # Stage -1: Validate feature dimensions match expectations (robust: use shape[-1])
+    feat_dim = X_test_scaled.shape[-1]
+    assert feat_dim == len(feature_cols), (
+        f"[Stage-1] Feature dimension mismatch: X_test_scaled.shape[-1]={feat_dim} != len(feature_cols)={len(feature_cols)}"
+    )
     
     # Build y_true_eol (capped) - EXACTLY as in notebook Cell 7
     # In the notebook: 
@@ -1717,32 +1780,53 @@ def run_diagnostics_for_run(
             is_phase4_residual = True
             print(f"  Assuming residual features for world model phase 4/5 experiment: {experiment_name}")
     
+    # Stage -1: Load feature pipeline config from training artifact
+    feature_pipeline_config_path = experiment_dir / "feature_pipeline_config.json"
+    if not feature_pipeline_config_path.exists():
+        raise ValueError(
+            f"[Stage-1] feature_pipeline_config.json not found at {feature_pipeline_config_path}. "
+            f"Diagnostics requires this artifact to reconstruct the exact feature pipeline used during training. "
+            f"Please re-run training to generate this artifact, or regenerate diagnostics with feature reconstruction."
+        )
+    
+    with open(feature_pipeline_config_path, "r") as f:
+        feature_pipeline_config = json.load(f)
+    print(f"[Stage-1] Loaded feature_pipeline_config.json from {feature_pipeline_config_path}")
+    
+    # Extract config sections
+    features_cfg_pipeline = feature_pipeline_config.get("features", {})
+    phys_features_cfg_pipeline = feature_pipeline_config.get("phys_features", {})
+    use_residuals_pipeline = feature_pipeline_config.get("use_residuals", False)
+    
+    # Apply feature pipeline config (override defaults)
+    ms_cfg_pipeline = features_cfg_pipeline.get("multiscale", {})
+    use_temporal_features = features_cfg_pipeline.get("use_multiscale_features", True)
+    windows_short = tuple(ms_cfg_pipeline.get("windows_short", (5, 10)))
+    windows_medium = tuple(ms_cfg_pipeline.get("windows_medium", ()))
+    windows_long = tuple(ms_cfg_pipeline.get("windows_long", (30,)))
+    combined_long = windows_medium + windows_long
+    extra_temporal_base_prefixes = ms_cfg_pipeline.get("extra_temporal_base_prefixes", [])
+    extra_temporal_base_max_cols = ms_cfg_pipeline.get("extra_temporal_base_max_cols", None)
+    
+    print(f"[Stage-1] Applied pipeline config:")
+    print(f"  multiscale={use_temporal_features} windows_short={windows_short} windows_medium={windows_medium} windows_long={windows_long}")
+    if extra_temporal_base_prefixes:
+        print(f"  extra_temporal_base_prefixes={extra_temporal_base_prefixes} extra_temporal_base_max_cols={extra_temporal_base_max_cols}")
+    
     # Feature configs - must match training pipeline exactly
     from src.config import ResidualFeatureConfig
     physics_config = PhysicsFeatureConfig(
         use_core=True,
         use_extended=False,
-        use_residuals=is_phase4_residual,  # Enable residuals for phase 4 experiments
+        use_residuals=use_residuals_pipeline,  # Use from pipeline config
         use_temporal_on_physics=False,
         residual=ResidualFeatureConfig(
-            enabled=is_phase4_residual,
+            enabled=use_residuals_pipeline,
             mode="per_engine",
             baseline_len=30,
             include_original=True,
-        ) if is_phase4_residual else ResidualFeatureConfig(enabled=False),
+        ) if use_residuals_pipeline else ResidualFeatureConfig(enabled=False),
     )
-
-    # Mirror the feature-block configuration used during training (run_experiments.py).
-    # If no explicit "features" section exists, we fall back to the legacy defaults
-    # (temporal multi-scale features enabled with windows 5/10/30).
-    features_cfg = config.get("features", {})
-    ms_cfg = features_cfg.get("multiscale", {})
-    use_temporal_features = features_cfg.get("use_multiscale_features", True)
-
-    windows_short = tuple(ms_cfg.get("windows_short", (5, 10)))
-    windows_medium = tuple(ms_cfg.get("windows_medium", ()))
-    windows_long = tuple(ms_cfg.get("windows_long", (30,)))
-    combined_long = windows_medium + windows_long
 
     temporal_cfg = TemporalFeatureConfig(
         base_cols=None,
@@ -1763,13 +1847,22 @@ def run_diagnostics_for_run(
     # ------------------------------------------------------------------
     # Build evaluation data
     # ------------------------------------------------------------------
-    # Physically-informed Transformer variants (transformer_encoder_phys_v2/v3/v4)
-    # und ms_dt_v1/v2-Experimente (ms+DT) nutzen während des Trainings einen
-    # kontinuierlichen Condition-Vektor + Digital-Twin-Residuals.
-    # Wenn phys_features in summary.json persistiert wurden, verwenden wir sie
-    # direkt; andernfalls rekonstruieren wir eine konsistente Default-Config
-    # basierend auf dem Experimentnamen (muss exakt zu run_experiments passen).
-    phys_features_cfg = config.get("phys_features", None)
+    # Apply phys_features from pipeline config (override summary.json fallback)
+    phys_features_cfg = phys_features_cfg_pipeline.copy() if phys_features_cfg_pipeline else config.get("phys_features", None)
+    
+    # Log applied config
+    use_phys_condition_vec = phys_features_cfg.get("use_condition_vector", False) if phys_features_cfg else False
+    use_twin_features_flag = bool(
+        phys_features_cfg.get("use_twin_features", False) if phys_features_cfg else False
+        or phys_features_cfg.get("use_digital_twin_residuals", False) if phys_features_cfg else False
+    ) if phys_features_cfg else False
+    
+    print(f"[Stage-1] Applied pipeline: use_digital_twin_residuals={use_twin_features_flag} twin_baseline_len={phys_features_cfg.get('twin_baseline_len', 30) if phys_features_cfg else 30}")
+    print(f"[Stage-1] Applied pipeline: use_condition_vector={use_phys_condition_vec} version={phys_features_cfg.get('condition_vector_version', 2) if phys_features_cfg else 2}")
+    
+    # Fallback to summary.json if pipeline config doesn't have phys_features (backwards compatibility)
+    if not phys_features_cfg:
+        phys_features_cfg = config.get("phys_features", None)
     if phys_features_cfg is None:
         name_lower = (experiment_name or run_name).lower()
         if "transformer_encoder_phys_v4" in name_lower:
@@ -1816,11 +1909,11 @@ def run_diagnostics_for_run(
         )
 
     print(f"[2] Building evaluation data ({dataset_name} pipeline)...")
-    # is_phase4_residual steuert nur die expliziten Physics-Residual-Features
+    # use_residuals_pipeline steuert nur die expliziten Physics-Residual-Features
     # (PhysicsFeatureConfig.use_residuals), NICHT die HealthyTwin-Residuals.
-    print(f"  Phase-4 residual features enabled (physics_config): {is_phase4_residual}")
+    print(f"  Phase-4 residual features enabled (physics_config): {use_residuals_pipeline}")
     print(f"  Digital-twin residuals enabled (phys_features):    {use_twin_features_flag}")
-    if is_phase4_residual:
+    if use_residuals_pipeline:
         print(f"  Residual config: mode={physics_config.residual.mode}, baseline_len={physics_config.residual.baseline_len}, include_original={physics_config.residual.include_original}")
     
     # Try to load scaler from experiment directory first to ensure consistency
@@ -1855,6 +1948,10 @@ def run_diagnostics_for_run(
         physics_config=physics_config,
         phys_features=phys_features_cfg,
         feature_cols_json_path=feature_cols_path,
+        extra_temporal_prefixes=extra_temporal_base_prefixes,
+        extra_temporal_max_cols=extra_temporal_base_max_cols,
+        windows_short=windows_short,
+        windows_long=combined_long if combined_long else (30,),
     )
 
     # For damage_v3-style experiments, compute HI_phys_v3 on the test features

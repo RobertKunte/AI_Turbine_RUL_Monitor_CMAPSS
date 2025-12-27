@@ -88,6 +88,7 @@ def train_world_model_universal_v3(
     world_model_config: Optional[WorldModelTrainingConfig] = None,
     results_dir: Optional[Path] = None,
     device: Optional[torch.device] = None,
+    feature_pipeline_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Train UniversalEncoderV2-based world model v3 with Health Index head.
@@ -1591,6 +1592,61 @@ def train_world_model_universal_v3(
     with open(feature_cols_path, "w") as f:
         json.dump(feature_cols, f, indent=2)
     print(f"[Stage-1] Saved feature_cols.json ({len(feature_cols)} features) to {feature_cols_path}")
+    
+    # Stage -1: Save feature pipeline config for diagnostics reconstruction
+    # Prefer using provided config (from effective experiment config); fallback to inference only if needed
+    if feature_pipeline_config is None:
+        # Fallback: Infer minimal config from feature column names (unreliable, log warning)
+        has_resid = any("Resid_" in c for c in feature_cols)
+        has_twin = any("Twin_" in c for c in feature_cols)
+        has_cond = any("Cond_" in c for c in feature_cols)
+        has_multiscale = any("_roll_mean_" in c or "_trend_" in c or "_delta_" in c for c in feature_cols)
+        
+        print(f"⚠️ [Stage-1] feature_pipeline_config not provided; inferring from feature_cols (fallback; may be unreliable)")
+        print(f"   Inferred: resid={has_resid}, twin={has_twin}, cond={has_cond}, multiscale={has_multiscale}")
+        
+        # Minimal inference: only booleans, do NOT guess window sizes
+        feature_pipeline_config = {
+            "schema_version": 1,
+            "dataset": dataset_name,
+            "features": {
+                "use_multiscale_features": has_multiscale,
+                "multiscale": {
+                    "windows_short": [5, 10],  # Default, not inferred
+                    "windows_medium": [],
+                    "windows_long": [30],  # Default, not inferred
+                    "extra_temporal_base_prefixes": ["Twin_", "Resid_"] if (has_twin or has_resid) else [],
+                    "extra_temporal_base_max_cols": None,
+                }
+            },
+            "phys_features": {
+                "use_condition_vector": has_cond,
+                "condition_vector_version": 3 if has_cond else 2,  # Default to v3 if present
+                "use_digital_twin_residuals": has_twin,
+                "twin_baseline_len": 30,  # Default
+            },
+            "use_residuals": has_resid,  # Phase 4 residuals
+        }
+    else:
+        # Ensure schema_version and dataset are set
+        if "schema_version" not in feature_pipeline_config:
+            feature_pipeline_config["schema_version"] = 1
+        if "dataset" not in feature_pipeline_config:
+            feature_pipeline_config["dataset"] = dataset_name
+    
+    # Log key toggles
+    features_cfg = feature_pipeline_config.get("features", {})
+    phys_features_cfg = feature_pipeline_config.get("phys_features", {})
+    use_multiscale = features_cfg.get("use_multiscale_features", True)
+    use_twin = phys_features_cfg.get("use_digital_twin_residuals", False)
+    use_resid = feature_pipeline_config.get("use_residuals", False)
+    use_cond = phys_features_cfg.get("use_condition_vector", False)
+    
+    feature_pipeline_config_path = results_dir / "feature_pipeline_config.json"
+    with open(feature_pipeline_config_path, "w") as f:
+        json.dump(feature_pipeline_config, f, indent=2)
+    print(f"[Stage-1] Saved feature_pipeline_config.json (schema_version={feature_pipeline_config.get('schema_version', 1)}) to {feature_pipeline_config_path}")
+    print(f"   Config: multiscale={use_multiscale}, twin={use_twin}, resid={use_resid}, cond={use_cond}")
 
     # Save split metrics as standalone artifact (standard name)
     try:
