@@ -1727,6 +1727,10 @@ def get_fd001_wm_v1_p0_softcap_k3_hm_pad_cap125_config() -> ExperimentConfig:
     cfg = copy.deepcopy(get_fd001_wm_v1_p0_softcap_k3_hm_pad_config())
     cfg["experiment_name"] = "fd001_wm_v1_p0_softcap_k3_hm_pad_cap125"
     
+    # Set training epochs to 50
+    cfg.setdefault("training_params", {})
+    cfg["training_params"]["num_epochs"] = 50
+    
     wmp = cfg.setdefault("world_model_params", {})
     
     # Delta test: capped to 125 for cross-dataset semantic alignment with FD004.
@@ -1753,6 +1757,10 @@ def get_fd002_wm_v1_p0_softcap_k3_hm_pad_cap125_config() -> ExperimentConfig:
     cfg = copy.deepcopy(get_fd002_wm_v1_p0_softcap_k3_hm_pad_config())
     cfg["experiment_name"] = "fd002_wm_v1_p0_softcap_k3_hm_pad_cap125"
     
+    # Set training epochs to 50
+    cfg.setdefault("training_params", {})
+    cfg["training_params"]["num_epochs"] = 50
+    
     wmp = cfg.setdefault("world_model_params", {})
     
     # Delta test: capped to 125 for cross-dataset semantic alignment with FD004.
@@ -1778,6 +1786,10 @@ def get_fd003_wm_v1_p0_softcap_k3_hm_pad_cap125_config() -> ExperimentConfig:
     """
     cfg = copy.deepcopy(get_fd003_wm_v1_p0_softcap_k3_hm_pad_config())
     cfg["experiment_name"] = "fd003_wm_v1_p0_softcap_k3_hm_pad_cap125"
+    
+    # Set training epochs to 50
+    cfg.setdefault("training_params", {})
+    cfg["training_params"]["num_epochs"] = 50
     
     wmp = cfg.setdefault("world_model_params", {})
     
