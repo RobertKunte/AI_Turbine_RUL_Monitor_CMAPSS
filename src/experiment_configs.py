@@ -1712,6 +1712,84 @@ def get_fd003_wm_v1_p0_softcap_k3_hm_pad_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd001_wm_v1_p0_softcap_k3_hm_pad_cap125_config() -> ExperimentConfig:
+    """
+    FD001 capped baseline: Delta test with explicit capping to 125 for cross-dataset semantic alignment with FD004.
+    
+    Based on fd001_wm_v1_p0_softcap_k3_hm_pad, with explicit capping flags enabled:
+      - cap_targets = True
+      - cap_rul_targets_to_max_rul = True
+      - eval_clip_y_true_to_max_rul = True
+      - max_rul = 125
+    
+    All other settings identical to uncapped baseline.
+    """
+    cfg = copy.deepcopy(get_fd001_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd001_wm_v1_p0_softcap_k3_hm_pad_cap125"
+    
+    wmp = cfg.setdefault("world_model_params", {})
+    
+    # Delta test: capped to 125 for cross-dataset semantic alignment with FD004.
+    wmp["cap_targets"] = True
+    wmp["cap_rul_targets_to_max_rul"] = True
+    wmp["eval_clip_y_true_to_max_rul"] = True
+    wmp["max_rul"] = 125  # Explicit for clarity
+    
+    return cfg
+
+
+def get_fd002_wm_v1_p0_softcap_k3_hm_pad_cap125_config() -> ExperimentConfig:
+    """
+    FD002 capped baseline: Delta test with explicit capping to 125 for cross-dataset semantic alignment with FD004.
+    
+    Based on fd002_wm_v1_p0_softcap_k3_hm_pad, with explicit capping flags enabled:
+      - cap_targets = True
+      - cap_rul_targets_to_max_rul = True
+      - eval_clip_y_true_to_max_rul = True
+      - max_rul = 125
+    
+    All other settings identical to uncapped baseline.
+    """
+    cfg = copy.deepcopy(get_fd002_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd002_wm_v1_p0_softcap_k3_hm_pad_cap125"
+    
+    wmp = cfg.setdefault("world_model_params", {})
+    
+    # Delta test: capped to 125 for cross-dataset semantic alignment with FD004.
+    wmp["cap_targets"] = True
+    wmp["cap_rul_targets_to_max_rul"] = True
+    wmp["eval_clip_y_true_to_max_rul"] = True
+    wmp["max_rul"] = 125  # Explicit for clarity
+    
+    return cfg
+
+
+def get_fd003_wm_v1_p0_softcap_k3_hm_pad_cap125_config() -> ExperimentConfig:
+    """
+    FD003 capped baseline: Delta test with explicit capping to 125 for cross-dataset semantic alignment with FD004.
+    
+    Based on fd003_wm_v1_p0_softcap_k3_hm_pad, with explicit capping flags enabled:
+      - cap_targets = True
+      - cap_rul_targets_to_max_rul = True
+      - eval_clip_y_true_to_max_rul = True
+      - max_rul = 125
+    
+    All other settings identical to uncapped baseline.
+    """
+    cfg = copy.deepcopy(get_fd003_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd003_wm_v1_p0_softcap_k3_hm_pad_cap125"
+    
+    wmp = cfg.setdefault("world_model_params", {})
+    
+    # Delta test: capped to 125 for cross-dataset semantic alignment with FD004.
+    wmp["cap_targets"] = True
+    wmp["cap_rul_targets_to_max_rul"] = True
+    wmp["eval_clip_y_true_to_max_rul"] = True
+    wmp["max_rul"] = 125  # Explicit for clarity
+    
+    return cfg
+
+
 def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config() -> ExperimentConfig:
     """
     Ablation to isolate collapse source: RUL-only (no HI anchor, no HI loss) + lower LR + earlier unfreeze.
@@ -4564,10 +4642,16 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_wm_v1_p0_softcap_k3_hm_pad_hm_off_config()
     if experiment_name == "fd001_wm_v1_p0_softcap_k3_hm_pad":
         return get_fd001_wm_v1_p0_softcap_k3_hm_pad_config()
+    if experiment_name == "fd001_wm_v1_p0_softcap_k3_hm_pad_cap125":
+        return get_fd001_wm_v1_p0_softcap_k3_hm_pad_cap125_config()
     if experiment_name == "fd002_wm_v1_p0_softcap_k3_hm_pad":
         return get_fd002_wm_v1_p0_softcap_k3_hm_pad_config()
+    if experiment_name == "fd002_wm_v1_p0_softcap_k3_hm_pad_cap125":
+        return get_fd002_wm_v1_p0_softcap_k3_hm_pad_cap125_config()
     if experiment_name == "fd003_wm_v1_p0_softcap_k3_hm_pad":
         return get_fd003_wm_v1_p0_softcap_k3_hm_pad_config()
+    if experiment_name == "fd003_wm_v1_p0_softcap_k3_hm_pad_cap125":
+        return get_fd003_wm_v1_p0_softcap_k3_hm_pad_cap125_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1":
         return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config()
     # Check for world model phase 5 v3 experiments first

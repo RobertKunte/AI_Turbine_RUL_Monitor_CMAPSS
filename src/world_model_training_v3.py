@@ -428,6 +428,9 @@ def train_world_model_universal_v3(
     # 5. Initialize model
     # ===================================================================
     print("\n[5] Initializing World Model v3...")
+    # Decoder type selection (default: "lstm")
+    decoder_type = str(getattr(world_model_config, "decoder_type", "lstm"))
+    
     model = WorldModelUniversalV3(
         input_size=len(feature_cols),
         d_model=d_model,
@@ -445,12 +448,18 @@ def train_world_model_universal_v3(
         horizon=horizon,
         use_hi_in_eol=world_model_config.use_hi_in_eol,
         use_hi_slope_in_eol=world_model_config.use_hi_slope_in_eol,
+        decoder_type=decoder_type,
     ).to(device)
     
     num_params = sum(p.numel() for p in model.parameters())
     print(f"  Model parameters: {num_params:,}")
     print(f"  Encoder: UniversalEncoderV2 (d_model={d_model}, num_layers={num_layers})")
-    print(f"  Decoder: LSTM (num_layers={decoder_num_layers}, horizon={horizon})")
+    if decoder_type == "lstm":
+        print(f"  Decoder: LSTM (num_layers={decoder_num_layers}, horizon={horizon})")
+    elif decoder_type == "tf_ar":
+        print(f"  Decoder: Transformer AR (self-attn, num_layers={decoder_num_layers}, horizon={horizon})")
+    elif decoder_type == "tf_ar_xattn":
+        print(f"  Decoder: Transformer AR (cross-attn, num_layers={decoder_num_layers}, horizon={horizon})")
     print(f"  Heads: Trajectory, EOL, HI")
     
     # ===================================================================

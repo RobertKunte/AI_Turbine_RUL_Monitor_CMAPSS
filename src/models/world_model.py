@@ -728,6 +728,8 @@ class WorldModelUniversalV3(nn.Module):
         # v3 extensions: HI fusion into EOL head
         use_hi_in_eol: bool = False,
         use_hi_slope_in_eol: bool = False,
+        # Decoder type selection
+        decoder_type: str = "lstm",  # "lstm" (default) or "tf_ar" or "tf_ar_xattn"
     ):
         super().__init__()
         
@@ -744,6 +746,7 @@ class WorldModelUniversalV3(nn.Module):
         self.horizon = horizon
         self.use_hi_in_eol = use_hi_in_eol
         self.use_hi_slope_in_eol = use_hi_slope_in_eol
+        self.decoder_type = decoder_type
         
         # Import UniversalEncoderV2
         from .universal_encoder_v1 import UniversalEncoderV2
@@ -764,18 +767,41 @@ class WorldModelUniversalV3(nn.Module):
             max_seq_len=max_seq_len,
         )
         
-        # Decoder: LSTM for trajectory prediction (same as v2)
-        self.decoder = nn.LSTM(
-            input_size=1,  # Autoregressive: feed previous prediction
-            hidden_size=decoder_hidden_size,
-            num_layers=decoder_num_layers,
-            batch_first=True,
-            dropout=dropout if decoder_num_layers > 1 else 0.0,
-        )
-        
-        # Project encoder output to decoder initial hidden state
-        self.encoder_to_decoder_h = nn.Linear(d_model, decoder_hidden_size * decoder_num_layers)
-        self.encoder_to_decoder_c = nn.Linear(d_model, decoder_hidden_size * decoder_num_layers)
+        # Decoder: LSTM (default) or Transformer AR
+        if decoder_type == "lstm":
+            # LSTM decoder (default, unchanged)
+            self.decoder = nn.LSTM(
+                input_size=1,  # Autoregressive: feed previous prediction
+                hidden_size=decoder_hidden_size,
+                num_layers=decoder_num_layers,
+                batch_first=True,
+                dropout=dropout if decoder_num_layers > 1 else 0.0,
+            )
+            
+            # Project encoder output to decoder initial hidden state
+            self.encoder_to_decoder_h = nn.Linear(d_model, decoder_hidden_size * decoder_num_layers)
+            self.encoder_to_decoder_c = nn.Linear(d_model, decoder_hidden_size * decoder_num_layers)
+            self.tf_decoder = None
+        elif decoder_type in {"tf_ar", "tf_ar_xattn"}:
+            # Transformer AR decoder
+            from .decoders.transformer_ar_decoder import TransformerARDecoder
+            
+            use_cross_attention = (decoder_type == "tf_ar_xattn")
+            self.tf_decoder = TransformerARDecoder(
+                d_model=d_model,
+                nhead=nhead,
+                num_layers=decoder_num_layers,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                horizon=horizon,
+                use_cross_attention=use_cross_attention,
+            )
+            # LSTM decoder components not used, but keep for compatibility
+            self.decoder = None
+            self.encoder_to_decoder_h = None
+            self.encoder_to_decoder_c = None
+        else:
+            raise ValueError(f"Unknown decoder_type: {decoder_type}. Must be 'lstm', 'tf_ar', or 'tf_ar_xattn'")
         
         # Shared head (like RULHIUniversalModelV2) for HI and (base) EOL features
         self.shared_head = nn.Sequential(
@@ -785,7 +811,12 @@ class WorldModelUniversalV3(nn.Module):
         )
         
         # Trajectory-Head: Predicts HI-proxy trajectory from decoder output
-        self.traj_head = nn.Linear(decoder_hidden_size, 1)
+        # For LSTM: maps decoder hidden -> scalar
+        # For Transformer: output_head is inside TransformerARDecoder
+        if decoder_type == "lstm":
+            self.traj_head = nn.Linear(decoder_hidden_size, 1)
+        else:
+            self.traj_head = None  # Transformer decoder has its own output head
         
         # Determine number of additional HI features for EOL fusion
         hi_feat_dim = 0
@@ -851,47 +882,69 @@ class WorldModelUniversalV3(nn.Module):
         elif horizon is None:
             horizon = self.horizon
         
-        # Initialize decoder hidden state from encoder embedding
-        h_0 = self.encoder_to_decoder_h(enc_emb)  # (B, decoder_hidden_size * decoder_num_layers)
-        c_0 = self.encoder_to_decoder_c(enc_emb)  # (B, decoder_hidden_size * decoder_num_layers)
-        
-        # Reshape for LSTM: (num_layers, B, hidden_size)
-        h_0 = h_0.view(B, self.decoder_num_layers, -1).transpose(0, 1).contiguous()
-        c_0 = c_0.view(B, self.decoder_num_layers, -1).transpose(0, 1).contiguous()
-        
-        dec_hidden = (h_0, c_0)
-        
-        # Initial decoder input:
-        # - If we have decoder_targets (training/teacher forcing), start from first target step.
-        # - Otherwise:
-        #     * In HI-fusion mode: start from HI prediction (consistent with HI trajectory)
-        #     * In base mode: we will start from a simple EOL estimate later if needed.
-        if decoder_targets is not None:
-            dec_input = decoder_targets[:, 0:1, :]  # (B, 1, 1)
-        else:
-            if self.use_hi_in_eol:
-                dec_input = hi_pred.unsqueeze(1)  # (B, 1, 1)
-            else:
-                # Base mode without HI fusion: start from zeros (decoder learns its own dynamics)
-                dec_input = torch.zeros(B, 1, 1, device=encoder_inputs.device)
-        
-        # --- Decoder Loop ---
-        traj_outputs = []
-        for t in range(horizon):
-            dec_out, dec_hidden = self.decoder(dec_input, dec_hidden)
-            step_pred = self.traj_head(dec_out)  # (B, 1, 1) - HI-proxy prediction
-            traj_outputs.append(step_pred)
+        # Decoder forward: LSTM or Transformer AR
+        if self.decoder_type == "lstm":
+            # LSTM decoder path (original, unchanged)
+            # Initialize decoder hidden state from encoder embedding
+            h_0 = self.encoder_to_decoder_h(enc_emb)  # (B, decoder_hidden_size * decoder_num_layers)
+            c_0 = self.encoder_to_decoder_c(enc_emb)  # (B, decoder_hidden_size * decoder_num_layers)
             
-            # Teacher forcing or autoregressive
-            if decoder_targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
-                if t + 1 < decoder_targets.size(1):
-                    dec_input = decoder_targets[:, t + 1 : t + 2, :]
+            # Reshape for LSTM: (num_layers, B, hidden_size)
+            h_0 = h_0.view(B, self.decoder_num_layers, -1).transpose(0, 1).contiguous()
+            c_0 = c_0.view(B, self.decoder_num_layers, -1).transpose(0, 1).contiguous()
+            
+            dec_hidden = (h_0, c_0)
+            
+            # Initial decoder input:
+            # - If we have decoder_targets (training/teacher forcing), start from first target step.
+            # - Otherwise:
+            #     * In HI-fusion mode: start from HI prediction (consistent with HI trajectory)
+            #     * In base mode: we will start from a simple EOL estimate later if needed.
+            if decoder_targets is not None:
+                dec_input = decoder_targets[:, 0:1, :]  # (B, 1, 1)
+            else:
+                if self.use_hi_in_eol:
+                    dec_input = hi_pred.unsqueeze(1)  # (B, 1, 1)
+                else:
+                    # Base mode without HI fusion: start from zeros (decoder learns its own dynamics)
+                    dec_input = torch.zeros(B, 1, 1, device=encoder_inputs.device)
+            
+            # --- Decoder Loop ---
+            traj_outputs = []
+            for t in range(horizon):
+                dec_out, dec_hidden = self.decoder(dec_input, dec_hidden)
+                step_pred = self.traj_head(dec_out)  # (B, 1, 1) - HI-proxy prediction
+                traj_outputs.append(step_pred)
+                
+                # Teacher forcing or autoregressive
+                if decoder_targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                    if t + 1 < decoder_targets.size(1):
+                        dec_input = decoder_targets[:, t + 1 : t + 2, :]
+                    else:
+                        dec_input = step_pred
                 else:
                     dec_input = step_pred
-            else:
-                dec_input = step_pred
-        
-        traj_outputs = torch.cat(traj_outputs, dim=1)  # (B, H, 1)
+            
+            traj_outputs = torch.cat(traj_outputs, dim=1)  # (B, H, 1)
+            
+        else:
+            # Transformer AR decoder path
+            # Determine mode
+            mode = "train" if decoder_targets is not None else "inference"
+            
+            # For cross-attention variant, we would need encoder sequence
+            # But UniversalEncoderV2 returns only (B, d_model), not sequence
+            # So we pass None for enc_seq (decoder will use enc_token as fallback)
+            enc_seq = None
+            
+            # Call transformer decoder
+            traj_outputs = self.tf_decoder(
+                enc_token=enc_emb,  # (B, d_model)
+                y_teacher=decoder_targets,  # (B, H, 1) or None
+                enc_seq=enc_seq,  # None (encoder doesn't provide sequence)
+                cond_ctx=None,  # Reserved for future use
+                mode=mode,
+            )  # (B, H, 1)
         hi_seq = traj_outputs.squeeze(-1)  # (B, H)
 
         # --- EOL Head with optional HI fusion ---
