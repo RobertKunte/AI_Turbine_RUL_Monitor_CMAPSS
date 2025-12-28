@@ -1487,6 +1487,231 @@ def get_fd004_wm_v1_p0_softcap_k3_hm_pad_hm_off_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd001_wm_v1_p0_softcap_k3_hm_pad_config() -> ExperimentConfig:
+    """
+    FD001 baseline port: Same semantics as FD004 baseline (fd004_wm_v1_p0_softcap_k3_hm_pad).
+    
+    P0 cap-collapse fix (ADR-0010) + Stage-1 horizon padding:
+      - P0.1: soft_cap_enable=True (distance-based soft weighting, replaces binary masking)
+      - P0.2: informative_sampling_mode="uncapped_frac" with threshold=0.3
+      - keeps late weighting from previous experiments
+      - use_padded_horizon_targets=True (enables near-EOL windows in Stage-1)
+      - use_horizon_mask=True (masks padded timesteps in RUL loss)
+    
+    All settings identical to FD004 baseline except dataset=FD001.
+    """
+    # Start from FD001 transformer encoder config to get correct dataset/feature setup
+    base = get_fd001_transformer_encoder_ms_dt_v1_config()
+    
+    # Convert to world model config
+    cfg = copy.deepcopy(base)
+    cfg["experiment_name"] = "fd001_wm_v1_p0_softcap_k3_hm_pad"
+    cfg["dataset"] = "FD001"
+    cfg["encoder_type"] = "world_model_universal_v3"
+    
+    # Map encoder kwargs (same structure as FD004)
+    cfg["encoder_kwargs"] = {
+        "d_model": base["encoder_kwargs"]["d_model"],
+        "num_layers": base["encoder_kwargs"]["num_layers"],
+        "nhead": base["encoder_kwargs"]["n_heads"],
+        "dim_feedforward": base["encoder_kwargs"]["dim_feedforward"],
+        "dropout": base["encoder_kwargs"]["dropout"],
+        "kernel_sizes": base["encoder_kwargs"].get("kernel_sizes", [3, 5, 9]),
+        "seq_encoder_type": "transformer",
+        "decoder_num_layers": 1,
+    }
+    
+    # Training params (match FD004 baseline exactly)
+    cfg.setdefault("training_params", {})
+    cfg["training_params"]["num_epochs"] = 10
+    cfg["training_params"]["batch_size"] = 256
+    cfg["training_params"]["random_seed"] = 42
+    cfg["training_params"]["engine_train_ratio"] = 0.8
+    
+    # World model params (match FD004 baseline exactly)
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["max_rul"] = 125  # Explicit for comparability
+    wmp["past_len"] = 30
+    wmp["future_horizon"] = 30
+    
+    # P0.1: Soft cap weighting
+    wmp["soft_cap_enable"] = True
+    wmp["soft_cap_power"] = 0.5
+    wmp["soft_cap_floor"] = 0.05
+    wmp["cap_mask_enable"] = False
+    
+    # P0.2: Stricter informative sampling
+    wmp["informative_sampling_enable"] = True
+    wmp["informative_sampling_mode"] = "uncapped_frac"
+    wmp["informative_uncapped_frac_threshold"] = 0.3
+    wmp["keep_prob_noninformative"] = 0.05
+    
+    # Late weighting
+    wmp["late_weight_enable"] = True
+    wmp["late_weight_factor"] = 10.0
+    
+    # Horizon masking and padding (key semantics)
+    wmp["use_horizon_mask"] = True
+    wmp["use_padded_horizon_targets"] = True
+    
+    # Logging
+    wmp["debug_wiring_enable"] = True
+    wmp["debug_wiring_epochs"] = 1
+    wmp["log_informative_stats"] = True
+    
+    return cfg
+
+
+def get_fd002_wm_v1_p0_softcap_k3_hm_pad_config() -> ExperimentConfig:
+    """
+    FD002 baseline port: Same semantics as FD004 baseline (fd004_wm_v1_p0_softcap_k3_hm_pad).
+    
+    P0 cap-collapse fix (ADR-0010) + Stage-1 horizon padding:
+      - P0.1: soft_cap_enable=True (distance-based soft weighting, replaces binary masking)
+      - P0.2: informative_sampling_mode="uncapped_frac" with threshold=0.3
+      - keeps late weighting from previous experiments
+      - use_padded_horizon_targets=True (enables near-EOL windows in Stage-1)
+      - use_horizon_mask=True (masks padded timesteps in RUL loss)
+    
+    All settings identical to FD004 baseline except dataset=FD002.
+    """
+    # Start from FD002 transformer encoder config to get correct dataset/feature setup
+    base = get_fd002_transformer_encoder_ms_dt_v1_config()
+    
+    # Convert to world model config
+    cfg = copy.deepcopy(base)
+    cfg["experiment_name"] = "fd002_wm_v1_p0_softcap_k3_hm_pad"
+    cfg["dataset"] = "FD002"
+    cfg["encoder_type"] = "world_model_universal_v3"
+    
+    # Map encoder kwargs (same structure as FD004)
+    cfg["encoder_kwargs"] = {
+        "d_model": base["encoder_kwargs"]["d_model"],
+        "num_layers": base["encoder_kwargs"]["num_layers"],
+        "nhead": base["encoder_kwargs"]["n_heads"],
+        "dim_feedforward": base["encoder_kwargs"]["dim_feedforward"],
+        "dropout": base["encoder_kwargs"]["dropout"],
+        "kernel_sizes": base["encoder_kwargs"].get("kernel_sizes", [3, 5, 9]),
+        "seq_encoder_type": "transformer",
+        "decoder_num_layers": 1,
+    }
+    
+    # Training params (match FD004 baseline exactly)
+    cfg.setdefault("training_params", {})
+    cfg["training_params"]["num_epochs"] = 10
+    cfg["training_params"]["batch_size"] = 256
+    cfg["training_params"]["random_seed"] = 42
+    cfg["training_params"]["engine_train_ratio"] = 0.8
+    
+    # World model params (match FD004 baseline exactly)
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["max_rul"] = 125  # Explicit for comparability
+    wmp["past_len"] = 30
+    wmp["future_horizon"] = 30
+    
+    # P0.1: Soft cap weighting
+    wmp["soft_cap_enable"] = True
+    wmp["soft_cap_power"] = 0.5
+    wmp["soft_cap_floor"] = 0.05
+    wmp["cap_mask_enable"] = False
+    
+    # P0.2: Stricter informative sampling
+    wmp["informative_sampling_enable"] = True
+    wmp["informative_sampling_mode"] = "uncapped_frac"
+    wmp["informative_uncapped_frac_threshold"] = 0.3
+    wmp["keep_prob_noninformative"] = 0.05
+    
+    # Late weighting
+    wmp["late_weight_enable"] = True
+    wmp["late_weight_factor"] = 10.0
+    
+    # Horizon masking and padding (key semantics)
+    wmp["use_horizon_mask"] = True
+    wmp["use_padded_horizon_targets"] = True
+    
+    # Logging
+    wmp["debug_wiring_enable"] = True
+    wmp["debug_wiring_epochs"] = 1
+    wmp["log_informative_stats"] = True
+    
+    return cfg
+
+
+def get_fd003_wm_v1_p0_softcap_k3_hm_pad_config() -> ExperimentConfig:
+    """
+    FD003 baseline port: Same semantics as FD004 baseline (fd004_wm_v1_p0_softcap_k3_hm_pad).
+    
+    P0 cap-collapse fix (ADR-0010) + Stage-1 horizon padding:
+      - P0.1: soft_cap_enable=True (distance-based soft weighting, replaces binary masking)
+      - P0.2: informative_sampling_mode="uncapped_frac" with threshold=0.3
+      - keeps late weighting from previous experiments
+      - use_padded_horizon_targets=True (enables near-EOL windows in Stage-1)
+      - use_horizon_mask=True (masks padded timesteps in RUL loss)
+    
+    All settings identical to FD004 baseline except dataset=FD003.
+    """
+    # Start from FD003 transformer encoder config to get correct dataset/feature setup
+    base = get_fd003_transformer_encoder_ms_dt_v1_config()
+    
+    # Convert to world model config
+    cfg = copy.deepcopy(base)
+    cfg["experiment_name"] = "fd003_wm_v1_p0_softcap_k3_hm_pad"
+    cfg["dataset"] = "FD003"
+    cfg["encoder_type"] = "world_model_universal_v3"
+    
+    # Map encoder kwargs (same structure as FD004)
+    cfg["encoder_kwargs"] = {
+        "d_model": base["encoder_kwargs"]["d_model"],
+        "num_layers": base["encoder_kwargs"]["num_layers"],
+        "nhead": base["encoder_kwargs"]["n_heads"],
+        "dim_feedforward": base["encoder_kwargs"]["dim_feedforward"],
+        "dropout": base["encoder_kwargs"]["dropout"],
+        "kernel_sizes": base["encoder_kwargs"].get("kernel_sizes", [3, 5, 9]),
+        "seq_encoder_type": "transformer",
+        "decoder_num_layers": 1,
+    }
+    
+    # Training params (match FD004 baseline exactly)
+    cfg.setdefault("training_params", {})
+    cfg["training_params"]["num_epochs"] = 10
+    cfg["training_params"]["batch_size"] = 256
+    cfg["training_params"]["random_seed"] = 42
+    cfg["training_params"]["engine_train_ratio"] = 0.8
+    
+    # World model params (match FD004 baseline exactly)
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["max_rul"] = 125  # Explicit for comparability
+    wmp["past_len"] = 30
+    wmp["future_horizon"] = 30
+    
+    # P0.1: Soft cap weighting
+    wmp["soft_cap_enable"] = True
+    wmp["soft_cap_power"] = 0.5
+    wmp["soft_cap_floor"] = 0.05
+    wmp["cap_mask_enable"] = False
+    
+    # P0.2: Stricter informative sampling
+    wmp["informative_sampling_enable"] = True
+    wmp["informative_sampling_mode"] = "uncapped_frac"
+    wmp["informative_uncapped_frac_threshold"] = 0.3
+    wmp["keep_prob_noninformative"] = 0.05
+    
+    # Late weighting
+    wmp["late_weight_enable"] = True
+    wmp["late_weight_factor"] = 10.0
+    
+    # Horizon masking and padding (key semantics)
+    wmp["use_horizon_mask"] = True
+    wmp["use_padded_horizon_targets"] = True
+    
+    # Logging
+    wmp["debug_wiring_enable"] = True
+    wmp["debug_wiring_epochs"] = 1
+    wmp["log_informative_stats"] = True
+    
+    return cfg
+
+
 def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config() -> ExperimentConfig:
     """
     Ablation to isolate collapse source: RUL-only (no HI anchor, no HI loss) + lower LR + earlier unfreeze.
@@ -4337,6 +4562,12 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_wm_v1_p0_softcap_k3_hm_pad_softcap_off_config()
     if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_hm_off":
         return get_fd004_wm_v1_p0_softcap_k3_hm_pad_hm_off_config()
+    if experiment_name == "fd001_wm_v1_p0_softcap_k3_hm_pad":
+        return get_fd001_wm_v1_p0_softcap_k3_hm_pad_config()
+    if experiment_name == "fd002_wm_v1_p0_softcap_k3_hm_pad":
+        return get_fd002_wm_v1_p0_softcap_k3_hm_pad_config()
+    if experiment_name == "fd003_wm_v1_p0_softcap_k3_hm_pad":
+        return get_fd003_wm_v1_p0_softcap_k3_hm_pad_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1":
         return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config()
     # Check for world model phase 5 v3 experiments first
