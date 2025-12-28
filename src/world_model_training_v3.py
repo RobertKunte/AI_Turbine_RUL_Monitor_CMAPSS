@@ -1596,6 +1596,8 @@ def train_world_model_universal_v3(
             "eol_hi_threshold": float(getattr(world_model_config, "eol_hi_threshold", 0.2)),
             "eol_hi_temperature": float(getattr(world_model_config, "eol_hi_temperature", 0.05)),
             "eol_hi_p_min": float(getattr(world_model_config, "eol_hi_p_min", 0.2)),
+            # Decoder type (for architecture tracking)
+            "decoder_type": str(getattr(world_model_config, "decoder_type", "lstm")),
         },
         "train_metrics": metrics_train,
         "val_metrics": metrics_val,

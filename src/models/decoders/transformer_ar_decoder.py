@@ -63,14 +63,17 @@ class TransformerARDecoder(nn.Module):
         # Transformer layers
         if use_cross_attention:
             # Use TransformerDecoderLayer for cross-attention
+            # Note: PyTorch TransformerDecoder does NOT support batch_first=True
+            # We need to handle batch dimension manually
             decoder_layer = nn.TransformerDecoderLayer(
                 d_model=d_model,
                 nhead=nhead,
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
-                batch_first=True,
+                batch_first=False,  # PyTorch TransformerDecoder requires batch_first=False
             )
             self.transformer_layers = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+            self.use_batch_first = False  # Flag to handle batch dimension
         else:
             # Use TransformerEncoderLayer with causal masking (self-attention only)
             encoder_layer = nn.TransformerEncoderLayer(
@@ -81,6 +84,7 @@ class TransformerARDecoder(nn.Module):
                 batch_first=True,
             )
             self.transformer_layers = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.use_batch_first = True
         
         # Output head: maps d_model -> scalar RUL
         self.output_head = nn.Linear(d_model, 1)
@@ -170,9 +174,12 @@ class TransformerARDecoder(nn.Module):
                 # Apply transformer
                 if self.use_cross_attention:
                     # Cross-attention: tgt = token_seq, memory = enc_seq
+                    # PyTorch TransformerDecoder expects (S, B, E) format
+                    tgt_seq = token_seq_pos.transpose(0, 1)  # (seq_len, B, d_model)
+                    
                     if enc_seq is None:
                         # Fallback: use enc_token as single-step memory
-                        memory = enc_token.unsqueeze(1).transpose(0, 1)  # (1, B, d_model)
+                        memory = enc_token.unsqueeze(0)  # (1, B, d_model)
                     else:
                         # Transpose for PyTorch TransformerDecoder: (S, B, E)
                         memory = enc_seq.transpose(0, 1)  # (T_past, B, d_model)
@@ -180,12 +187,15 @@ class TransformerARDecoder(nn.Module):
                     # Causal mask for tgt
                     tgt_mask = self._create_causal_mask(seq_len, device)
                     
-                    # Transformer decoder
+                    # Transformer decoder (expects (S, B, E))
                     out = self.transformer_layers(
-                        tgt=token_seq_pos,
+                        tgt=tgt_seq,
                         memory=memory,
                         tgt_mask=tgt_mask,
-                    )  # (B, seq_len, d_model)
+                    )  # (seq_len, B, d_model)
+                    
+                    # Transpose back to (B, seq_len, d_model)
+                    out = out.transpose(0, 1)  # (B, seq_len, d_model)
                 else:
                     # Self-attention only: causal mask
                     src_mask = self._create_causal_mask(seq_len, device)
@@ -217,13 +227,17 @@ class TransformerARDecoder(nn.Module):
         
         # Apply transformer to final sequence
         if self.use_cross_attention:
+            # PyTorch TransformerDecoder expects (S, B, E) format
+            tgt_seq = token_seq.transpose(0, 1)  # (H, B, d_model)
+            
             if enc_seq is None:
-                memory = enc_token.unsqueeze(1).transpose(0, 1)  # (1, B, d_model)
+                memory = enc_token.unsqueeze(0)  # (1, B, d_model)
             else:
                 memory = enc_seq.transpose(0, 1)  # (T_past, B, d_model)
             
             tgt_mask = self._create_causal_mask(seq_len, device)
-            out = self.transformer_layers(token_seq, memory=memory, tgt_mask=tgt_mask)
+            out = self.transformer_layers(tgt_seq, memory=memory, tgt_mask=tgt_mask)  # (H, B, d_model)
+            out = out.transpose(0, 1)  # (B, H, d_model)
         else:
             src_mask = self._create_causal_mask(seq_len, device)
             out = self.transformer_layers(token_seq, mask=src_mask)

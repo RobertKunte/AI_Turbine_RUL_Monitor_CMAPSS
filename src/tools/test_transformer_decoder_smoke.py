@@ -13,8 +13,9 @@ import torch.nn as nn
 import sys
 from pathlib import Path
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add project root to path
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
 
 from src.models.decoders.transformer_ar_decoder import TransformerARDecoder
 
@@ -53,7 +54,7 @@ def test_transformer_decoder_self_attn():
     
     assert y_hat_train.shape == (B, H, 1), f"Expected (B, H, 1), got {y_hat_train.shape}"
     assert torch.isfinite(y_hat_train).all(), "Output contains NaN or Inf"
-    print(f"  ✓ Teacher forcing: output shape {y_hat_train.shape}, all finite")
+    print(f"  [OK] Teacher forcing: output shape {y_hat_train.shape}, all finite")
     
     # Forward pass: inference
     y_hat_inf = decoder(
@@ -64,9 +65,9 @@ def test_transformer_decoder_self_attn():
     
     assert y_hat_inf.shape == (B, H, 1), f"Expected (B, H, 1), got {y_hat_inf.shape}"
     assert torch.isfinite(y_hat_inf).all(), "Output contains NaN or Inf"
-    print(f"  ✓ Inference: output shape {y_hat_inf.shape}, all finite")
+    print(f"  [OK] Inference: output shape {y_hat_inf.shape}, all finite")
     
-    print("  ✓ Self-attention variant passed\n")
+    print("  [OK] Self-attention variant passed\n")
 
 
 def test_transformer_decoder_cross_attn():
@@ -108,7 +109,7 @@ def test_transformer_decoder_cross_attn():
     
     assert y_hat_train.shape == (B, H, 1), f"Expected (B, H, 1), got {y_hat_train.shape}"
     assert torch.isfinite(y_hat_train).all(), "Output contains NaN or Inf"
-    print(f"  ✓ Teacher forcing (with enc_seq): output shape {y_hat_train.shape}, all finite")
+    print(f"  [OK] Teacher forcing (with enc_seq): output shape {y_hat_train.shape}, all finite")
     
     # Forward pass: inference (fallback to enc_token)
     y_hat_inf = decoder(
@@ -120,9 +121,9 @@ def test_transformer_decoder_cross_attn():
     
     assert y_hat_inf.shape == (B, H, 1), f"Expected (B, H, 1), got {y_hat_inf.shape}"
     assert torch.isfinite(y_hat_inf).all(), "Output contains NaN or Inf"
-    print(f"  ✓ Inference (enc_token fallback): output shape {y_hat_inf.shape}, all finite")
+    print(f"  [OK] Inference (enc_token fallback): output shape {y_hat_inf.shape}, all finite")
     
-    print("  ✓ Cross-attention variant passed\n")
+    print("  [OK] Cross-attention variant passed\n")
 
 
 def test_causal_mask():
@@ -153,10 +154,10 @@ def test_causal_mask():
         for j in range(i + 1, seq_len):
             assert mask[i, j] == float('-inf'), f"Upper triangle should be -inf, got {mask[i, j]} at ({i}, {j})"
     
-    print(f"  ✓ Causal mask shape: {mask.shape}")
-    print(f"  ✓ Lower triangle (including diagonal): all zeros")
-    print(f"  ✓ Upper triangle: all -inf")
-    print("  ✓ Causal mask test passed\n")
+    print(f"  [OK] Causal mask shape: {mask.shape}")
+    print(f"  [OK] Lower triangle (including diagonal): all zeros")
+    print(f"  [OK] Upper triangle: all -inf")
+    print("  [OK] Causal mask test passed\n")
 
 
 def test_world_model_integration():
@@ -198,7 +199,7 @@ def test_world_model_integration():
         assert "hi" in out_lstm, "Missing 'hi' key"
         assert out_lstm["traj"].shape == (B, horizon, 1), f"Expected traj shape (B, H, 1), got {out_lstm['traj'].shape}"
         assert torch.isfinite(out_lstm["traj"]).all(), "LSTM decoder output contains NaN/Inf"
-        print(f"  ✓ LSTM decoder: traj shape {out_lstm['traj'].shape}, all finite")
+        print(f"  [OK] LSTM decoder: traj shape {out_lstm['traj'].shape}, all finite")
         
         # Instantiate with Transformer AR decoder (self-attention)
         model_tf = WorldModelUniversalV3(
@@ -221,7 +222,7 @@ def test_world_model_integration():
         assert "traj" in out_tf, "Missing 'traj' key"
         assert out_tf["traj"].shape == (B, horizon, 1), f"Expected traj shape (B, H, 1), got {out_tf['traj'].shape}"
         assert torch.isfinite(out_tf["traj"]).all(), "Transformer decoder output contains NaN/Inf"
-        print(f"  ✓ Transformer AR decoder: traj shape {out_tf['traj'].shape}, all finite")
+        print(f"  [OK] Transformer AR decoder: traj shape {out_tf['traj'].shape}, all finite")
         
         # Instantiate with Transformer AR decoder (cross-attention)
         model_tf_xattn = WorldModelUniversalV3(
@@ -244,12 +245,12 @@ def test_world_model_integration():
         assert "traj" in out_tf_xattn, "Missing 'traj' key"
         assert out_tf_xattn["traj"].shape == (B, horizon, 1), f"Expected traj shape (B, H, 1), got {out_tf_xattn['traj'].shape}"
         assert torch.isfinite(out_tf_xattn["traj"]).all(), "Transformer decoder (cross-attn) output contains NaN/Inf"
-        print(f"  ✓ Transformer AR decoder (cross-attn): traj shape {out_tf_xattn['traj'].shape}, all finite")
+        print(f"  [OK] Transformer AR decoder (cross-attn): traj shape {out_tf_xattn['traj'].shape}, all finite")
         
-        print("  ✓ World Model integration passed\n")
+        print("  [OK] World Model integration passed\n")
         
     except Exception as e:
-        print(f"  ✗ World Model integration failed: {e}")
+        print(f"  [FAIL] World Model integration failed: {e}")
         raise
 
 
@@ -270,7 +271,7 @@ if __name__ == "__main__":
         print("=" * 80)
         
     except Exception as e:
-        print(f"\n✗ Test failed: {e}")
+        print(f"\n[FAIL] Test failed: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)

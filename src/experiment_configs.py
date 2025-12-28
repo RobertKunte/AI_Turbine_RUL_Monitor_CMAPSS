@@ -1253,6 +1253,28 @@ def get_fd004_wm_v1_p0_softcap_k3_hm_pad_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config() -> ExperimentConfig:
+    """
+    Transformer AR decoder variant (self-attention only) of baseline.
+    
+    Part of Track B2 (Architecture - Decoder Variants).
+    Identical to baseline (fd004_wm_v1_p0_softcap_k3_hm_pad) except decoder_type="tf_ar".
+    
+    All other settings preserved for comparability:
+    - Same seeds, splits, epochs, batch_size, max_rul, horizon
+    - Same masking, loss weights, freeze_encoder settings
+    - Same feature pipeline, evaluation protocol
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar"
+    
+    # Change ONLY decoder_type
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["decoder_type"] = "tf_ar"
+    
+    return cfg
+
+
 def get_fd004_wm_v1_p0_softcap_k3_hm_pad_e50_config() -> ExperimentConfig:
     """
     P0 cap-collapse fix (ADR-0010) + Stage-1 horizon padding + extended training:
@@ -4652,6 +4674,8 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_wm_v1_p0_softcap_k3_hm_pad_softcap_off_config()
     if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_hm_off":
         return get_fd004_wm_v1_p0_softcap_k3_hm_pad_hm_off_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar":
+        return get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config()
     if experiment_name == "fd001_wm_v1_p0_softcap_k3_hm_pad":
         return get_fd001_wm_v1_p0_softcap_k3_hm_pad_config()
     if experiment_name == "fd001_wm_v1_p0_softcap_k3_hm_pad_cap125":
