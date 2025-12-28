@@ -1294,6 +1294,138 @@ def get_fd004_wm_v1_p0_softcap_k3_hm_pad_e50_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_raw_only_config() -> ExperimentConfig:
+    """
+    Feature ablation: raw sensors only (~21 features).
+    
+    Part of Sprint A1 (Feature Group Ablations).
+    All settings identical to baseline except feature groups.
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_raw_only"
+    
+    # Feature selection: raw only
+    cfg.setdefault("features", {})
+    cfg["features"]["use_multiscale_features"] = False
+    cfg["features"]["include_groups"] = ["raw"]
+    
+    cfg.setdefault("phys_features", {})
+    cfg["phys_features"]["use_condition_vector"] = False
+    cfg["phys_features"]["use_digital_twin_residuals"] = False
+    
+    return cfg
+
+
+def get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_ms_only_config() -> ExperimentConfig:
+    """
+    Feature ablation: multiscale only (no residuals/twin/cond).
+    
+    Part of Sprint A1 (Feature Group Ablations).
+    All settings identical to baseline except feature groups.
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_ms_only"
+    
+    # Feature selection: multiscale only
+    cfg.setdefault("features", {})
+    cfg["features"]["use_multiscale_features"] = True
+    cfg["features"]["include_groups"] = ["ms"]
+    
+    cfg.setdefault("phys_features", {})
+    cfg["phys_features"]["use_condition_vector"] = False
+    cfg["phys_features"]["use_digital_twin_residuals"] = False
+    
+    return cfg
+
+
+def get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_ms_config() -> ExperimentConfig:
+    """
+    Feature ablation: no multiscale (raw + residual + twin + cond).
+    
+    Part of Sprint A1 (Feature Group Ablations).
+    All settings identical to baseline except feature groups.
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_ms"
+    
+    # Feature selection: raw + residual + twin + cond (no multiscale)
+    cfg.setdefault("features", {})
+    cfg["features"]["use_multiscale_features"] = False
+    cfg["features"]["include_groups"] = ["raw", "residual", "twin", "cond"]
+    
+    cfg.setdefault("phys_features", {})
+    cfg["phys_features"]["use_condition_vector"] = True
+    cfg["phys_features"]["use_digital_twin_residuals"] = True
+    
+    return cfg
+
+
+def get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_residual_config() -> ExperimentConfig:
+    """
+    Feature ablation: no digital-twin residuals (raw + ms + twin + cond).
+    
+    Part of Sprint A1 (Feature Group Ablations).
+    All settings identical to baseline except feature groups.
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_residual"
+    
+    # Feature selection: raw + ms + twin + cond (no residual)
+    cfg.setdefault("features", {})
+    cfg["features"]["use_multiscale_features"] = True
+    cfg["features"]["include_groups"] = ["raw", "ms", "twin", "cond"]
+    
+    cfg.setdefault("phys_features", {})
+    cfg["phys_features"]["use_condition_vector"] = True
+    cfg["phys_features"]["use_digital_twin_residuals"] = False
+    
+    return cfg
+
+
+def get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_cond_config() -> ExperimentConfig:
+    """
+    Feature ablation: no condition vectors (raw + ms + residual + twin).
+    
+    Part of Sprint A1 (Feature Group Ablations).
+    All settings identical to baseline except feature groups.
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_cond"
+    
+    # Feature selection: raw + ms + residual + twin (no cond)
+    cfg.setdefault("features", {})
+    cfg["features"]["use_multiscale_features"] = True
+    cfg["features"]["include_groups"] = ["raw", "ms", "residual", "twin"]
+    
+    cfg.setdefault("phys_features", {})
+    cfg["phys_features"]["use_condition_vector"] = False
+    cfg["phys_features"]["use_digital_twin_residuals"] = True
+    
+    return cfg
+
+
+def get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_ms_cond_only_config() -> ExperimentConfig:
+    """
+    Feature ablation: multiscale + condition only (no raw/residual/twin).
+    
+    Part of Sprint A1 (Feature Group Ablations).
+    All settings identical to baseline except feature groups.
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_ms_cond_only"
+    
+    # Feature selection: ms + cond only
+    cfg.setdefault("features", {})
+    cfg["features"]["use_multiscale_features"] = True
+    cfg["features"]["include_groups"] = ["ms", "cond"]
+    
+    cfg.setdefault("phys_features", {})
+    cfg["phys_features"]["use_condition_vector"] = True
+    cfg["phys_features"]["use_digital_twin_residuals"] = False
+    
+    return cfg
+
+
 def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config() -> ExperimentConfig:
     """
     Ablation to isolate collapse source: RUL-only (no HI anchor, no HI loss) + lower LR + earlier unfreeze.
@@ -4128,6 +4260,18 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_wm_v1_p0_softcap_k3_hm_pad_config()
     if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_e50":
         return get_fd004_wm_v1_p0_softcap_k3_hm_pad_e50_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_raw_only":
+        return get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_raw_only_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_ms_only":
+        return get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_ms_only_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_ms":
+        return get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_ms_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_residual":
+        return get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_residual_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_cond":
+        return get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_cond_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_ms_cond_only":
+        return get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_ms_cond_only_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1":
         return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config()
     # Check for world model phase 5 v3 experiments first
