@@ -1426,6 +1426,67 @@ def get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_ms_cond_only_config() -> Exper
     return cfg
 
 
+def get_fd004_wm_v1_p0_softcap_k3_hm_pad_softcap_off_config() -> ExperimentConfig:
+    """
+    Feature ablation: Soft-cap weighting disabled (binary masking / hard cap behavior).
+    
+    Part of Sprint A2 (Soft-Cap & Horizon-Mask Isolated Effects).
+    All settings identical to baseline except soft_cap_enable=False.
+    
+    Expected behavior:
+    - Falls back to binary cap masking or hard cap weighting
+    - Horizon masking still enabled (use_horizon_mask=True)
+    - Padding still enabled (use_padded_horizon_targets=True)
+    - Near-EOL windows still included
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3_hm_pad_softcap_off"
+    
+    wmp = cfg.setdefault("world_model_params", {})
+    
+    # Disable soft-cap weighting (falls back to binary masking or hard cap behavior)
+    wmp["soft_cap_enable"] = False
+    
+    # Ensure horizon masking and padding remain enabled (baseline semantics)
+    wmp["use_horizon_mask"] = True
+    wmp["use_padded_horizon_targets"] = True
+    
+    # Enable binary cap masking as fallback (if soft-cap is off, binary mask should be on)
+    wmp["cap_mask_enable"] = True
+    
+    return cfg
+
+
+def get_fd004_wm_v1_p0_softcap_k3_hm_pad_hm_off_config() -> ExperimentConfig:
+    """
+    Feature ablation: Horizon masking disabled (padding enabled but loss sees padded timesteps).
+    
+    Part of Sprint A2 (Soft-Cap & Horizon-Mask Isolated Effects).
+    All settings identical to baseline except use_horizon_mask=False.
+    
+    Expected behavior:
+    - Padding still enabled (use_padded_horizon_targets=True)
+    - But padded timesteps are NOT masked out → model sees synthetic targets in loss
+    - Soft-cap weighting still enabled (soft_cap_enable=True)
+    - This is intentional sanity check to confirm horizon mask prevents padding artifacts
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3_hm_pad_hm_off"
+    
+    wmp = cfg.setdefault("world_model_params", {})
+    
+    # Disable horizon masking (padded timesteps will contribute to loss)
+    wmp["use_horizon_mask"] = False
+    
+    # Keep padding enabled (this is the key: padding exists but not masked)
+    wmp["use_padded_horizon_targets"] = True
+    
+    # Keep soft-cap weighting enabled (unchanged from baseline)
+    wmp["soft_cap_enable"] = True
+    
+    return cfg
+
+
 def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config() -> ExperimentConfig:
     """
     Ablation to isolate collapse source: RUL-only (no HI anchor, no HI loss) + lower LR + earlier unfreeze.
@@ -4272,6 +4333,10 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_no_cond_config()
     if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_ms_cond_only":
         return get_fd004_wm_v1_p0_softcap_k3_hm_pad_ablation_ms_cond_only_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_softcap_off":
+        return get_fd004_wm_v1_p0_softcap_k3_hm_pad_softcap_off_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_hm_off":
+        return get_fd004_wm_v1_p0_softcap_k3_hm_pad_hm_off_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1":
         return get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_config()
     # Check for world model phase 5 v3 experiments first
