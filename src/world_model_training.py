@@ -206,6 +206,12 @@ class WorldModelTrainingConfig:
     use_horizon_mask: bool = False
 
     # --------------------------------------------------
+    # Decoder type selection (World Model v3)
+    # --------------------------------------------------
+    # Decoder architecture: "lstm" (default), "tf_ar" (Transformer AR self-attn), "tf_ar_xattn" (Transformer AR cross-attn)
+    decoder_type: str = "lstm"
+
+    # --------------------------------------------------
     # Transformer World Model V1 (Dynamic Latent WM A+) knobs
     # Stored on the shared config for convenience; default OFF.
     # --------------------------------------------------

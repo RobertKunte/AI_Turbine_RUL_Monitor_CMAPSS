@@ -823,6 +823,8 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 eol_hi_threshold=world_model_params.get('eol_hi_threshold', 0.2),
                 eol_hi_temperature=world_model_params.get('eol_hi_temperature', 0.05),
                 eol_hi_p_min=world_model_params.get('eol_hi_p_min', 0.2),
+                # Decoder type selection (World Model v3)
+                decoder_type=str(world_model_params.get('decoder_type', 'lstm')),
             )
             # Additional world-model V1 specific loss weights (sensor / future HI / future RUL)
             # and architectural flags are stored as dynamic attributes on the

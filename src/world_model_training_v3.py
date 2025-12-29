@@ -431,6 +431,9 @@ def train_world_model_universal_v3(
     # Decoder type selection (default: "lstm")
     decoder_type = str(getattr(world_model_config, "decoder_type", "lstm"))
     
+    # Debug log: show decoder_type from config
+    print(f"[config] decoder_type={decoder_type} (from world_model_config.decoder_type={getattr(world_model_config, 'decoder_type', 'NOT_SET')})")
+    
     model = WorldModelUniversalV3(
         input_size=len(feature_cols),
         d_model=d_model,
@@ -461,6 +464,39 @@ def train_world_model_universal_v3(
     elif decoder_type == "tf_ar_xattn":
         print(f"  Decoder: Transformer AR (cross-attn, num_layers={decoder_num_layers}, horizon={horizon})")
     print(f"  Heads: Trajectory, EOL, HI")
+    
+    # Hard-fail guard: verify decoder matches config
+    if decoder_type != "lstm":
+        # Check that model actually has Transformer decoder
+        if not hasattr(model, 'tf_decoder') or model.tf_decoder is None:
+            raise RuntimeError(
+                f"Decoder type mismatch: config specifies decoder_type='{decoder_type}' "
+                f"but model was initialized with LSTM decoder. "
+                f"Experiment: {experiment_name}, "
+                f"model.decoder_type={model.decoder_type}, "
+                f"model.decoder class={type(model.decoder).__name__ if hasattr(model, 'decoder') else 'N/A'}"
+            )
+        # Verify decoder class name contains "Transformer"
+        decoder_class_name = model.tf_decoder.__class__.__name__
+        if "Transformer" not in decoder_class_name:
+            raise RuntimeError(
+                f"Decoder type mismatch: config specifies decoder_type='{decoder_type}' "
+                f"but decoder class is '{decoder_class_name}' (expected TransformerARDecoder). "
+                f"Experiment: {experiment_name}, "
+                f"model.decoder_type={model.decoder_type}"
+            )
+        print(f"  [VERIFIED] Transformer decoder instantiated: {decoder_class_name}")
+    else:
+        # For LSTM, verify it's actually LSTM
+        if hasattr(model, 'decoder') and model.decoder is not None:
+            decoder_class_name = model.decoder.__class__.__name__
+            if decoder_class_name != "LSTM":
+                raise RuntimeError(
+                    f"Decoder type mismatch: config specifies decoder_type='lstm' "
+                    f"but decoder class is '{decoder_class_name}' (expected LSTM). "
+                    f"Experiment: {experiment_name}, "
+                    f"model.decoder_type={model.decoder_type}"
+                )
     
     # ===================================================================
     # 6. Training loop
@@ -1598,6 +1634,15 @@ def train_world_model_universal_v3(
             "eol_hi_p_min": float(getattr(world_model_config, "eol_hi_p_min", 0.2)),
             # Decoder type (for architecture tracking)
             "decoder_type": str(getattr(world_model_config, "decoder_type", "lstm")),
+            # Decoder class name (for debugging)
+            "decoder_class": (
+                model.tf_decoder.__class__.__name__ if hasattr(model, 'tf_decoder') and model.tf_decoder is not None
+                else (model.decoder.__class__.__name__ if hasattr(model, 'decoder') and model.decoder is not None else "unknown")
+            ),
+            "decoder_class": (
+                model.tf_decoder.__class__.__name__ if hasattr(model, 'tf_decoder') and model.tf_decoder is not None
+                else (model.decoder.__class__.__name__ if hasattr(model, 'decoder') and model.decoder is not None else "unknown")
+            ),
         },
         "train_metrics": metrics_train,
         "val_metrics": metrics_val,
