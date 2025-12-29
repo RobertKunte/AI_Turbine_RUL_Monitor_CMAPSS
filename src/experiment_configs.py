@@ -1584,6 +1584,28 @@ def get_fd001_wm_v1_p0_softcap_k3_hm_pad_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd001_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config() -> ExperimentConfig:
+    """
+    Transformer AR decoder variant (self-attention only) of FD001 baseline.
+    
+    Part of Track B2 (Architecture - Decoder Variants).
+    Identical to baseline (fd001_wm_v1_p0_softcap_k3_hm_pad) except decoder_type="tf_ar".
+    
+    All other settings preserved for comparability:
+    - Same seeds, splits, epochs, batch_size, max_rul, horizon
+    - Same masking, loss weights, freeze_encoder settings
+    - Same feature pipeline, evaluation protocol
+    """
+    cfg = copy.deepcopy(get_fd001_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd001_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar"
+    
+    # Change ONLY decoder_type
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["decoder_type"] = "tf_ar"
+    
+    return cfg
+
+
 def get_fd002_wm_v1_p0_softcap_k3_hm_pad_config() -> ExperimentConfig:
     """
     FD002 baseline port: Same semantics as FD004 baseline (fd004_wm_v1_p0_softcap_k3_hm_pad).
@@ -1659,6 +1681,28 @@ def get_fd002_wm_v1_p0_softcap_k3_hm_pad_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd002_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config() -> ExperimentConfig:
+    """
+    Transformer AR decoder variant (self-attention only) of FD002 baseline.
+    
+    Part of Track B2 (Architecture - Decoder Variants).
+    Identical to baseline (fd002_wm_v1_p0_softcap_k3_hm_pad) except decoder_type="tf_ar".
+    
+    All other settings preserved for comparability:
+    - Same seeds, splits, epochs, batch_size, max_rul, horizon
+    - Same masking, loss weights, freeze_encoder settings
+    - Same feature pipeline, evaluation protocol
+    """
+    cfg = copy.deepcopy(get_fd002_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd002_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar"
+    
+    # Change ONLY decoder_type
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["decoder_type"] = "tf_ar"
+    
+    return cfg
+
+
 def get_fd003_wm_v1_p0_softcap_k3_hm_pad_config() -> ExperimentConfig:
     """
     FD003 baseline port: Same semantics as FD004 baseline (fd004_wm_v1_p0_softcap_k3_hm_pad).
@@ -1730,6 +1774,28 @@ def get_fd003_wm_v1_p0_softcap_k3_hm_pad_config() -> ExperimentConfig:
     wmp["debug_wiring_enable"] = True
     wmp["debug_wiring_epochs"] = 1
     wmp["log_informative_stats"] = True
+    
+    return cfg
+
+
+def get_fd003_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config() -> ExperimentConfig:
+    """
+    Transformer AR decoder variant (self-attention only) of FD003 baseline.
+    
+    Part of Track B2 (Architecture - Decoder Variants).
+    Identical to baseline (fd003_wm_v1_p0_softcap_k3_hm_pad) except decoder_type="tf_ar".
+    
+    All other settings preserved for comparability:
+    - Same seeds, splits, epochs, batch_size, max_rul, horizon
+    - Same masking, loss weights, freeze_encoder settings
+    - Same feature pipeline, evaluation protocol
+    """
+    cfg = copy.deepcopy(get_fd003_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "fd003_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar"
+    
+    # Change ONLY decoder_type
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["decoder_type"] = "tf_ar"
     
     return cfg
 
@@ -4678,14 +4744,20 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config()
     if experiment_name == "fd001_wm_v1_p0_softcap_k3_hm_pad":
         return get_fd001_wm_v1_p0_softcap_k3_hm_pad_config()
+    if experiment_name == "fd001_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar":
+        return get_fd001_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config()
     if experiment_name == "fd001_wm_v1_p0_softcap_k3_hm_pad_cap125":
         return get_fd001_wm_v1_p0_softcap_k3_hm_pad_cap125_config()
     if experiment_name == "fd002_wm_v1_p0_softcap_k3_hm_pad":
         return get_fd002_wm_v1_p0_softcap_k3_hm_pad_config()
+    if experiment_name == "fd002_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar":
+        return get_fd002_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config()
     if experiment_name == "fd002_wm_v1_p0_softcap_k3_hm_pad_cap125":
         return get_fd002_wm_v1_p0_softcap_k3_hm_pad_cap125_config()
     if experiment_name == "fd003_wm_v1_p0_softcap_k3_hm_pad":
         return get_fd003_wm_v1_p0_softcap_k3_hm_pad_config()
+    if experiment_name == "fd003_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar":
+        return get_fd003_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config()
     if experiment_name == "fd003_wm_v1_p0_softcap_k3_hm_pad_cap125":
         return get_fd003_wm_v1_p0_softcap_k3_hm_pad_cap125_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1":
