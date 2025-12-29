@@ -1271,6 +1271,8 @@ def get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config() -> ExperimentConfig:
     # Change ONLY decoder_type
     wmp = cfg.setdefault("world_model_params", {})
     wmp["decoder_type"] = "tf_ar"
+    # Ensure max_rul = 125 (cap 125)
+    wmp["max_rul"] = 125
     
     return cfg
 
@@ -1602,6 +1604,8 @@ def get_fd001_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config() -> ExperimentConfig:
     # Change ONLY decoder_type
     wmp = cfg.setdefault("world_model_params", {})
     wmp["decoder_type"] = "tf_ar"
+    # Ensure max_rul = 125 (cap 125)
+    wmp["max_rul"] = 125
     
     return cfg
 
@@ -1699,6 +1703,8 @@ def get_fd002_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config() -> ExperimentConfig:
     # Change ONLY decoder_type
     wmp = cfg.setdefault("world_model_params", {})
     wmp["decoder_type"] = "tf_ar"
+    # Ensure max_rul = 125 (cap 125)
+    wmp["max_rul"] = 125
     
     return cfg
 
@@ -1796,6 +1802,8 @@ def get_fd003_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config() -> ExperimentConfig:
     # Change ONLY decoder_type
     wmp = cfg.setdefault("world_model_params", {})
     wmp["decoder_type"] = "tf_ar"
+    # Ensure max_rul = 125 (cap 125)
+    wmp["max_rul"] = 125
     
     return cfg
 
