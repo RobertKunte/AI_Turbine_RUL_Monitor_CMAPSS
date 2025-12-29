@@ -1277,6 +1277,42 @@ def get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config() -> ExperimentConfig:
     return cfg
 
 
+def get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_seed43_config() -> ExperimentConfig:
+    """
+    Transformer AR decoder variant with seed 43 for reproducibility check.
+
+    Identical to fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar except random_seed=43.
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_seed43"
+
+    # Change ONLY random_seed
+    cfg.setdefault("training_params", {})
+    cfg["training_params"]["random_seed"] = 43
+
+    return cfg
+
+
+def get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_xattn_config() -> ExperimentConfig:
+    """
+    Transformer AR decoder variant with cross-attention.
+
+    Identical to fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar except decoder_type="tf_ar_xattn".
+
+    Part of Track B2 (Architecture - Decoder Variants).
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config())
+    cfg["experiment_name"] = "fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_xattn"
+
+    # Change decoder_type to cross-attention variant
+    wmp = cfg.setdefault("world_model_params", {})
+    wmp["decoder_type"] = "tf_ar_xattn"
+    # Ensure max_rul = 125 (cap 125)
+    wmp["max_rul"] = 125
+
+    return cfg
+
+
 def get_fd004_wm_v1_p0_softcap_k3_hm_pad_e50_config() -> ExperimentConfig:
     """
     P0 cap-collapse fix (ADR-0010) + Stage-1 horizon padding + extended training:
