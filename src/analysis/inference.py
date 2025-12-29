@@ -175,12 +175,19 @@ def load_model_from_experiment(
     # Robust world model detection
     # Helper: detect presence of V3 heads regardless of potential 'module.' prefix
     def _has_v3_heads(sd: Dict[str, torch.Tensor]) -> bool:
-        keys = list(sd.keys())
-        has_health = any(k.endswith("fc_health.weight") for k in keys)
-        # EOL head might be named fc_rul or fc_eol depending on version
-        has_eol = any(k.endswith("fc_rul.weight") or k.endswith("fc_eol.weight") for k in keys)
-        has_traj = any(k.endswith("traj_head.weight") for k in keys)
-        return has_health and has_eol and has_traj
+        """
+        Check if state_dict contains V3 head parameters.
+        Uses flexible matching to handle different naming conventions.
+        """
+        keys = [k.lower() for k in sd.keys()]
+        # Check for health head (fc_health or hi_head)
+        has_health = any("fc_health" in k or "hi_head" in k for k in keys)
+        # Check for EOL head (fc_rul, fc_eol, or eol_head)
+        has_eol = any("fc_rul" in k or "fc_eol" in k or "eol_head" in k for k in keys)
+        # Check for trajectory head (traj_head or hi_head can serve dual purpose)
+        has_traj = any("traj_head" in k or ("hi_head" in k and has_health) for k in keys)
+        # At minimum, need EOL and one of health/traj
+        return has_eol and (has_health or has_traj)
 
     has_v3_keys = _has_v3_heads(state_dict)
 
@@ -193,16 +200,36 @@ def load_model_from_experiment(
         or ("world" in experiment_name.lower() and "phase5" in experiment_name.lower())
     )
 
-    # If config explicitly requests V3 but checkpoint lacks V3 heads -> hard error
+    # If config explicitly requests V3 but checkpoint lacks V3 heads -> check if encoder-only
     if is_world_model_v3_by_name and not has_v3_keys:
-        sample_keys = list(state_dict.keys())[:10]
-        raise RuntimeError(
-            f"Loaded checkpoint '{model_path.name}' is missing World Model V3 heads "
-            f"(fc_health / fc_rul / traj_head), but config requests V3.\n"
-            f"Experiment: {experiment_name}\n"
-            f"Hint: Ensure you are loading 'world_model_v3_best.pt' for V3 runs.\n"
-            f"Sample keys: {sample_keys}"
-        )
+        # Check if this looks like an encoder-only checkpoint
+        encoder_keys = [k for k in state_dict.keys() if "encoder" in k.lower()]
+        decoder_keys = [k for k in state_dict.keys() if "decoder" in k.lower()]
+        head_keys = [k for k in state_dict.keys() if any(p in k.lower() for p in ["traj_head", "fc_rul", "fc_eol", "fc_health", "hi_head", "eol_head"])]
+        
+        is_encoder_only = len(encoder_keys) > 0 and len(head_keys) == 0
+        
+        if is_encoder_only:
+            sample_keys = list(state_dict.keys())[:10]
+            raise RuntimeError(
+                f"Checkpoint appears encoder-only (no head params). "
+                f"This indicates a save bug or wrong file. Expected full WM v3 checkpoint.\n"
+                f"Experiment: {experiment_name}\n"
+                f"Checkpoint: {model_path.name}\n"
+                f"Encoder keys: {len(encoder_keys)}, Decoder keys: {len(decoder_keys)}, Head keys: {len(head_keys)}\n"
+                f"Sample keys: {sample_keys}\n"
+                f"Hint: Check training logs for '[checkpoint-save]' messages to verify save format."
+            )
+        else:
+            # Not encoder-only, but still missing heads - different issue
+            sample_keys = list(state_dict.keys())[:10]
+            raise RuntimeError(
+                f"Loaded checkpoint '{model_path.name}' is missing World Model V3 heads "
+                f"(fc_health / fc_rul / traj_head), but config requests V3.\n"
+                f"Experiment: {experiment_name}\n"
+                f"Hint: Ensure you are loading 'world_model_v3_best.pt' for V3 runs.\n"
+                f"Sample keys: {sample_keys}"
+            )
 
     # Now we can safely flag V3 if both config and heads agree
     is_world_model_v3 = is_world_model_v3_by_name and has_v3_keys

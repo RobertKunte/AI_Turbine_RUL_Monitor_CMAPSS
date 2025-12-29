@@ -1735,6 +1735,20 @@ def run_diagnostics_for_run(
     try:
         model, config = load_model_from_experiment(experiment_dir, device=device)
         model.eval()
+    except RuntimeError as e:
+        # Check if it's an encoder-only checkpoint error
+        error_msg = str(e)
+        if "encoder-only" in error_msg.lower() or "no head params" in error_msg.lower():
+            print(f"  ⚠️  Checkpoint issue detected: {error_msg}")
+            print(f"  ⚠️  Skipping diagnostics for {run_name} - checkpoint appears incomplete")
+            return
+        else:
+            # Other RuntimeError - re-raise with traceback
+            print(f"  ❌ Error loading model: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"  ⚠️  Skipping diagnostics for {run_name} due to model loading error")
+            return
     except Exception as e:
         print(f"  ❌ Error loading model: {e}")
         import traceback

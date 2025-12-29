@@ -1320,9 +1320,16 @@ def train_world_model_universal_v3(
         if allow_best_update and metric_val < best_val_loss:
             best_val_loss = metric_val
             epochs_no_improve = 0
+            
+            # Debug: verify we're saving full model state_dict
+            state_dict = model.state_dict()
+            num_keys = len(state_dict)
+            head_keys = [k for k in state_dict.keys() if any(p in k.lower() for p in ["traj_head", "fc_rul", "fc_eol", "fc_health", "hi_head", "eol_head"])]
+            has_heads = len(head_keys) > 0
+            
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": state_dict,
                     "epoch": epoch,
                     "val_loss": metric_val,
                     "best_metric": best_metric,
@@ -1335,6 +1342,9 @@ def train_world_model_universal_v3(
                 },
                 best_model_path,
             )
+            print(f"[checkpoint-save] saving model.state_dict keys={num_keys} has_heads={has_heads} path={best_model_path.name}")
+            if not has_heads:
+                print(f"  ⚠️  WARNING: No head keys found in checkpoint! Head patterns: {head_keys[:5] if head_keys else 'none'}")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
