@@ -4786,6 +4786,10 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_wm_v1_p0_softcap_k3_hm_pad_hm_off_config()
     if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar":
         return get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_seed43":
+        return get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_seed43_config()
+    if experiment_name == "fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_xattn":
+        return get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_xattn_config()
     if experiment_name == "fd001_wm_v1_p0_softcap_k3_hm_pad":
         return get_fd001_wm_v1_p0_softcap_k3_hm_pad_config()
     if experiment_name == "fd001_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar":
