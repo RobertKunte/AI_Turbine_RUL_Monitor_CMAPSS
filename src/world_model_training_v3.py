@@ -433,7 +433,10 @@ def train_world_model_universal_v3(
     
     # Debug log: show decoder_type from config
     print(f"[config] decoder_type={decoder_type} (from world_model_config.decoder_type={getattr(world_model_config, 'decoder_type', 'NOT_SET')})")
-    
+
+    # Extract decoder_num_layers from config (default to parameter value)
+    decoder_num_layers = int(getattr(world_model_config, "decoder_num_layers", decoder_num_layers))
+
     # Get tf_cross decoder parameters
     future_max_len = int(getattr(world_model_config, "future_max_len", 256))
     cond_dim = int(getattr(world_model_config, "cond_dim", 0))
@@ -465,8 +468,9 @@ def train_world_model_universal_v3(
     ).to(device)
     
     num_params = sum(p.numel() for p in model.parameters())
+    encoder_d_model = model.encoder.d_model
     print(f"  Model parameters: {num_params:,}")
-    print(f"  Encoder: UniversalEncoderV2 (d_model={d_model}, num_layers={num_layers})")
+    print(f"  Encoder: UniversalEncoderV2 (d_model={encoder_d_model}, num_layers={num_layers})")
     if decoder_type == "lstm":
         print(f"  Decoder: LSTM (num_layers={decoder_num_layers}, horizon={horizon})")
     elif decoder_type == "tf_ar":
@@ -474,7 +478,7 @@ def train_world_model_universal_v3(
     elif decoder_type == "tf_ar_xattn":
         print(f"  Decoder: Transformer AR (cross-attn, num_layers={decoder_num_layers}, horizon={horizon})")
     elif decoder_type == "tf_cross":
-        print(f"  Decoder: Transformer Cross-Attention (non-AR, num_layers={decoder_num_layers}, horizon={horizon})")
+        print(f"  Decoder: Transformer Cross-Attention (non-AR, d_model={encoder_d_model}, num_layers={decoder_num_layers}, horizon={horizon})")
         print(f"    Quantiles: {quantiles}, Future max len: {future_max_len}")
     print(f"  Heads: Trajectory, EOL, HI" + (", Quantile RUL" if decoder_type == "tf_cross" else ""))
     

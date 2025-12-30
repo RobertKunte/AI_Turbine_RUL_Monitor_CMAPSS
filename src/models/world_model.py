@@ -695,7 +695,7 @@ class WorldModelEncoderDecoderUniversalV2(nn.Module):
 class WorldModelUniversalV3(nn.Module):
     """
     Universal World Model v3 with Health Index Head.
-    
+
     Phase 5: Enhanced World Model with:
     - UniversalEncoderV2 (multi-scale CNN + Transformer) as encoder
     - LSTM Decoder for trajectory prediction (horizon=40)
@@ -703,9 +703,12 @@ class WorldModelUniversalV3(nn.Module):
         * Trajectory-Head: Predicts HI-proxy trajectory over horizon
         * EOL-Head: Predicts EOL RUL (strongly weighted)
         * HI-Head: Predicts Health Index in [0, 1] (with monotonicity)
-    
+
     This is designed for Phase 5 residual feature experiments (464 features).
     Uses same architecture pattern as RULHIUniversalModelV2 for compatibility.
+
+    IMPORTANT: All components (heads, decoders) automatically use the encoder's actual d_model
+    to ensure tensor shape consistency, even if the d_model parameter differs.
     """
     
     def __init__(
@@ -771,7 +774,10 @@ class WorldModelUniversalV3(nn.Module):
             use_layer_norm=use_layer_norm,
             max_seq_len=max_seq_len,
         )
-        
+
+        # Get the actual d_model used by encoder (for consistency with tf_cross components)
+        encoder_d_model = self.encoder.d_model
+
         # Decoder: LSTM (default) or Transformer AR or Transformer Cross-Attention
         if decoder_type == "lstm":
             # LSTM decoder (default, unchanged)
@@ -784,8 +790,8 @@ class WorldModelUniversalV3(nn.Module):
             )
             
             # Project encoder output to decoder initial hidden state
-            self.encoder_to_decoder_h = nn.Linear(d_model, decoder_hidden_size * decoder_num_layers)
-            self.encoder_to_decoder_c = nn.Linear(d_model, decoder_hidden_size * decoder_num_layers)
+            self.encoder_to_decoder_h = nn.Linear(encoder_d_model, decoder_hidden_size * decoder_num_layers)
+            self.encoder_to_decoder_c = nn.Linear(encoder_d_model, decoder_hidden_size * decoder_num_layers)
             self.tf_decoder = None
             self.tf_cross_decoder = None
             self.future_query_builder = None
@@ -796,7 +802,7 @@ class WorldModelUniversalV3(nn.Module):
             
             use_cross_attention = (decoder_type == "tf_ar_xattn")
             self.tf_decoder = TransformerARDecoder(
-                d_model=d_model,
+                d_model=encoder_d_model,
                 nhead=nhead,
                 num_layers=decoder_num_layers,
                 dim_feedforward=dim_feedforward,
@@ -816,32 +822,39 @@ class WorldModelUniversalV3(nn.Module):
             from .decoders.tf_cross_decoder import CrossAttentionTFDecoder
             from .decoders.future_query_builder import FutureQueryBuilder
             from .heads.quantile_rul_head import QuantileRULHead
-            
+
+            # Enforce d_model consistency: use encoder's actual d_model
+            d_model_used = encoder_d_model
+
+            # Check for d_model mismatch and warn/override
+            if hasattr(self, 'd_model') and d_model != encoder_d_model:
+                print(f"WARNING: d_model mismatch - encoder uses {encoder_d_model}, tf_cross was set to {d_model}. Using encoder d_model: {encoder_d_model}")
+
             # Default quantiles if not provided
             if quantiles is None:
                 quantiles = [0.1, 0.5, 0.9]
-            
+
             # Default dec_ff if not provided
             if dec_ff is None:
                 dec_ff = dim_feedforward
-            
+
             self.future_query_builder = FutureQueryBuilder(
-                d_model=d_model,
+                d_model=d_model_used,
                 max_future=future_max_len,
                 cond_dim=cond_dim,
                 dropout=dropout,
             )
-            
+
             self.tf_cross_decoder = CrossAttentionTFDecoder(
-                d_model=d_model,
+                d_model=d_model_used,
                 nhead=nhead,
                 num_layers=decoder_num_layers,
                 dim_feedforward=dec_ff,
                 dropout=dropout,
             )
-            
+
             self.rul_quantile_head = QuantileRULHead(
-                d_model=d_model,
+                d_model=d_model_used,
                 quantiles=quantiles,
                 dropout=dropout,
             )
@@ -856,7 +869,7 @@ class WorldModelUniversalV3(nn.Module):
         
         # Shared head (like RULHIUniversalModelV2) for HI and (base) EOL features
         self.shared_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(encoder_d_model, encoder_d_model),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
@@ -877,11 +890,11 @@ class WorldModelUniversalV3(nn.Module):
                 hi_feat_dim += 1  # hi_slope
         
         # EOL-Head: MLP/Linear on shared encoder features (+ optional HI fusion)
-        eol_in_dim = d_model + hi_feat_dim if self.use_hi_in_eol else d_model
+        eol_in_dim = encoder_d_model + hi_feat_dim if self.use_hi_in_eol else encoder_d_model
         self.fc_rul = nn.Linear(eol_in_dim, 1)
-        
+
         # HI-Head: Predicts Health Index in [0, 1] (with monotonicity)
-        self.fc_health = nn.Linear(d_model, 1)
+        self.fc_health = nn.Linear(encoder_d_model, 1)
         
         # Initialize weights
         for m in self.modules():

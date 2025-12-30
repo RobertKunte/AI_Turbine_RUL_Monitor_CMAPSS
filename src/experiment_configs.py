@@ -1334,9 +1334,12 @@ def get_wm_v3_fd004_b2_tf_cross_qr_b20_last_config() -> ExperimentConfig:
     """
     cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_config())
     cfg["experiment_name"] = "wm_v3_fd004_b2_tf_cross_qr_b20_last"
-    
+
+    # Override encoder_kwargs for tf_cross decoder
+    cfg["encoder_kwargs"]["decoder_num_layers"] = 2
+
     wmp = cfg.setdefault("world_model_params", {})
-    
+
     # Decoder configuration
     wmp["decoder_type"] = "tf_cross"
     wmp["decoder_num_layers"] = 2
