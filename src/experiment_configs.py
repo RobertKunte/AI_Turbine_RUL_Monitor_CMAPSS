@@ -4802,6 +4802,11 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_fd004_decoder_v3_from_encoder_v3d_config()
     if experiment_name == "fd004_decoder_v3_uncertainty_from_encoder_v3d":
         return get_fd004_decoder_v3_uncertainty_from_encoder_v3d_config()
+    # B2 Track: Transformer Cross-Attention Decoder with Quantile RUL Head
+    if experiment_name == "wm_v3_fd004_b2_tf_cross_qr_b20_last":
+        return get_wm_v3_fd004_b2_tf_cross_qr_b20_last_config()
+    if experiment_name == "wm_v3_fd004_b2_tf_cross_qr_b21_traj":
+        return get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":
