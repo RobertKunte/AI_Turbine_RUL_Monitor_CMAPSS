@@ -534,7 +534,12 @@ def train_world_model_universal_v3(
     # Encoder freezing parameters
     freeze_encoder = bool(getattr(world_model_config, "freeze_encoder", False))
     freeze_encoder_epochs = int(getattr(world_model_config, "freeze_encoder_epochs", 0) or 0)
-    unfreeze_encoder_layers = int(getattr(world_model_config, "unfreeze_encoder_layers", 0) or 0)
+    # Support unfreeze_encoder_layers as int, "all", or -1
+    unfreeze_encoder_layers_raw = getattr(world_model_config, "unfreeze_encoder_layers", 0)
+    if unfreeze_encoder_layers_raw == "all" or unfreeze_encoder_layers_raw == -1:
+        unfreeze_encoder_layers = -1  # Use -1 internally for "all layers"
+    else:
+        unfreeze_encoder_layers = int(unfreeze_encoder_layers_raw) if unfreeze_encoder_layers_raw else 0
     encoder_lr_mult = float(getattr(world_model_config, "encoder_lr_mult", 0.1) or 0.1)
 
     def _set_requires_grad(module: nn.Module, flag: bool) -> None:
@@ -788,11 +793,23 @@ def train_world_model_universal_v3(
     init_eol_bias = bool(getattr(world_model_config, "init_eol_bias_to_target_mean", False))
     
     # Freeze-aware checkpointing (prevents degenerate solutions during freeze phase)
-    checkpoint_min_epoch = getattr(world_model_config, "checkpoint_min_epoch", None)
-    checkpoint_unfreeze_warmup_epochs = int(getattr(world_model_config, "checkpoint_unfreeze_warmup_epochs", 2))
+    # Support both new names (best_ckpt_*) and old names (checkpoint_*) for backwards compatibility
+    best_ckpt_min_epoch = getattr(world_model_config, "best_ckpt_min_epoch", None)
+    if best_ckpt_min_epoch is None:
+        best_ckpt_min_epoch = getattr(world_model_config, "checkpoint_min_epoch", None)
+    
+    best_ckpt_min_epoch_after_unfreeze = int(getattr(world_model_config, "best_ckpt_min_epoch_after_unfreeze", 
+        getattr(world_model_config, "checkpoint_unfreeze_warmup_epochs", 2)))
+    
+    best_ckpt_require_pred_std_min = getattr(world_model_config, "best_ckpt_require_pred_std_min", None)
+    if best_ckpt_require_pred_std_min is None:
+        # Check old name, default to 1.0 if not set
+        best_ckpt_require_pred_std_min = getattr(world_model_config, "checkpoint_pred_std_min", 1.0)
+    if best_ckpt_require_pred_std_min is not None:
+        best_ckpt_require_pred_std_min = float(best_ckpt_require_pred_std_min)
+    
+    # Legacy: checkpoint_pred_sanity_gate (for backwards compatibility)
     checkpoint_pred_sanity_gate = bool(getattr(world_model_config, "checkpoint_pred_sanity_gate", True))
-    checkpoint_pred_range_min = float(getattr(world_model_config, "checkpoint_pred_range_min", 10.0))
-    checkpoint_pred_std_min = float(getattr(world_model_config, "checkpoint_pred_std_min", 2.0))
     
     # Stage -1: FD004 hard enforcement (sync with earlier enforcement)
     if dataset_name.upper() == "FD004":
@@ -1959,22 +1976,33 @@ def train_world_model_universal_v3(
         allow_best_update_base = (not select_best_after_eol_active) or bool(eol_active)
         
         # Freeze-aware checkpointing: calculate min_epoch
-        if checkpoint_min_epoch is not None:
-            min_epoch = int(checkpoint_min_epoch)
+        if best_ckpt_min_epoch is not None:
+            min_epoch = int(best_ckpt_min_epoch)
         elif freeze_encoder or freeze_encoder_epochs > 0:
             # During freeze phase, require warmup after unfreeze
-            min_epoch = freeze_encoder_epochs + checkpoint_unfreeze_warmup_epochs
+            min_epoch = freeze_encoder_epochs + 1  # Default: allow after freeze ends + 1 epoch
         else:
             # No freeze: allow from epoch 0
             min_epoch = 0
         
-        # Check if checkpoint is allowed based on freeze-aware min_epoch
-        checkpoint_allowed = epoch >= min_epoch
+        # Compute epochs since unfreeze
+        if freeze_encoder_epochs > 0:
+            epochs_since_unfreeze = max(0, epoch - freeze_encoder_epochs)
+        else:
+            epochs_since_unfreeze = epoch
+        
+        # Check if checkpoint is allowed based on freeze-aware gating
+        checkpoint_allowed_min_epoch = epoch >= min_epoch
+        checkpoint_allowed_after_unfreeze = epochs_since_unfreeze >= best_ckpt_min_epoch_after_unfreeze
+        checkpoint_allowed = checkpoint_allowed_min_epoch and checkpoint_allowed_after_unfreeze
         reason_blocked = None
         
         if not checkpoint_allowed:
             allow_best_update = False
-            reason_blocked = f"min_epoch={min_epoch} (freeze-aware: freeze_epochs={freeze_encoder_epochs}, warmup={checkpoint_unfreeze_warmup_epochs})"
+            if not checkpoint_allowed_min_epoch:
+                reason_blocked = f"min_epoch={min_epoch} (freeze-aware: freeze_epochs={freeze_encoder_epochs})"
+            elif not checkpoint_allowed_after_unfreeze:
+                reason_blocked = f"min_after_unfreeze={best_ckpt_min_epoch_after_unfreeze} (epochs_since_unfreeze={epochs_since_unfreeze})"
         else:
             allow_best_update = allow_best_update_base
             reason_blocked = None if allow_best_update_base else f"eol_active={eol_active} (EOL-aware gating)"
@@ -1982,14 +2010,14 @@ def train_world_model_universal_v3(
         # Sanity gate: reject degenerate predictions (only if checkpoint would be allowed)
         pred_range_last = None
         pred_std_last = None
-        if allow_best_update and checkpoint_pred_sanity_gate and y_pred_val_for_gate is not None:
+        if allow_best_update and best_ckpt_require_pred_std_min is not None and y_pred_val_for_gate is not None:
             # Get y_pred_val if available (for FD004 val_rmse_last)
             pred_range_last = float(np.max(y_pred_val_for_gate) - np.min(y_pred_val_for_gate))
             pred_std_last = float(np.std(y_pred_val_for_gate))
             
-            if pred_range_last < checkpoint_pred_range_min or pred_std_last < checkpoint_pred_std_min:
+            if pred_std_last < best_ckpt_require_pred_std_min:
                 allow_best_update = False
-                reason_blocked = f"sanity_gate(range={pred_range_last:.2f}<{checkpoint_pred_range_min}, std={pred_std_last:.2f}<{checkpoint_pred_std_min})"
+                reason_blocked = f"sanity_gate(std={pred_std_last:.2f}<{best_ckpt_require_pred_std_min})"
 
         # Choose which metric to optimize for best checkpoint
         # Stage -1: FD004 must use capped LAST metric (val_rmse_last)
@@ -2089,7 +2117,7 @@ def train_world_model_universal_v3(
         encoder_frozen_state = encoder_frozen if 'encoder_frozen' in locals() else (freeze_encoder or (freeze_encoder_epochs > 0 and epoch < freeze_encoder_epochs))
         log_msg = (
             f"[checkpoint] epoch={epoch} encoder_frozen={encoder_frozen_state} "
-            f"checkpoint_allowed={checkpoint_allowed} min_epoch={min_epoch} "
+            f"checkpoint_allowed={checkpoint_allowed} min_epoch={min_epoch} epochs_since_unfreeze={epochs_since_unfreeze} "
             f"allow_best_update={allow_best_update} best_metric={best_metric} metric={metric_val:.4f}"
         )
         if reason_blocked:
@@ -2456,11 +2484,10 @@ def train_world_model_universal_v3(
             # Freeze-aware checkpointing config
             "freeze_encoder": freeze_encoder,
             "freeze_encoder_epochs": freeze_encoder_epochs,
-            "checkpoint_min_epoch": checkpoint_min_epoch,
-            "checkpoint_unfreeze_warmup_epochs": checkpoint_unfreeze_warmup_epochs,
-            "checkpoint_pred_sanity_gate": checkpoint_pred_sanity_gate,
-            "checkpoint_pred_range_min": checkpoint_pred_range_min,
-            "checkpoint_pred_std_min": checkpoint_pred_std_min,
+            "unfreeze_encoder_layers": unfreeze_encoder_layers_raw if 'unfreeze_encoder_layers_raw' in locals() else unfreeze_encoder_layers,
+            "best_ckpt_min_epoch": best_ckpt_min_epoch,
+            "best_ckpt_min_epoch_after_unfreeze": best_ckpt_min_epoch_after_unfreeze,
+            "best_ckpt_require_pred_std_min": best_ckpt_require_pred_std_min,
         },
         "train_metrics": metrics_train,
         "val_metrics": metrics_val,

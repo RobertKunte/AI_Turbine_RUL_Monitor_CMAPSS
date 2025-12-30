@@ -1358,6 +1358,11 @@ def get_wm_v3_fd004_b2_tf_cross_qr_b20_last_config() -> ExperimentConfig:
     
     # Ensure max_rul = 125 (cap 125)
     wmp["max_rul"] = 125
+
+    # Freeze policy for tf_cross (ADR-0011): shorter freeze + full unfreeze recommended
+    wmp["freeze_encoder_epochs"] = 2  # Reduced from 5 to minimize fake-good window
+    wmp["unfreeze_encoder_layers"] = "all"  # Full unfreeze recommended for FD004 tf_cross
+    wmp["encoder_lr_mult"] = 0.1  # Low LR multiplier to prevent encoder overfitting
     
     return cfg
 
