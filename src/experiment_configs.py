@@ -1375,9 +1375,12 @@ def get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_config() -> ExperimentConfig:
     cfg["experiment_name"] = "wm_v3_fd004_b2_tf_cross_qr_b21_traj"
     
     wmp = cfg.setdefault("world_model_params", {})
-    
+    training = cfg.setdefault("training_params", {})
     # Change ONLY b2_loss_mode
     wmp["b2_loss_mode"] = "traj"
+
+    
+    training["num_epochs"] = 50
     
     return cfg
 
@@ -1404,7 +1407,7 @@ def get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_hiheavy_config() -> ExperimentConfig
     wmp["eol_loss_weight"] = 0.1  # Decreased from 5.0
 
     # Shorter training for ablation
-    training["num_epochs"] = 10
+    training["num_epochs"] = 50
 
     return cfg
 

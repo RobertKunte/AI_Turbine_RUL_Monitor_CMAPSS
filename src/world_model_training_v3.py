@@ -787,6 +787,13 @@ def train_world_model_universal_v3(
     eol_target_mode = str(getattr(world_model_config, "eol_target_mode", "future0")).lower()
     init_eol_bias = bool(getattr(world_model_config, "init_eol_bias_to_target_mean", False))
     
+    # Freeze-aware checkpointing (prevents degenerate solutions during freeze phase)
+    checkpoint_min_epoch = getattr(world_model_config, "checkpoint_min_epoch", None)
+    checkpoint_unfreeze_warmup_epochs = int(getattr(world_model_config, "checkpoint_unfreeze_warmup_epochs", 2))
+    checkpoint_pred_sanity_gate = bool(getattr(world_model_config, "checkpoint_pred_sanity_gate", True))
+    checkpoint_pred_range_min = float(getattr(world_model_config, "checkpoint_pred_range_min", 10.0))
+    checkpoint_pred_std_min = float(getattr(world_model_config, "checkpoint_pred_std_min", 2.0))
+    
     # Stage -1: FD004 hard enforcement (sync with earlier enforcement)
     if dataset_name.upper() == "FD004":
         cap_rul_targets = True
@@ -887,6 +894,12 @@ def train_world_model_universal_v3(
         "val_crossing_rate_seq": [],
         "val_coverage_10_90_last": [],
         "val_coverage_10_90_seq": [],
+        # Checkpoint tracking (freeze-aware)
+        "checkpoint_allowed": [],
+        "checkpoint_min_epoch": [],
+        "checkpoint_reason_blocked": [],
+        "checkpoint_pred_range_last": [],
+        "checkpoint_pred_std_last": [],
     }
     
     best_val_loss = float("inf")
@@ -1942,10 +1955,45 @@ def train_world_model_universal_v3(
         # --------------------------------------------------
         # Best checkpoint selection + early stopping (optionally EOL-aware)
         # --------------------------------------------------
-        allow_best_update = (not select_best_after_eol_active) or bool(eol_active)
+        # Base allow_best_update from EOL-aware logic
+        allow_best_update_base = (not select_best_after_eol_active) or bool(eol_active)
+        
+        # Freeze-aware checkpointing: calculate min_epoch
+        if checkpoint_min_epoch is not None:
+            min_epoch = int(checkpoint_min_epoch)
+        elif freeze_encoder or freeze_encoder_epochs > 0:
+            # During freeze phase, require warmup after unfreeze
+            min_epoch = freeze_encoder_epochs + checkpoint_unfreeze_warmup_epochs
+        else:
+            # No freeze: allow from epoch 0
+            min_epoch = 0
+        
+        # Check if checkpoint is allowed based on freeze-aware min_epoch
+        checkpoint_allowed = epoch >= min_epoch
+        reason_blocked = None
+        
+        if not checkpoint_allowed:
+            allow_best_update = False
+            reason_blocked = f"min_epoch={min_epoch} (freeze-aware: freeze_epochs={freeze_encoder_epochs}, warmup={checkpoint_unfreeze_warmup_epochs})"
+        else:
+            allow_best_update = allow_best_update_base
+            reason_blocked = None if allow_best_update_base else f"eol_active={eol_active} (EOL-aware gating)"
+        
+        # Sanity gate: reject degenerate predictions (only if checkpoint would be allowed)
+        pred_range_last = None
+        pred_std_last = None
+        if allow_best_update and checkpoint_pred_sanity_gate and y_pred_val_for_gate is not None:
+            # Get y_pred_val if available (for FD004 val_rmse_last)
+            pred_range_last = float(np.max(y_pred_val_for_gate) - np.min(y_pred_val_for_gate))
+            pred_std_last = float(np.std(y_pred_val_for_gate))
+            
+            if pred_range_last < checkpoint_pred_range_min or pred_std_last < checkpoint_pred_std_min:
+                allow_best_update = False
+                reason_blocked = f"sanity_gate(range={pred_range_last:.2f}<{checkpoint_pred_range_min}, std={pred_std_last:.2f}<{checkpoint_pred_std_min})"
 
         # Choose which metric to optimize for best checkpoint
         # Stage -1: FD004 must use capped LAST metric (val_rmse_last)
+        y_pred_val_for_gate = None  # Initialize for sanity gate
         if dataset_name.upper() == "FD004" and best_metric == "val_rmse_last":
             # Compute val_rmse_last during validation for FD004
             # This requires evaluating on validation set (quick evaluation)
@@ -2010,6 +2058,9 @@ def train_world_model_universal_v3(
                     clip_val = (0.0, float(max_rul)) if max_rul is not None else None
                     m_val_last = compute_last_per_unit_metrics(unit_ids_val, y_true_val, y_pred_val, clip=clip_val)
                     metric_val = float(m_val_last.get("rmse_last", epoch_val_eol_loss))
+                    
+                    # Store y_pred_val for sanity gate (only for FD004 val_rmse_last)
+                    y_pred_val_for_gate = y_pred_val.copy()
                     print(f"[Stage-1] FD004: Computed val_rmse_last={metric_val:.4f} for checkpoint selection")
                 else:
                     # Fallback to val_eol_loss if validation set is empty
@@ -2034,11 +2085,26 @@ def train_world_model_universal_v3(
             metric_val = float(epoch_val_loss)
 
         # Stage -1: Explicit logging of checkpoint metric and capping status
-        print(
-            f"[checkpoint] eol_active={eol_active} mult={eol_mult:.3f} "
-            f"allow_best_update={allow_best_update} best_metric={best_metric} metric={metric_val:.4f} "
-            f"(cap_targets={cap_rul_targets}, max_rul={max_rul if max_rul is not None else 125.0})"
+        # encoder_frozen is computed earlier in the epoch loop
+        encoder_frozen_state = encoder_frozen if 'encoder_frozen' in locals() else (freeze_encoder or (freeze_encoder_epochs > 0 and epoch < freeze_encoder_epochs))
+        log_msg = (
+            f"[checkpoint] epoch={epoch} encoder_frozen={encoder_frozen_state} "
+            f"checkpoint_allowed={checkpoint_allowed} min_epoch={min_epoch} "
+            f"allow_best_update={allow_best_update} best_metric={best_metric} metric={metric_val:.4f}"
         )
+        if reason_blocked:
+            log_msg += f" reason_blocked={reason_blocked}"
+        if pred_range_last is not None:
+            log_msg += f" pred_range={pred_range_last:.2f} pred_std={pred_std_last:.2f}"
+        log_msg += f" (cap_targets={cap_rul_targets}, max_rul={max_rul if max_rul is not None else 125.0})"
+        print(log_msg)
+        
+        # Track checkpoint decisions in history
+        history["checkpoint_allowed"].append(checkpoint_allowed)
+        history["checkpoint_min_epoch"].append(min_epoch)
+        history["checkpoint_reason_blocked"].append(reason_blocked if reason_blocked else "")
+        history["checkpoint_pred_range_last"].append(pred_range_last if pred_range_last is not None else float("nan"))
+        history["checkpoint_pred_std_last"].append(pred_std_last if pred_std_last is not None else float("nan"))
 
         # If gating is enabled, don't start patience until EOL becomes active
         if select_best_after_eol_active and (not eol_active):
@@ -2387,10 +2453,14 @@ def train_world_model_universal_v3(
                 model.tf_decoder.__class__.__name__ if hasattr(model, 'tf_decoder') and model.tf_decoder is not None
                 else (model.decoder.__class__.__name__ if hasattr(model, 'decoder') and model.decoder is not None else "unknown")
             ),
-            "decoder_class": (
-                model.tf_decoder.__class__.__name__ if hasattr(model, 'tf_decoder') and model.tf_decoder is not None
-                else (model.decoder.__class__.__name__ if hasattr(model, 'decoder') and model.decoder is not None else "unknown")
-            ),
+            # Freeze-aware checkpointing config
+            "freeze_encoder": freeze_encoder,
+            "freeze_encoder_epochs": freeze_encoder_epochs,
+            "checkpoint_min_epoch": checkpoint_min_epoch,
+            "checkpoint_unfreeze_warmup_epochs": checkpoint_unfreeze_warmup_epochs,
+            "checkpoint_pred_sanity_gate": checkpoint_pred_sanity_gate,
+            "checkpoint_pred_range_min": checkpoint_pred_range_min,
+            "checkpoint_pred_std_min": checkpoint_pred_std_min,
         },
         "train_metrics": metrics_train,
         "val_metrics": metrics_val,
