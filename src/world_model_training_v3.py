@@ -546,6 +546,47 @@ def train_world_model_universal_v3(
         _set_requires_grad(model.encoder, False)
         model.encoder.eval()
 
+    def _discover_transformer_layers(encoder: nn.Module) -> Optional[list]:
+        """
+        Discover transformer encoder layers from UniversalEncoderV2 or similar structures.
+        Returns list of layer modules or None if not found.
+        """
+        # Try UniversalEncoderV2 structure: encoder.transformer.layers
+        if hasattr(encoder, "transformer"):
+            transformer = encoder.transformer
+            if isinstance(transformer, nn.TransformerEncoder):
+                # nn.TransformerEncoder stores layers in .layers (ModuleList)
+                if hasattr(transformer, "layers"):
+                    layers = transformer.layers
+                    if isinstance(layers, (nn.ModuleList, list)) and len(layers) > 0:
+                        return list(layers)
+            # Fallback: check if transformer has .layers directly
+            elif hasattr(transformer, "layers"):
+                layers = transformer.layers
+                if isinstance(layers, (nn.ModuleList, list)) and len(layers) > 0:
+                    return list(layers)
+
+        # Try alternative structures
+        if hasattr(encoder, "seq_encoder"):
+            seq_enc = encoder.seq_encoder
+            if isinstance(seq_enc, nn.TransformerEncoder) and hasattr(seq_enc, "layers"):
+                layers = seq_enc.layers
+                if isinstance(layers, (nn.ModuleList, list)) and len(layers) > 0:
+                    return list(layers)
+
+        # Try encoder.encoder or encoder.layers
+        if hasattr(encoder, "encoder") and hasattr(encoder.encoder, "layers"):
+            layers = encoder.encoder.layers
+            if isinstance(layers, (nn.ModuleList, list)) and len(layers) > 0:
+                return list(layers)
+
+        if hasattr(encoder, "layers"):
+            layers = encoder.layers
+            if isinstance(layers, (nn.ModuleList, list)) and len(layers) > 0:
+                return list(layers)
+
+        return None
+
     def _partial_unfreeze_encoder(*, unfreeze_last_k: int) -> list[str]:
         """
         Unfreeze encoder layers based on unfreeze_last_k:
@@ -565,15 +606,19 @@ def train_world_model_universal_v3(
             model.encoder.train()
             return unfrozen_modules
 
-        # Try to unfreeze last K transformer layers
-        if hasattr(model.encoder, "transformer") and hasattr(model.encoder.transformer, "layers"):
-            layers = model.encoder.transformer.layers
-            if layers is not None and unfreeze_last_k > 0:
-                k = min(int(unfreeze_last_k), len(layers))
-                # Unfreeze last k layers
-                for idx, layer in enumerate(list(layers)[-k:], start=len(layers) - k):
-                    _set_requires_grad(layer, True)
-                    unfrozen_modules.append(f"encoder.transformer.layers[{idx}]")
+        # Discover transformer layers
+        layers = _discover_transformer_layers(model.encoder)
+        if layers is not None and unfreeze_last_k > 0:
+            k = min(int(unfreeze_last_k), len(layers))
+            # Unfreeze last k layers (from end of list)
+            for idx in range(len(layers) - k, len(layers)):
+                layer = layers[idx]
+                _set_requires_grad(layer, True)
+                unfrozen_modules.append(f"encoder.transformer.layers[{idx}]")
+        elif unfreeze_last_k > 0:
+            # If no transformer layers found, log warning but don't fail
+            print(f"[EncoderFreeze] Warning: Could not find transformer layers in encoder. "
+                  f"Structure: {type(model.encoder).__name__}, attrs: {[a for a in dir(model.encoder) if not a.startswith('_')][:10]}")
 
         # Always unfreeze shared_head if present (part of encoder)
         if hasattr(model.encoder, "shared_head") and model.encoder.shared_head is not None:
@@ -593,8 +638,43 @@ def train_world_model_universal_v3(
     else:
         print(f"[EncoderFreeze] No initial freeze: freeze_encoder={freeze_encoder}, freeze_encoder_epochs={freeze_encoder_epochs}")
 
+    # Safety check: ensure decoder/heads are trainable when encoder is frozen
+    trainability_check = summarize_trainability(model)
+    encoder_trainable = trainability_check["encoder"]["trainable"]
+    decoder_trainable = trainability_check["decoder_heads"]["trainable"]
+    
+    if (freeze_encoder or freeze_encoder_epochs > 0) and encoder_trainable == 0:
+        if decoder_trainable == 0:
+            raise RuntimeError(
+                f"[EncoderFreeze] CRITICAL: Encoder is frozen but decoder/heads also have 0 trainable params! "
+                f"This would prevent any training. Check model structure."
+            )
+        print(f"[EncoderFreeze] Safety check passed: encoder_trainable={encoder_trainable:,}, decoder_trainable={decoder_trainable:,}")
+
     print(f"[EncoderFreeze] Config: unfreeze_encoder_layers={unfreeze_encoder_layers}, encoder_lr_mult={encoder_lr_mult}")
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    def _make_optimizer() -> torch.optim.Optimizer:
+        """
+        Create optimizer with separate param groups for encoder (with lr_mult) and decoder/heads.
+        This ensures encoder params get correct learning rate when unfrozen.
+        """
+        enc_params = [p for n, p in model.named_parameters() if n.startswith("encoder.") and p.requires_grad]
+        other_params = [p for n, p in model.named_parameters() if not n.startswith("encoder.") and p.requires_grad]
+
+        param_groups = []
+        if other_params:
+            param_groups.append({"params": other_params, "lr": lr})
+        if enc_params:
+            param_groups.append({"params": enc_params, "lr": lr * encoder_lr_mult})
+
+        # If no trainable params, create empty optimizer (shouldn't happen, but safety)
+        if not param_groups:
+            print("[EncoderFreeze] WARNING: No trainable parameters found! Creating optimizer with all params.")
+            return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        return torch.optim.Adam(param_groups, lr=lr, weight_decay=weight_decay)
+
+    optimizer = _make_optimizer()
     mse_loss = nn.MSELoss()
 
     # -------------------------------
@@ -864,23 +944,34 @@ def train_world_model_universal_v3(
             unfrozen = _partial_unfreeze_encoder(unfreeze_last_k=unfreeze_encoder_layers)
             did_initial_unfreeze = True
             print(f"[EncoderFreeze] Epoch {epoch}: Partial unfreeze - unfrozen modules: {unfrozen}")
+            
+            # Rebuild optimizer to include newly unfrozen encoder params with correct lr_mult
+            optimizer = _make_optimizer()
+            print(f"[EncoderFreeze] Epoch {epoch}: Rebuilt optimizer with {len(optimizer.param_groups)} param groups")
+            for pg_idx, pg in enumerate(optimizer.param_groups):
+                n_params = sum(p.numel() for p in pg["params"])
+                print(f"  Param group {pg_idx}: {n_params:,} params, lr={pg['lr']:.6f}")
 
         # Optional: freeze encoder briefly when EOL starts to protect representation
+        eol_freeze_active = False
         if freeze_encoder_n > 0 and eol_on_epoch is not None and (epoch - eol_on_epoch) < freeze_encoder_n:
             _set_requires_grad(model.encoder, False)
-            encoder_frozen = True
-        else:
-            encoder_frozen = False
+            eol_freeze_active = True
 
         # Get trainability summary for logging
         trainability = summarize_trainability(model)
-        encoder_should_be_frozen = (freeze_encoder or (freeze_encoder_epochs > 0 and epoch < freeze_encoder_epochs))
+        encoder_should_be_frozen = (freeze_encoder or (freeze_encoder_epochs > 0 and epoch < freeze_encoder_epochs)) or eol_freeze_active
         encoder_trainable_params = trainability["encoder"]["trainable"]
+        decoder_trainable_params = trainability["decoder_heads"]["trainable"]
         encoder_frozen_flag = trainability["encoder"]["frozen"]
 
-        # Log freeze state
+        # Use actual frozen state from trainability (not separate variable)
+        encoder_frozen = encoder_frozen_flag
+
+        # Log freeze state with component breakdown
         print(f"[EncoderFreeze] epoch={epoch} should_be_frozen={encoder_should_be_frozen} "
-              f"trainable_params={encoder_trainable_params:,} frozen_flag={encoder_frozen_flag}")
+              f"encoder_trainable={encoder_trainable_params:,} decoder_trainable={decoder_trainable_params:,} "
+              f"frozen_flag={encoder_frozen_flag}")
 
         # Take parameter snapshots for update norm calculation
         param_snapshots = {}
