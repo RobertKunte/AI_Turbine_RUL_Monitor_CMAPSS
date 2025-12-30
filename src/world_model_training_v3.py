@@ -531,6 +531,12 @@ def train_world_model_universal_v3(
     # ===================================================================
     print("\n[6] Training model...")
 
+    # Encoder freezing parameters
+    freeze_encoder = bool(getattr(world_model_config, "freeze_encoder", False))
+    freeze_encoder_epochs = int(getattr(world_model_config, "freeze_encoder_epochs", 0) or 0)
+    unfreeze_encoder_layers = int(getattr(world_model_config, "unfreeze_encoder_layers", 0) or 0)
+    encoder_lr_mult = float(getattr(world_model_config, "encoder_lr_mult", 0.1) or 0.1)
+
     # Initialize encoder freezing state
     did_initial_unfreeze = False
 
@@ -594,12 +600,6 @@ def train_world_model_universal_v3(
     clip_grad_norm_cfg = getattr(world_model_config, "clip_grad_norm", None)
     if normalize_eol and clip_grad_norm_cfg is None:
         clip_grad_norm_cfg = 1.0
-
-    # Encoder freezing parameters
-    freeze_encoder = bool(getattr(world_model_config, "freeze_encoder", False))
-    freeze_encoder_epochs = int(getattr(world_model_config, "freeze_encoder_epochs", 0) or 0)
-    unfreeze_encoder_layers = int(getattr(world_model_config, "unfreeze_encoder_layers", 0) or 0)
-    encoder_lr_mult = float(getattr(world_model_config, "encoder_lr_mult", 0.1) or 0.1)
 
     freeze_encoder_n = int(getattr(world_model_config, "freeze_encoder_epochs_after_eol_on", 0) or 0)
     eol_on_epoch: Optional[int] = None
