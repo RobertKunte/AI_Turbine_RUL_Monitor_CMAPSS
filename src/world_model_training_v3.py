@@ -798,7 +798,15 @@ def train_world_model_universal_v3(
             cond_batch = cond_batch.to(device)
             if mask_batch is not None:
                 mask_batch = mask_batch.to(device)
-            
+
+            # ------------------------------------------------------------------
+            # Define target_traj_rul immediately after batch unpacking (ALWAYS available)
+            # ------------------------------------------------------------------
+            target_traj_rul = Y_batch  # (B, H, 1) - future RUL trajectory (may be raw/padded)
+            if cap_rul_targets:
+                max_rul_f = float(max_rul if max_rul is not None else 125.0)
+                target_traj_rul = target_traj_rul.clamp(0.0, max_rul_f)
+
             optimizer.zero_grad()
             
             # Forward pass
@@ -831,11 +839,15 @@ def train_world_model_universal_v3(
                     quantile_crossing_rate,
                     quantile_coverage,
                 )
-                
+
+                # Defensive assertions for target_traj_rul
+                assert target_traj_rul is not None, "target_traj_rul must be defined"
+                assert target_traj_rul.ndim == 3 and target_traj_rul.shape[-1] == 1, f"target_traj_rul must be (B, T, 1), got {target_traj_rul.shape}"
+
                 # Get quantile outputs
                 rul_q_seq = outputs.get("rul_q_seq")  # (B, T_future, 3)
                 rul_q_last = outputs.get("rul_q_last")  # (B, 3)
-                
+
                 if rul_q_seq is None or rul_q_last is None:
                     raise ValueError("tf_cross decoder must return rul_q_seq and rul_q_last")
                 
@@ -921,12 +933,9 @@ def train_world_model_universal_v3(
                     raise ValueError(f"Unknown b2_loss_mode: {b2_loss_mode}. Must be 'last' or 'traj'")
 
             # ------------------------------------------------------------------
-            # Targets
+            # Targets (target_traj_rul already defined above)
             # ------------------------------------------------------------------
-            target_traj_rul = Y_batch              # (B, H, 1) - future RUL trajectory (may be raw/padded)
-            if cap_rul_targets:
-                max_rul_f = float(max_rul if max_rul is not None else 125.0)
-                target_traj_rul = target_traj_rul.clamp(0.0, max_rul_f)
+            # target_traj_rul is already defined and capped above after batch unpacking
 
             # Scalar EOL target (explicit definition; must match eval units)
             if eol_target_mode in {"future0", "t0", "start"}:
@@ -1223,7 +1232,15 @@ def train_world_model_universal_v3(
                 cond_batch = cond_batch.to(device)
                 if mask_batch is not None:
                     mask_batch = mask_batch.to(device)
-                
+
+                # ------------------------------------------------------------------
+                # Define target_traj_rul immediately after batch unpacking (ALWAYS available)
+                # ------------------------------------------------------------------
+                target_traj_rul = Y_batch  # (B, H, 1) - future RUL trajectory (may be raw/padded)
+                if cap_rul_targets:
+                    max_rul_f = float(max_rul if max_rul is not None else 125.0)
+                    target_traj_rul = target_traj_rul.clamp(0.0, max_rul_f)
+
                 # Forward pass
                 outputs = model(
                     encoder_inputs=X_batch,
@@ -1252,11 +1269,15 @@ def train_world_model_universal_v3(
                         quantile_crossing_rate,
                         quantile_coverage,
                     )
-                    
+
+                    # Defensive assertions for target_traj_rul
+                    assert target_traj_rul is not None, "target_traj_rul must be defined"
+                    assert target_traj_rul.ndim == 3 and target_traj_rul.shape[-1] == 1, f"target_traj_rul must be (B, T, 1), got {target_traj_rul.shape}"
+
                     # Get quantile outputs
                     rul_q_seq = outputs.get("rul_q_seq")  # (B, T_future, 3)
                     rul_q_last = outputs.get("rul_q_last")  # (B, 3)
-                    
+
                     if rul_q_seq is not None and rul_q_last is not None:
                         # Get config parameters
                         b2_loss_mode = str(getattr(world_model_config, "b2_loss_mode", "last")).lower()
@@ -1328,12 +1349,8 @@ def train_world_model_universal_v3(
                                 y_pred=y_pred_seq,
                                 mask=valid_mask_seq,
                             )
-                
-                # Targets
-                target_traj_rul = Y_batch              # (B, H, 1)
-                if cap_rul_targets:
-                    max_rul_f = float(max_rul if max_rul is not None else 125.0)
-                    target_traj_rul = target_traj_rul.clamp(0.0, max_rul_f)
+
+                # Targets (target_traj_rul already defined above)
 
                 if eol_target_mode in {"future0", "t0", "start"}:
                     eol_scalar_target = target_traj_rul[:, 0, 0]
