@@ -546,6 +546,66 @@ def train_world_model_universal_v3(
         _set_requires_grad(model.encoder, False)
         model.encoder.eval()
 
+    def count_trainable_params(module: nn.Module) -> Tuple[int, int]:
+        """
+        Count trainable parameters in a module.
+        Returns: (num_params, num_tensors)
+        """
+        trainable_params = [p for p in module.parameters() if p.requires_grad]
+        num_params = sum(p.numel() for p in trainable_params)
+        num_tensors = len(trainable_params)
+        return num_params, num_tensors
+
+    def list_trainable_param_names(module: nn.Module, k: int = 10) -> List[str]:
+        """
+        List names of trainable parameters (up to k).
+        """
+        names = [name for name, param in module.named_parameters() if param.requires_grad]
+        return names[:k]
+
+    def summarize_trainability(model: nn.Module) -> dict:
+        """Summarize parameter trainability statistics."""
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        # Encoder stats
+        encoder_params = sum(p.numel() for p in model.encoder.parameters())
+        encoder_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+
+        # Decoder/Heads stats (everything that's not encoder)
+        decoder_params = total_params - encoder_params
+        decoder_trainable = trainable_params - encoder_trainable
+
+        # Per-encoder-block stats if available
+        encoder_blocks = {}
+        if hasattr(model.encoder, "transformer") and hasattr(model.encoder.transformer, "layers"):
+            layers = model.encoder.transformer.layers
+            if layers is not None:
+                for i, layer in enumerate(layers):
+                    block_params = sum(p.numel() for p in layer.parameters())
+                    block_trainable = sum(p.numel() for p in layer.parameters() if p.requires_grad)
+                    encoder_blocks[f"layer_{i}"] = {
+                        "total": block_params,
+                        "trainable": block_trainable,
+                        "frozen": block_trainable == 0
+                    }
+
+        return {
+            "total_params": total_params,
+            "trainable_params": trainable_params,
+            "encoder": {
+                "total": encoder_params,
+                "trainable": encoder_trainable,
+                "frozen": encoder_trainable == 0
+            },
+            "decoder_heads": {
+                "total": decoder_params,
+                "trainable": decoder_trainable,
+                "frozen": decoder_trainable == 0
+            },
+            "encoder_blocks": encoder_blocks
+        }
+
     def _discover_transformer_layers(encoder: nn.Module) -> Optional[list]:
         """
         Discover transformer encoder layers from UniversalEncoderV2 or similar structures.
@@ -585,6 +645,12 @@ def train_world_model_universal_v3(
             if isinstance(layers, (nn.ModuleList, list)) and len(layers) > 0:
                 return list(layers)
 
+        # Try blocks/block pattern
+        if hasattr(encoder, "blocks"):
+            blocks = encoder.blocks
+            if isinstance(blocks, (nn.ModuleList, list)) and len(blocks) > 0:
+                return list(blocks)
+
         return None
 
     def _partial_unfreeze_encoder(*, unfreeze_last_k: int) -> list[str]:
@@ -606,7 +672,7 @@ def train_world_model_universal_v3(
             model.encoder.train()
             return unfrozen_modules
 
-        # Discover transformer layers
+        # Strategy 1: Try to unfreeze last K transformer layers
         layers = _discover_transformer_layers(model.encoder)
         if layers is not None and unfreeze_last_k > 0:
             k = min(int(unfreeze_last_k), len(layers))
@@ -615,15 +681,42 @@ def train_world_model_universal_v3(
                 layer = layers[idx]
                 _set_requires_grad(layer, True)
                 unfrozen_modules.append(f"encoder.transformer.layers[{idx}]")
-        elif unfreeze_last_k > 0:
-            # If no transformer layers found, log warning but don't fail
-            print(f"[EncoderFreeze] Warning: Could not find transformer layers in encoder. "
-                  f"Structure: {type(model.encoder).__name__}, attrs: {[a for a in dir(model.encoder) if not a.startswith('_')][:10]}")
+
+        # Strategy 2: Fallback to name-pattern matching if layer discovery failed
+        if unfreeze_last_k > 0 and len(unfrozen_modules) == 0:
+            # Patterns to try for unfreezing by name
+            patterns = []
+            # Try to identify which submodule contains layers
+            if hasattr(model.encoder, "transformer"):
+                patterns.extend(["transformer.layers", "transformer"])
+            if hasattr(model.encoder, "seq_encoder"):
+                patterns.extend(["seq_encoder.layers", "seq_encoder"])
+            patterns.extend(["layers", "blocks", "block", "encoder.layers"])
+
+            # Also always try to unfreeze projection/head modules
+            head_patterns = ["proj", "out_proj", "head", "mlp", "fc_out", "output"]
+
+            # Unfreeze params matching patterns
+            unfrozen_by_pattern = []
+            for name, param in model.encoder.named_parameters():
+                # Check if name matches any pattern
+                matches_pattern = any(pattern in name for pattern in patterns)
+                matches_head = any(pattern in name for pattern in head_patterns)
+                
+                if matches_pattern or matches_head:
+                    param.requires_grad = True
+                    if name not in unfrozen_by_pattern:
+                        unfrozen_by_pattern.append(name)
+                        unfrozen_modules.append(f"encoder.{name}")
+
+            if unfrozen_by_pattern:
+                print(f"[EncoderFreeze] Fallback: Unfroze {len(unfrozen_by_pattern)} params by name pattern")
 
         # Always unfreeze shared_head if present (part of encoder)
         if hasattr(model.encoder, "shared_head") and model.encoder.shared_head is not None:
             _set_requires_grad(model.encoder.shared_head, True)
-            unfrozen_modules.append("encoder.shared_head")
+            if "encoder.shared_head" not in unfrozen_modules:
+                unfrozen_modules.append("encoder.shared_head")
 
         model.encoder.train()
         return unfrozen_modules
@@ -730,49 +823,6 @@ def train_world_model_universal_v3(
     freeze_encoder_n = int(getattr(world_model_config, "freeze_encoder_epochs_after_eol_on", 0) or 0)
     eol_on_epoch: Optional[int] = None
     eol_became_active_epoch: Optional[int] = None
-
-    def summarize_trainability(model: nn.Module) -> dict:
-        """Summarize parameter trainability statistics."""
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-        # Encoder stats
-        encoder_params = sum(p.numel() for p in model.encoder.parameters())
-        encoder_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
-
-        # Decoder/Heads stats (everything that's not encoder)
-        decoder_params = total_params - encoder_params
-        decoder_trainable = trainable_params - encoder_trainable
-
-        # Per-encoder-block stats if available
-        encoder_blocks = {}
-        if hasattr(model.encoder, "transformer") and hasattr(model.encoder.transformer, "layers"):
-            layers = model.encoder.transformer.layers
-            if layers is not None:
-                for i, layer in enumerate(layers):
-                    block_params = sum(p.numel() for p in layer.parameters())
-                    block_trainable = sum(p.numel() for p in layer.parameters() if p.requires_grad)
-                    encoder_blocks[f"layer_{i}"] = {
-                        "total": block_params,
-                        "trainable": block_trainable,
-                        "frozen": block_trainable == 0
-                    }
-
-        return {
-            "total_params": total_params,
-            "trainable_params": trainable_params,
-            "encoder": {
-                "total": encoder_params,
-                "trainable": encoder_trainable,
-                "frozen": encoder_trainable == 0
-            },
-            "decoder_heads": {
-                "total": decoder_params,
-                "trainable": decoder_trainable,
-                "frozen": decoder_trainable == 0
-            },
-            "encoder_blocks": encoder_blocks
-        }
 
     def _eol_loss_per_sample(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -943,14 +993,40 @@ def train_world_model_universal_v3(
         if (not did_initial_unfreeze) and freeze_encoder_epochs > 0 and epoch == freeze_encoder_epochs:
             unfrozen = _partial_unfreeze_encoder(unfreeze_last_k=unfreeze_encoder_layers)
             did_initial_unfreeze = True
+            
+            # Fail-fast check: verify unfreeze actually worked
+            enc_params, enc_tensors = count_trainable_params(model.encoder)
+            total_params, total_tensors = count_trainable_params(model)
+            trainable_names = list_trainable_param_names(model.encoder, k=10)
+            
             print(f"[EncoderFreeze] Epoch {epoch}: Partial unfreeze - unfrozen modules: {unfrozen}")
+            print(f"[EncoderFreeze] Epoch {epoch}: encoder trainable tensors: {enc_tensors}, params: {enc_params:,}")
+            print(f"[EncoderFreeze] Epoch {epoch}: total trainable params: {total_params:,}")
+            if trainable_names:
+                print(f"[EncoderFreeze] Epoch {epoch}: sample trainable names: {trainable_names[:5]}")
+            
+            # Hard assertion: encoder must have trainable params after unfreeze (unless unfreeze_last_k==0)
+            if unfreeze_encoder_layers != 0 and enc_params == 0:
+                encoder_type = type(model.encoder).__name__
+                encoder_attrs = [a for a in dir(model.encoder) if not a.startswith('_')][:15]
+                raise RuntimeError(
+                    f"[EncoderFreeze] CRITICAL: Unfreeze failed! Encoder has 0 trainable params after unfreeze attempt.\n"
+                    f"  Configuration: freeze_encoder_epochs={freeze_encoder_epochs}, unfreeze_encoder_layers={unfreeze_encoder_layers}\n"
+                    f"  Encoder type: {encoder_type}\n"
+                    f"  Encoder attributes: {encoder_attrs}\n"
+                    f"  Unfrozen modules reported: {unfrozen}\n"
+                    f"  This will cause training to fail (no encoder updates).\n"
+                    f"  Suggestion: Check encoder structure or set unfreeze_encoder_layers=-1 to unfreeze all layers."
+                )
             
             # Rebuild optimizer to include newly unfrozen encoder params with correct lr_mult
             optimizer = _make_optimizer()
             print(f"[EncoderFreeze] Epoch {epoch}: Rebuilt optimizer with {len(optimizer.param_groups)} param groups")
             for pg_idx, pg in enumerate(optimizer.param_groups):
                 n_params = sum(p.numel() for p in pg["params"])
-                print(f"  Param group {pg_idx}: {n_params:,} params, lr={pg['lr']:.6f}")
+                effective_lr = pg["lr"]
+                print(f"  Param group {pg_idx}: {n_params:,} params, lr={effective_lr:.6f} "
+                      f"{'(encoder, lr_mult=' + str(encoder_lr_mult) + ')' if effective_lr != lr else '(decoder/heads)'}")
 
         # Optional: freeze encoder briefly when EOL starts to protect representation
         eol_freeze_active = False

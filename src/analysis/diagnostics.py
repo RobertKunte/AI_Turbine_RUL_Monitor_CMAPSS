@@ -1116,6 +1116,39 @@ def build_trajectories(
     trajectories: List[EngineTrajectory] = []
     raw_by_unit: Dict[int, Dict[str, np.ndarray]] = {}
 
+    def resolve_hi_target_col(df_columns: List[str], hi_target_type: str) -> Optional[str]:
+        """
+        Resolve HI target column name robustly with fallback candidates.
+        Returns column name if found, None otherwise.
+        """
+        df_cols_lower = [c.lower() for c in df_columns]
+        
+        if hi_target_type == "phys_v3":
+            candidates = ["HI_phys_v3", "hi_phys_v3", "health_phys_v3", "HI_phys", "hi_phys", "HI_phys_v3.1"]
+        elif hi_target_type == "phys_v2":
+            candidates = ["HI_phys_v2", "hi_phys_v2", "health_phys_v2"]
+        elif hi_target_type == "damage":
+            candidates = ["HI_damage", "hi_damage", "health_damage"]
+        elif hi_target_type == "cal":
+            candidates = ["HI_cal", "hi_cal", "HI_cal_v1", "HI_cal_v2"]
+        else:
+            # Generic fallback: try exact match and case-insensitive
+            candidates = [hi_target_type, hi_target_type.lower(), hi_target_type.upper()]
+        
+        # Try exact match first
+        for cand in candidates:
+            if cand in df_columns:
+                return cand
+        
+        # Try case-insensitive match
+        for cand in candidates:
+            cand_lower = cand.lower()
+            for col in df_columns:
+                if col.lower() == cand_lower:
+                    return col
+        
+        return None
+
     # Determine HI target type and calibration
     hi_target_type = "phys_v3"  # Default
     hi_calibrator_path = None
@@ -1142,7 +1175,25 @@ def build_trajectories(
             print(f"Warning: Could not load HI calibrator {hi_calibrator_path}: {e}")
             calibrator = None
 
-    print(f"HI target type: {hi_target_type}, Calibrator: {'Yes' if calibrator else 'No'}")
+    # Resolve HI target column once (before loop)
+    hi_target_col = None
+    if use_hi_true_target and len(df_test_fe) > 0:
+        # Get sample engine to check columns
+        sample_unit = df_test_fe["UnitNumber"].iloc[0]
+        sample_df = df_test_fe[df_test_fe["UnitNumber"] == sample_unit]
+        hi_target_col = resolve_hi_target_col(list(sample_df.columns), hi_target_type)
+        
+        if hi_target_col:
+            print(f"[Diagnostics] HI target column resolved: '{hi_target_col}' for type '{hi_target_type}'")
+        else:
+            # Emit ONE warning only
+            print(f"[Diagnostics] Warning: HI target column not found for type '{hi_target_type}'. "
+                  f"Available columns: {[c for c in sample_df.columns if 'HI' in c or 'hi' in c or 'health' in c.lower()][:10]}. "
+                  f"Skipping HI_true overlays.")
+            use_hi_true_target = False  # Disable HI_true for all engines
+
+    print(f"[Diagnostics] HI target type: {hi_target_type}, Column: {hi_target_col or 'None'}, "
+          f"Calibrator: {'Yes' if calibrator else 'No'}")
 
     for i, unit_id in enumerate(unit_ids_test):
         unit_id = int(unit_id)
@@ -1188,17 +1239,8 @@ def build_trajectories(
         
         # Extract actual HI target used in training
         hi_true_target_traj = None
-        if use_hi_true_target:
-            # Try to get HI target from dataframe columns
-            hi_target_col = None
-            if hi_target_type == "phys_v3" and "HI_phys_v3" in df_engine.columns:
-                hi_target_col = "HI_phys_v3"
-            elif hi_target_type == "phys_v2" and "HI_phys_v2" in df_engine.columns:
-                hi_target_col = "HI_phys_v2"
-            elif hi_target_type == "damage" and "HI_damage" in df_engine.columns:
-                hi_target_col = "HI_damage"
-
-            if hi_target_col:
+        if use_hi_true_target and hi_target_col:
+            try:
                 # Extract HI target values at the same cycles as HI predictions
                 engine_hi_targets = df_engine.set_index("TimeInCycles")[hi_target_col]
                 hi_true_target_traj = engine_hi_targets.loc[cycles_hi].values
@@ -1210,9 +1252,13 @@ def build_trajectories(
 
                 # Ensure proper bounds
                 hi_true_target_traj = np.clip(hi_true_target_traj, 0.0, 1.0)
-                print(f"  Engine {unit_id}: Loaded {hi_target_col} target, range [{hi_true_target_traj.min():.3f}, {hi_true_target_traj.max():.3f}]")
-            else:
-                print(f"  Warning: HI target column not found for type '{hi_target_type}' in engine {unit_id}")
+                
+                # Log only for first few engines to avoid spam
+                if i < 3:
+                    print(f"  Engine {unit_id}: Loaded {hi_target_col} target, range [{hi_true_target_traj.min():.3f}, {hi_true_target_traj.max():.3f}]")
+            except (KeyError, IndexError) as e:
+                # Skip this engine's HI_true if data alignment fails
+                hi_true_target_traj = None
 
         # Optional: RUL-derived proxy HIs (for comparison)
         max_rul_for_hi = float(max_rul if max_rul is not None else 125.0)
