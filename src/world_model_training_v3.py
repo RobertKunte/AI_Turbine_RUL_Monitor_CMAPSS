@@ -434,6 +434,12 @@ def train_world_model_universal_v3(
     # Debug log: show decoder_type from config
     print(f"[config] decoder_type={decoder_type} (from world_model_config.decoder_type={getattr(world_model_config, 'decoder_type', 'NOT_SET')})")
     
+    # Get tf_cross decoder parameters
+    future_max_len = int(getattr(world_model_config, "future_max_len", 256))
+    cond_dim = int(getattr(world_model_config, "cond_dim", 0))
+    quantiles = getattr(world_model_config, "quantiles", [0.1, 0.5, 0.9])
+    dec_ff = int(getattr(world_model_config, "dec_ff", dim_feedforward))
+    
     model = WorldModelUniversalV3(
         input_size=len(feature_cols),
         d_model=d_model,
@@ -452,6 +458,10 @@ def train_world_model_universal_v3(
         use_hi_in_eol=world_model_config.use_hi_in_eol,
         use_hi_slope_in_eol=world_model_config.use_hi_slope_in_eol,
         decoder_type=decoder_type,
+        future_max_len=future_max_len,
+        cond_dim=cond_dim,
+        quantiles=quantiles,
+        dec_ff=dec_ff,
     ).to(device)
     
     num_params = sum(p.numel() for p in model.parameters())
@@ -463,10 +473,24 @@ def train_world_model_universal_v3(
         print(f"  Decoder: Transformer AR (self-attn, num_layers={decoder_num_layers}, horizon={horizon})")
     elif decoder_type == "tf_ar_xattn":
         print(f"  Decoder: Transformer AR (cross-attn, num_layers={decoder_num_layers}, horizon={horizon})")
-    print(f"  Heads: Trajectory, EOL, HI")
+    elif decoder_type == "tf_cross":
+        print(f"  Decoder: Transformer Cross-Attention (non-AR, num_layers={decoder_num_layers}, horizon={horizon})")
+        print(f"    Quantiles: {quantiles}, Future max len: {future_max_len}")
+    print(f"  Heads: Trajectory, EOL, HI" + (", Quantile RUL" if decoder_type == "tf_cross" else ""))
     
     # Hard-fail guard: verify decoder matches config
-    if decoder_type != "lstm":
+    if decoder_type == "tf_cross":
+        # Check that model actually has tf_cross decoder
+        if not hasattr(model, 'tf_cross_decoder') or model.tf_cross_decoder is None:
+            raise RuntimeError(
+                f"Decoder type mismatch: config specifies decoder_type='{decoder_type}' "
+                f"but model was not initialized with tf_cross decoder. "
+                f"Experiment: {experiment_name}, "
+                f"model.decoder_type={model.decoder_type}"
+            )
+        decoder_class_name = model.tf_cross_decoder.__class__.__name__
+        print(f"  [VERIFIED] Transformer cross-attention decoder instantiated: {decoder_class_name}")
+    elif decoder_type != "lstm":
         # Check that model actually has Transformer decoder
         if not hasattr(model, 'tf_decoder') or model.tf_decoder is None:
             raise RuntimeError(
@@ -613,6 +637,19 @@ def train_world_model_universal_v3(
         "val_shape_weighted": [],
         "val_eol_hi_loss": [],
         "val_eol_hi_weighted": [],
+        # Quantile metrics for tf_cross decoder
+        "train_pinball_loss": [],
+        "train_crossing_penalty": [],
+        "train_crossing_rate_last": [],
+        "train_crossing_rate_seq": [],
+        "train_coverage_10_90_last": [],
+        "train_coverage_10_90_seq": [],
+        "val_pinball_loss": [],
+        "val_crossing_penalty": [],
+        "val_crossing_rate_last": [],
+        "val_crossing_rate_seq": [],
+        "val_coverage_10_90_last": [],
+        "val_coverage_10_90_seq": [],
     }
     
     best_val_loss = float("inf")
@@ -739,6 +776,14 @@ def train_world_model_universal_v3(
         printed_epoch_stats = False
         running_grad_norm = 0.0
         n_grad_norm = 0
+        # Quantile metrics tracking
+        running_pinball_loss = 0.0
+        running_crossing_penalty = 0.0
+        running_crossing_rate_last = 0.0
+        running_crossing_rate_seq = 0.0
+        running_coverage_10_90_last = 0.0
+        running_coverage_10_90_seq = 0.0
+        n_quantile_batches = 0
         
         for batch_idx, batch in enumerate(train_loader):
             # Backward-compatible unpacking: (X,Y,cond) or (X,Y,cond,mask)
@@ -768,6 +813,112 @@ def train_world_model_universal_v3(
             traj_pred = outputs["traj"]  # (B, H, 1) - predicted HI trajectory
             eol_pred = outputs["eol"].squeeze(-1)  # (B,)   - predicted EOL RUL
             hi_pred = outputs["hi"].squeeze(-1)    # (B,)   - predicted HI at current step
+            
+            # ------------------------------------------------------------------
+            # Quantile loss for tf_cross decoder
+            # ------------------------------------------------------------------
+            loss_pinball = None
+            loss_cross = None
+            crossing_rate_last = None
+            crossing_rate_seq = None
+            coverage_10_90_last = None
+            coverage_10_90_seq = None
+            
+            if decoder_type == "tf_cross":
+                from src.losses.quantile_losses import (
+                    pinball_loss,
+                    quantile_crossing_penalty,
+                    quantile_crossing_rate,
+                    quantile_coverage,
+                )
+                
+                # Get quantile outputs
+                rul_q_seq = outputs.get("rul_q_seq")  # (B, T_future, 3)
+                rul_q_last = outputs.get("rul_q_last")  # (B, 3)
+                
+                if rul_q_seq is None or rul_q_last is None:
+                    raise ValueError("tf_cross decoder must return rul_q_seq and rul_q_last")
+                
+                # Get config parameters
+                b2_loss_mode = str(getattr(world_model_config, "b2_loss_mode", "last")).lower()
+                lambda_cross = float(getattr(world_model_config, "lambda_cross", 0.05))
+                quantiles_tensor = torch.tensor(
+                    getattr(world_model_config, "quantiles", [0.1, 0.5, 0.9]),
+                    device=X_batch.device,
+                    dtype=torch.float32,
+                )
+                
+                # Get right-censor/horizon mask
+                valid_mask_seq = mask_batch.squeeze(-1) if (use_horizon_mask and mask_batch is not None) else None
+                
+                if b2_loss_mode == "last":
+                    # B2.0: LAST-only loss
+                    y_true_last = target_traj_rul[:, -1, 0]  # (B,) - last timestep RUL
+                    y_pred_last = rul_q_last  # (B, 3)
+                    
+                    # Mask for last timestep (right-censor aware)
+                    mask_last = None
+                    if valid_mask_seq is not None:
+                        mask_last = valid_mask_seq[:, -1]  # (B,)
+                    
+                    # Compute losses
+                    loss_pinball = pinball_loss(
+                        y_true=y_true_last,
+                        y_pred=y_pred_last,
+                        quantiles=quantiles_tensor,
+                        mask=mask_last,
+                    )
+                    
+                    loss_cross = quantile_crossing_penalty(
+                        y_pred=y_pred_last,
+                        mask=mask_last,
+                        margin=0.0,
+                    )
+                    
+                    # Metrics
+                    with torch.no_grad():
+                        crossing_rate_last = quantile_crossing_rate(
+                            y_pred=y_pred_last,
+                            mask=mask_last,
+                        )
+                        coverage_10_90_last = quantile_coverage(
+                            y_true=y_true_last,
+                            y_pred=y_pred_last,
+                            mask=mask_last,
+                        )
+                
+                elif b2_loss_mode == "traj":
+                    # B2.1: Trajectory loss
+                    y_true_seq = target_traj_rul.squeeze(-1)  # (B, T_future)
+                    y_pred_seq = rul_q_seq  # (B, T_future, 3)
+                    
+                    # Compute losses with sequence mask
+                    loss_pinball = pinball_loss(
+                        y_true=y_true_seq,
+                        y_pred=y_pred_seq,
+                        quantiles=quantiles_tensor,
+                        mask=valid_mask_seq,
+                    )
+                    
+                    loss_cross = quantile_crossing_penalty(
+                        y_pred=y_pred_seq,
+                        mask=valid_mask_seq,
+                        margin=0.0,
+                    )
+                    
+                    # Metrics
+                    with torch.no_grad():
+                        crossing_rate_seq = quantile_crossing_rate(
+                            y_pred=y_pred_seq,
+                            mask=valid_mask_seq,
+                        )
+                        coverage_10_90_seq = quantile_coverage(
+                            y_true=y_true_seq,
+                            y_pred=y_pred_seq,
+                            mask=valid_mask_seq,
+                        )
+                else:
+                    raise ValueError(f"Unknown b2_loss_mode: {b2_loss_mode}. Must be 'last' or 'traj'")
 
             # ------------------------------------------------------------------
             # Targets
@@ -946,8 +1097,14 @@ def train_world_model_universal_v3(
             weighted_hi = world_model_config.hi_loss_weight * loss_hi_last
             weighted_shape = shape_loss
             weighted_eol_hi = eol_hi_loss
+            
+            # Quantile loss for tf_cross decoder
+            weighted_quantile = 0.0
+            if decoder_type == "tf_cross" and loss_pinball is not None:
+                lambda_cross = float(getattr(world_model_config, "lambda_cross", 0.05))
+                weighted_quantile = loss_pinball + lambda_cross * loss_cross
 
-            loss = weighted_traj + weighted_eol + weighted_hi + weighted_shape + weighted_eol_hi
+            loss = weighted_traj + weighted_eol + weighted_hi + weighted_shape + weighted_eol_hi + weighted_quantile
 
             # NaN/Inf guard
             if not torch.isfinite(loss):
@@ -985,10 +1142,46 @@ def train_world_model_universal_v3(
             
             running_train_loss += loss.item() * X_batch.size(0)
             n_train_samples += X_batch.size(0)
+            
+            # Accumulate quantile metrics
+            if decoder_type == "tf_cross" and loss_pinball is not None:
+                running_pinball_loss += loss_pinball.item() * X_batch.size(0)
+                running_crossing_penalty += loss_cross.item() * X_batch.size(0)
+                n_quantile_batches += X_batch.size(0)
+                if crossing_rate_last is not None:
+                    running_crossing_rate_last += crossing_rate_last * X_batch.size(0)
+                    running_coverage_10_90_last += coverage_10_90_last * X_batch.size(0)
+                if crossing_rate_seq is not None:
+                    running_crossing_rate_seq += crossing_rate_seq * X_batch.size(0)
+                    running_coverage_10_90_seq += coverage_10_90_seq * X_batch.size(0)
         
         epoch_train_loss = running_train_loss / n_train_samples
         epoch_grad_norm = (running_grad_norm / n_grad_norm) if n_grad_norm > 0 else float("nan")
         history["train_grad_norm"].append(epoch_grad_norm)
+        
+        # Quantile metrics (for tf_cross decoder)
+        if decoder_type == "tf_cross" and n_quantile_batches > 0:
+            history["train_pinball_loss"].append(running_pinball_loss / n_quantile_batches)
+            history["train_crossing_penalty"].append(running_crossing_penalty / n_quantile_batches)
+            if running_crossing_rate_last > 0:
+                history["train_crossing_rate_last"].append(running_crossing_rate_last / n_quantile_batches)
+                history["train_coverage_10_90_last"].append(running_coverage_10_90_last / n_quantile_batches)
+            else:
+                history["train_crossing_rate_last"].append(0.0)
+                history["train_coverage_10_90_last"].append(0.0)
+            if running_crossing_rate_seq > 0:
+                history["train_crossing_rate_seq"].append(running_crossing_rate_seq / n_quantile_batches)
+                history["train_coverage_10_90_seq"].append(running_coverage_10_90_seq / n_quantile_batches)
+            else:
+                history["train_crossing_rate_seq"].append(0.0)
+                history["train_coverage_10_90_seq"].append(0.0)
+        else:
+            history["train_pinball_loss"].append(0.0)
+            history["train_crossing_penalty"].append(0.0)
+            history["train_crossing_rate_last"].append(0.0)
+            history["train_crossing_rate_seq"].append(0.0)
+            history["train_coverage_10_90_last"].append(0.0)
+            history["train_coverage_10_90_seq"].append(0.0)
         
         # Validation
         model.eval()
@@ -1008,6 +1201,14 @@ def train_world_model_universal_v3(
         running_val_eol_hi_loss = 0.0
         running_val_eol_hi_weighted = 0.0
         n_val_samples = 0
+        # Quantile metrics tracking for validation
+        running_val_pinball_loss = 0.0
+        running_val_crossing_penalty = 0.0
+        running_val_crossing_rate_last = 0.0
+        running_val_crossing_rate_seq = 0.0
+        running_val_coverage_10_90_last = 0.0
+        running_val_coverage_10_90_seq = 0.0
+        n_val_quantile_batches = 0
         
         with torch.no_grad():
             for batch in val_loader:
@@ -1035,6 +1236,98 @@ def train_world_model_universal_v3(
                 traj_pred = outputs["traj"]  # (B, H, 1) - predicted HI trajectory
                 eol_pred = outputs["eol"].squeeze(-1)  # (B,)
                 hi_pred = outputs["hi"].squeeze(-1)    # (B,)
+                
+                # Quantile loss for tf_cross decoder (validation)
+                val_loss_pinball = None
+                val_loss_cross = None
+                val_crossing_rate_last = None
+                val_crossing_rate_seq = None
+                val_coverage_10_90_last = None
+                val_coverage_10_90_seq = None
+                
+                if decoder_type == "tf_cross":
+                    from src.losses.quantile_losses import (
+                        pinball_loss,
+                        quantile_crossing_penalty,
+                        quantile_crossing_rate,
+                        quantile_coverage,
+                    )
+                    
+                    # Get quantile outputs
+                    rul_q_seq = outputs.get("rul_q_seq")  # (B, T_future, 3)
+                    rul_q_last = outputs.get("rul_q_last")  # (B, 3)
+                    
+                    if rul_q_seq is not None and rul_q_last is not None:
+                        # Get config parameters
+                        b2_loss_mode = str(getattr(world_model_config, "b2_loss_mode", "last")).lower()
+                        quantiles_tensor = torch.tensor(
+                            getattr(world_model_config, "quantiles", [0.1, 0.5, 0.9]),
+                            device=X_batch.device,
+                            dtype=torch.float32,
+                        )
+                        
+                        # Get right-censor/horizon mask
+                        valid_mask_seq = mask_batch.squeeze(-1) if (use_horizon_mask and mask_batch is not None) else None
+                        
+                        if b2_loss_mode == "last":
+                            # B2.0: LAST-only loss
+                            y_true_last = target_traj_rul[:, -1, 0]  # (B,)
+                            y_pred_last = rul_q_last  # (B, 3)
+                            
+                            mask_last = None
+                            if valid_mask_seq is not None:
+                                mask_last = valid_mask_seq[:, -1]  # (B,)
+                            
+                            val_loss_pinball = pinball_loss(
+                                y_true=y_true_last,
+                                y_pred=y_pred_last,
+                                quantiles=quantiles_tensor,
+                                mask=mask_last,
+                            )
+                            
+                            val_loss_cross = quantile_crossing_penalty(
+                                y_pred=y_pred_last,
+                                mask=mask_last,
+                                margin=0.0,
+                            )
+                            
+                            val_crossing_rate_last = quantile_crossing_rate(
+                                y_pred=y_pred_last,
+                                mask=mask_last,
+                            )
+                            val_coverage_10_90_last = quantile_coverage(
+                                y_true=y_true_last,
+                                y_pred=y_pred_last,
+                                mask=mask_last,
+                            )
+                        
+                        elif b2_loss_mode == "traj":
+                            # B2.1: Trajectory loss
+                            y_true_seq = target_traj_rul.squeeze(-1)  # (B, T_future)
+                            y_pred_seq = rul_q_seq  # (B, T_future, 3)
+                            
+                            val_loss_pinball = pinball_loss(
+                                y_true=y_true_seq,
+                                y_pred=y_pred_seq,
+                                quantiles=quantiles_tensor,
+                                mask=valid_mask_seq,
+                            )
+                            
+                            val_loss_cross = quantile_crossing_penalty(
+                                y_pred=y_pred_seq,
+                                mask=valid_mask_seq,
+                                margin=0.0,
+                            )
+                            
+                            val_crossing_rate_seq = quantile_crossing_rate(
+                                y_pred=y_pred_seq,
+                                mask=valid_mask_seq,
+                            )
+                            val_coverage_10_90_seq = quantile_coverage(
+                                y_true=y_true_seq,
+                                y_pred=y_pred_seq,
+                                mask=valid_mask_seq,
+                            )
                 
                 # Targets
                 target_traj_rul = Y_batch              # (B, H, 1)
@@ -1144,7 +1437,13 @@ def train_world_model_universal_v3(
                 weighted_shape = shape_loss
                 weighted_eol_hi = eol_hi_loss
                 
-                loss = weighted_traj + weighted_eol + weighted_hi + weighted_shape + weighted_eol_hi
+                # Quantile loss for tf_cross decoder (validation)
+                weighted_quantile = 0.0
+                if decoder_type == "tf_cross" and val_loss_pinball is not None:
+                    lambda_cross = float(getattr(world_model_config, "lambda_cross", 0.05))
+                    weighted_quantile = val_loss_pinball + lambda_cross * val_loss_cross
+                
+                loss = weighted_traj + weighted_eol + weighted_hi + weighted_shape + weighted_eol_hi + weighted_quantile
                 
                 running_val_loss += loss.item() * X_batch.size(0)
                 running_val_traj_loss += base_hi_mse.item() * X_batch.size(0)
@@ -1162,6 +1461,18 @@ def train_world_model_universal_v3(
                 running_val_eol_hi_loss += eol_hi_raw.item() * X_batch.size(0)
                 running_val_eol_hi_weighted += weighted_eol_hi.item() * X_batch.size(0)
                 n_val_samples += X_batch.size(0)
+                
+                # Accumulate quantile metrics (validation)
+                if decoder_type == "tf_cross" and val_loss_pinball is not None:
+                    running_val_pinball_loss += val_loss_pinball.item() * X_batch.size(0)
+                    running_val_crossing_penalty += val_loss_cross.item() * X_batch.size(0)
+                    n_val_quantile_batches += X_batch.size(0)
+                    if val_crossing_rate_last is not None:
+                        running_val_crossing_rate_last += val_crossing_rate_last * X_batch.size(0)
+                        running_val_coverage_10_90_last += val_coverage_10_90_last * X_batch.size(0)
+                    if val_crossing_rate_seq is not None:
+                        running_val_crossing_rate_seq += val_crossing_rate_seq * X_batch.size(0)
+                        running_val_coverage_10_90_seq += val_coverage_10_90_seq * X_batch.size(0)
         
         epoch_val_loss = running_val_loss / n_val_samples
         epoch_val_traj_loss = running_val_traj_loss / n_val_samples
@@ -1195,6 +1506,30 @@ def train_world_model_universal_v3(
         history["val_shape_weighted"].append(epoch_val_shape_weighted)
         history["val_eol_hi_loss"].append(epoch_val_eol_hi_loss)
         history["val_eol_hi_weighted"].append(epoch_val_eol_hi_weighted)
+        
+        # Quantile metrics (validation)
+        if decoder_type == "tf_cross" and n_val_quantile_batches > 0:
+            history["val_pinball_loss"].append(running_val_pinball_loss / n_val_quantile_batches)
+            history["val_crossing_penalty"].append(running_val_crossing_penalty / n_val_quantile_batches)
+            if running_val_crossing_rate_last > 0:
+                history["val_crossing_rate_last"].append(running_val_crossing_rate_last / n_val_quantile_batches)
+                history["val_coverage_10_90_last"].append(running_val_coverage_10_90_last / n_val_quantile_batches)
+            else:
+                history["val_crossing_rate_last"].append(0.0)
+                history["val_coverage_10_90_last"].append(0.0)
+            if running_val_crossing_rate_seq > 0:
+                history["val_crossing_rate_seq"].append(running_val_crossing_rate_seq / n_val_quantile_batches)
+                history["val_coverage_10_90_seq"].append(running_val_coverage_10_90_seq / n_val_quantile_batches)
+            else:
+                history["val_crossing_rate_seq"].append(0.0)
+                history["val_coverage_10_90_seq"].append(0.0)
+        else:
+            history["val_pinball_loss"].append(0.0)
+            history["val_crossing_penalty"].append(0.0)
+            history["val_crossing_rate_last"].append(0.0)
+            history["val_crossing_rate_seq"].append(0.0)
+            history["val_coverage_10_90_last"].append(0.0)
+            history["val_coverage_10_90_seq"].append(0.0)
         
         print(
             f"Epoch {epoch+1}/{num_epochs} - "

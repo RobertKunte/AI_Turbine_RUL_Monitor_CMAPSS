@@ -1313,6 +1313,72 @@ def get_fd004_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_xattn_config() -> ExperimentC
     return cfg
 
 
+def get_wm_v3_fd004_b2_tf_cross_qr_b20_last_config() -> ExperimentConfig:
+    """
+    B2.0: Transformer Cross-Attention Decoder with Quantile RUL Head (LAST-only loss).
+    
+    Part of Track B2 (Architecture - Decoder Variants).
+    Implements non-autoregressive Transformer decoder with cross-attention + quantile regression.
+    
+    Based on fd004_wm_v1_p0_softcap_k3_hm_pad baseline with:
+    - decoder_type="tf_cross" (non-AR Transformer decoder with cross-attention)
+    - Quantile RUL head predicting q10, q50, q90
+    - b2_loss_mode="last" (loss only on last timestep)
+    - Pinball loss + quantile crossing penalty
+    
+    All other settings preserved for comparability:
+    - Same encoder (UniversalEncoderV2 + Transformer)
+    - Same seeds, splits, epochs, batch_size, max_rul=125, horizon=30
+    - Same masking, loss weights, freeze_encoder settings
+    - Same feature pipeline, evaluation protocol
+    """
+    cfg = copy.deepcopy(get_fd004_wm_v1_p0_softcap_k3_hm_pad_config())
+    cfg["experiment_name"] = "wm_v3_fd004_b2_tf_cross_qr_b20_last"
+    
+    wmp = cfg.setdefault("world_model_params", {})
+    
+    # Decoder configuration
+    wmp["decoder_type"] = "tf_cross"
+    wmp["decoder_num_layers"] = 2
+    wmp["d_model"] = 96
+    wmp["nhead"] = 4
+    wmp["dec_ff"] = 256
+    wmp["dropout"] = 0.1
+    
+    # Quantile configuration
+    wmp["quantiles"] = [0.1, 0.5, 0.9]
+    wmp["lambda_cross"] = 0.05
+    wmp["b2_loss_mode"] = "last"
+    wmp["T_future"] = 30
+    wmp["future_max_len"] = 256
+    wmp["cond_dim"] = 0  # No condition embedding for now
+    
+    # Ensure max_rul = 125 (cap 125)
+    wmp["max_rul"] = 125
+    
+    return cfg
+
+
+def get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_config() -> ExperimentConfig:
+    """
+    B2.1: Transformer Cross-Attention Decoder with Quantile RUL Head (Trajectory loss).
+    
+    Part of Track B2 (Architecture - Decoder Variants).
+    Identical to B2.0 except b2_loss_mode="traj" (loss across all future timesteps).
+    
+    Based on wm_v3_fd004_b2_tf_cross_qr_b20_last but with trajectory loss.
+    """
+    cfg = copy.deepcopy(get_wm_v3_fd004_b2_tf_cross_qr_b20_last_config())
+    cfg["experiment_name"] = "wm_v3_fd004_b2_tf_cross_qr_b21_traj"
+    
+    wmp = cfg.setdefault("world_model_params", {})
+    
+    # Change ONLY b2_loss_mode
+    wmp["b2_loss_mode"] = "traj"
+    
+    return cfg
+
+
 def get_fd004_wm_v1_p0_softcap_k3_hm_pad_e50_config() -> ExperimentConfig:
     """
     P0 cap-collapse fix (ADR-0010) + Stage-1 horizon padding + extended training:

@@ -527,16 +527,21 @@ class UniversalEncoderV2(nn.Module):
         self,
         x: torch.Tensor,
         cond_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_sequence: bool = False,
+    ):
         """
         Forward pass.
         
         Args:
             x: [B, T, F] - Input sequences
             cond_ids: [B] - Optional condition IDs (int64). Required if num_conditions > 1.
+            return_sequence: If True, return sequence (B, T, d_model) instead of embedding
         
         Returns:
-            seq_emb: [B, d_model] - Sequence embedding
+            If return_sequence=False:
+                seq_emb: [B, d_model] - Sequence embedding
+            If return_sequence=True:
+                memory: [B, T, d_model] - Encoder sequence output
         """
         B, T, F = x.shape
         
@@ -593,6 +598,10 @@ class UniversalEncoderV2(nn.Module):
         else:  # lstm
             h_out, (h_n, c_n) = self.seq_encoder(x_fused)  # h_out: [B, T, d_model]
             h = h_out
+        
+        # If return_sequence=True, return the sequence directly
+        if return_sequence:
+            return h  # [B, T, d_model]
         
         # ===================================================================
         # 4. Aggregation

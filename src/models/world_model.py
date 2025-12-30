@@ -729,7 +729,12 @@ class WorldModelUniversalV3(nn.Module):
         use_hi_in_eol: bool = False,
         use_hi_slope_in_eol: bool = False,
         # Decoder type selection
-        decoder_type: str = "lstm",  # "lstm" (default) or "tf_ar" or "tf_ar_xattn"
+        decoder_type: str = "lstm",  # "lstm" (default) or "tf_ar" or "tf_ar_xattn" or "tf_cross"
+        # tf_cross decoder parameters
+        future_max_len: int = 256,
+        cond_dim: int = 0,
+        quantiles: List[float] = None,
+        dec_ff: Optional[int] = None,
     ):
         super().__init__()
         
@@ -767,7 +772,7 @@ class WorldModelUniversalV3(nn.Module):
             max_seq_len=max_seq_len,
         )
         
-        # Decoder: LSTM (default) or Transformer AR
+        # Decoder: LSTM (default) or Transformer AR or Transformer Cross-Attention
         if decoder_type == "lstm":
             # LSTM decoder (default, unchanged)
             self.decoder = nn.LSTM(
@@ -782,6 +787,9 @@ class WorldModelUniversalV3(nn.Module):
             self.encoder_to_decoder_h = nn.Linear(d_model, decoder_hidden_size * decoder_num_layers)
             self.encoder_to_decoder_c = nn.Linear(d_model, decoder_hidden_size * decoder_num_layers)
             self.tf_decoder = None
+            self.tf_cross_decoder = None
+            self.future_query_builder = None
+            self.rul_quantile_head = None
         elif decoder_type in {"tf_ar", "tf_ar_xattn"}:
             # Transformer AR decoder
             from .decoders.transformer_ar_decoder import TransformerARDecoder
@@ -800,8 +808,51 @@ class WorldModelUniversalV3(nn.Module):
             self.decoder = None
             self.encoder_to_decoder_h = None
             self.encoder_to_decoder_c = None
+            self.tf_cross_decoder = None
+            self.future_query_builder = None
+            self.rul_quantile_head = None
+        elif decoder_type == "tf_cross":
+            # Transformer Cross-Attention Decoder (non-autoregressive)
+            from .decoders.tf_cross_decoder import CrossAttentionTFDecoder
+            from .decoders.future_query_builder import FutureQueryBuilder
+            from .heads.quantile_rul_head import QuantileRULHead
+            
+            # Default quantiles if not provided
+            if quantiles is None:
+                quantiles = [0.1, 0.5, 0.9]
+            
+            # Default dec_ff if not provided
+            if dec_ff is None:
+                dec_ff = dim_feedforward
+            
+            self.future_query_builder = FutureQueryBuilder(
+                d_model=d_model,
+                max_future=future_max_len,
+                cond_dim=cond_dim,
+                dropout=dropout,
+            )
+            
+            self.tf_cross_decoder = CrossAttentionTFDecoder(
+                d_model=d_model,
+                nhead=nhead,
+                num_layers=decoder_num_layers,
+                dim_feedforward=dec_ff,
+                dropout=dropout,
+            )
+            
+            self.rul_quantile_head = QuantileRULHead(
+                d_model=d_model,
+                quantiles=quantiles,
+                dropout=dropout,
+            )
+            
+            # LSTM decoder components not used
+            self.decoder = None
+            self.encoder_to_decoder_h = None
+            self.encoder_to_decoder_c = None
+            self.tf_decoder = None
         else:
-            raise ValueError(f"Unknown decoder_type: {decoder_type}. Must be 'lstm', 'tf_ar', or 'tf_ar_xattn'")
+            raise ValueError(f"Unknown decoder_type: {decoder_type}. Must be 'lstm', 'tf_ar', 'tf_ar_xattn', or 'tf_cross'")
         
         # Shared head (like RULHIUniversalModelV2) for HI and (base) EOL features
         self.shared_head = nn.Sequential(
@@ -862,6 +913,11 @@ class WorldModelUniversalV3(nn.Module):
                 "traj": (B, H, 1) - Predicted HI-proxy trajectory
                 "eol": (B, 1) - Predicted EOL RUL
                 "hi": (B, 1) - Predicted Health Index in [0, 1]
+                For tf_cross decoder:
+                "rul_q_seq": (B, T_future, 3) - Quantile predictions [q10, q50, q90] for sequence
+                "rul_q_last": (B, 3) - Quantile predictions [q10, q50, q90] for last timestep
+                "rul_pred_last": (B, 1) - Point prediction (q50) for last timestep (convenience)
+                "rul_pred_seq": (B, T_future) - Point predictions (q50) for sequence (convenience)
         """
         B = encoder_inputs.size(0)
         
@@ -882,7 +938,7 @@ class WorldModelUniversalV3(nn.Module):
         elif horizon is None:
             horizon = self.horizon
         
-        # Decoder forward: LSTM or Transformer AR
+        # Decoder forward: LSTM or Transformer AR or Transformer Cross-Attention
         if self.decoder_type == "lstm":
             # LSTM decoder path (original, unchanged)
             # Initialize decoder hidden state from encoder embedding
@@ -927,6 +983,53 @@ class WorldModelUniversalV3(nn.Module):
             
             traj_outputs = torch.cat(traj_outputs, dim=1)  # (B, H, 1)
             
+        elif self.decoder_type == "tf_cross":
+            # Transformer Cross-Attention Decoder (non-autoregressive)
+            # Get encoder sequence (memory) for cross-attention
+            memory = self.encoder(
+                encoder_inputs,
+                cond_ids=cond_ids,
+                return_sequence=True,
+            )  # (B, T_past, d_model)
+            
+            # Build memory_key_padding_mask (assume no padding for now)
+            # TODO: Get actual padding mask from data pipeline if available
+            T_past = memory.size(1)
+            memory_key_padding_mask = None  # (B, T_past) bool, True=PAD
+            
+            # Determine T_future
+            T_future = horizon
+            
+            # Build condition vector if needed
+            cond_vector = None
+            if self.future_query_builder.use_cond and cond_ids is not None:
+                # Use condition embedding from encoder if available
+                # For now, we'll pass None and let FutureQueryBuilder handle it
+                # TODO: Extract condition embedding from encoder if needed
+                pass
+            
+            # Build query tokens (future time embeddings)
+            query_tokens = self.future_query_builder(
+                T_future=T_future,
+                batch_size=B,
+                device=encoder_inputs.device,
+                cond=cond_vector,
+            )  # (B, T_future, d_model)
+            
+            # Decode with cross-attention
+            dec_out = self.tf_cross_decoder(
+                query_tokens=query_tokens,
+                memory=memory,
+                memory_key_padding_mask=memory_key_padding_mask,
+                tgt_key_padding_mask=None,  # No padding for future queries
+            )  # (B, T_future, d_model)
+            
+            # Predict quantiles
+            rul_q_seq = self.rul_quantile_head(dec_out)  # (B, T_future, 3)
+            
+            # For compatibility with existing code, create traj_outputs from q50
+            traj_outputs = rul_q_seq[:, :, 1:2]  # (B, T_future, 1) - use q50 (median)
+            
         else:
             # Transformer AR decoder path
             # Determine mode
@@ -967,8 +1070,18 @@ class WorldModelUniversalV3(nn.Module):
             # Base mode: EOL depends only on shared encoder features (backwards-compatible)
             eol_pred = self.fc_rul(h_shared)  # (B, 1)
         
-        return {
+        outputs = {
             "traj": traj_outputs,  # (B, H, 1)
             "eol": eol_pred,       # (B, 1)
             "hi": hi_pred,         # (B, 1)
         }
+        
+        # Add quantile outputs for tf_cross decoder
+        if self.decoder_type == "tf_cross":
+            outputs["rul_q_seq"] = rul_q_seq  # (B, T_future, 3)
+            outputs["rul_q_last"] = rul_q_seq[:, -1, :]  # (B, 3)
+            # Convenience: point predictions from q50
+            outputs["rul_pred_last"] = rul_q_seq[:, -1, 1:2]  # (B, 1)
+            outputs["rul_pred_seq"] = rul_q_seq[:, :, 1]  # (B, T_future)
+        
+        return outputs
