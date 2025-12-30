@@ -530,6 +530,18 @@ def train_world_model_universal_v3(
     # 6. Training loop
     # ===================================================================
     print("\n[6] Training model...")
+
+    # Initialize encoder freezing state
+    did_initial_unfreeze = False
+
+    # Stage A: Initial encoder freeze (if requested)
+    if freeze_encoder or freeze_encoder_epochs > 0:
+        print(f"[EncoderFreeze] Initial freeze enabled: freeze_encoder={freeze_encoder}, freeze_encoder_epochs={freeze_encoder_epochs}")
+        _freeze_encoder()
+    else:
+        print(f"[EncoderFreeze] No initial freeze: freeze_encoder={freeze_encoder}, freeze_encoder_epochs={freeze_encoder_epochs}")
+
+    print(f"[EncoderFreeze] Config: unfreeze_encoder_layers={unfreeze_encoder_layers}, encoder_lr_mult={encoder_lr_mult}")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     mse_loss = nn.MSELoss()
 
@@ -583,6 +595,12 @@ def train_world_model_universal_v3(
     if normalize_eol and clip_grad_norm_cfg is None:
         clip_grad_norm_cfg = 1.0
 
+    # Encoder freezing parameters
+    freeze_encoder = bool(getattr(world_model_config, "freeze_encoder", False))
+    freeze_encoder_epochs = int(getattr(world_model_config, "freeze_encoder_epochs", 0) or 0)
+    unfreeze_encoder_layers = int(getattr(world_model_config, "unfreeze_encoder_layers", 0) or 0)
+    encoder_lr_mult = float(getattr(world_model_config, "encoder_lr_mult", 0.1) or 0.1)
+
     freeze_encoder_n = int(getattr(world_model_config, "freeze_encoder_epochs_after_eol_on", 0) or 0)
     eol_on_epoch: Optional[int] = None
     eol_became_active_epoch: Optional[int] = None
@@ -590,6 +608,91 @@ def train_world_model_universal_v3(
     def _set_requires_grad(module: nn.Module, flag: bool) -> None:
         for p in module.parameters():
             p.requires_grad = flag
+
+    def _freeze_encoder() -> None:
+        """Freeze all encoder parameters."""
+        _set_requires_grad(model.encoder, False)
+        model.encoder.eval()
+
+    def _partial_unfreeze_encoder(*, unfreeze_last_k: int) -> list[str]:
+        """
+        Unfreeze encoder layers based on unfreeze_last_k:
+        - unfreeze_last_k > 0: unfreeze last K transformer layers
+        - unfreeze_last_k == -1: unfreeze all layers (full encoder)
+        Returns list of unfrozen module names for logging.
+        """
+        # First freeze everything
+        _set_requires_grad(model.encoder, False)
+
+        unfrozen_modules: list[str] = []
+
+        # Handle unfreeze all layers (-1)
+        if unfreeze_last_k == -1:
+            _set_requires_grad(model.encoder, True)
+            unfrozen_modules.append("encoder.* (all layers)")
+            model.encoder.train()
+            return unfrozen_modules
+
+        # Try to unfreeze last K transformer layers
+        if hasattr(model.encoder, "transformer") and hasattr(model.encoder.transformer, "layers"):
+            layers = model.encoder.transformer.layers
+            if layers is not None and unfreeze_last_k > 0:
+                k = min(int(unfreeze_last_k), len(layers))
+                # Unfreeze last k layers
+                for idx, layer in enumerate(list(layers)[-k:], start=len(layers) - k):
+                    _set_requires_grad(layer, True)
+                    unfrozen_modules.append(f"encoder.transformer.layers[{idx}]")
+
+        # Always unfreeze shared_head if present (part of encoder)
+        if hasattr(model.encoder, "shared_head") and model.encoder.shared_head is not None:
+            _set_requires_grad(model.encoder.shared_head, True)
+            unfrozen_modules.append("encoder.shared_head")
+
+        model.encoder.train()
+        return unfrozen_modules
+
+    def summarize_trainability(model: nn.Module) -> dict:
+        """Summarize parameter trainability statistics."""
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        # Encoder stats
+        encoder_params = sum(p.numel() for p in model.encoder.parameters())
+        encoder_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+
+        # Decoder/Heads stats (everything that's not encoder)
+        decoder_params = total_params - encoder_params
+        decoder_trainable = trainable_params - encoder_trainable
+
+        # Per-encoder-block stats if available
+        encoder_blocks = {}
+        if hasattr(model.encoder, "transformer") and hasattr(model.encoder.transformer, "layers"):
+            layers = model.encoder.transformer.layers
+            if layers is not None:
+                for i, layer in enumerate(layers):
+                    block_params = sum(p.numel() for p in layer.parameters())
+                    block_trainable = sum(p.numel() for p in layer.parameters() if p.requires_grad)
+                    encoder_blocks[f"layer_{i}"] = {
+                        "total": block_params,
+                        "trainable": block_trainable,
+                        "frozen": block_trainable == 0
+                    }
+
+        return {
+            "total_params": total_params,
+            "trainable_params": trainable_params,
+            "encoder": {
+                "total": encoder_params,
+                "trainable": encoder_trainable,
+                "frozen": encoder_trainable == 0
+            },
+            "decoder_heads": {
+                "total": decoder_params,
+                "trainable": decoder_trainable,
+                "frozen": decoder_trainable == 0
+            },
+            "encoder_blocks": encoder_blocks
+        }
 
     def _eol_loss_per_sample(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -756,13 +859,34 @@ def train_world_model_universal_v3(
         if eol_active and eol_became_active_epoch is None:
             eol_became_active_epoch = int(epoch)
 
+        # Stage B: Partial unfreeze after initial freeze period
+        if (not did_initial_unfreeze) and freeze_encoder_epochs > 0 and epoch == freeze_encoder_epochs:
+            unfrozen = _partial_unfreeze_encoder(unfreeze_last_k=unfreeze_encoder_layers)
+            did_initial_unfreeze = True
+            print(f"[EncoderFreeze] Epoch {epoch}: Partial unfreeze - unfrozen modules: {unfrozen}")
+
         # Optional: freeze encoder briefly when EOL starts to protect representation
         if freeze_encoder_n > 0 and eol_on_epoch is not None and (epoch - eol_on_epoch) < freeze_encoder_n:
             _set_requires_grad(model.encoder, False)
             encoder_frozen = True
         else:
-            _set_requires_grad(model.encoder, True)
             encoder_frozen = False
+
+        # Get trainability summary for logging
+        trainability = summarize_trainability(model)
+        encoder_should_be_frozen = (freeze_encoder or (freeze_encoder_epochs > 0 and epoch < freeze_encoder_epochs))
+        encoder_trainable_params = trainability["encoder"]["trainable"]
+        encoder_frozen_flag = trainability["encoder"]["frozen"]
+
+        # Log freeze state
+        print(f"[EncoderFreeze] epoch={epoch} should_be_frozen={encoder_should_be_frozen} "
+              f"trainable_params={encoder_trainable_params:,} frozen_flag={encoder_frozen_flag}")
+
+        # Take parameter snapshots for update norm calculation
+        param_snapshots = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param_snapshots[name] = param.data.clone()
 
         # Training
         model.train()
@@ -788,6 +912,19 @@ def train_world_model_universal_v3(
         running_coverage_10_90_last = 0.0
         running_coverage_10_90_seq = 0.0
         n_quantile_batches = 0
+
+        # Gradient/Update norm tracking (sample first K batches)
+        grad_norm_sample_batches = min(2, len(train_loader))  # Sample first 2 batches or all if fewer
+        running_grad_norm_encoder = 0.0
+        running_grad_norm_decoder = 0.0
+        running_grad_norm_heads = 0.0
+        running_update_norm_encoder = 0.0
+        running_update_norm_decoder = 0.0
+        running_update_norm_heads = 0.0
+        n_norm_batches = 0
+
+        # Store parameter snapshots for update norm calculation
+        param_snapshots = None
         
         for batch_idx, batch in enumerate(train_loader):
             # Backward-compatible unpacking: (X,Y,cond) or (X,Y,cond,mask)
@@ -1152,7 +1289,47 @@ def train_world_model_universal_v3(
                     print(f"  ⚠️  Warning: clip_grad_norm failed: {e}")
 
             optimizer.step()
-            
+
+            # Calculate gradient and update norms for sampled batches
+            if batch_idx < grad_norm_sample_batches and param_snapshots is not None:
+                # Calculate gradient norms
+                grad_norm_enc = 0.0
+                grad_norm_dec = 0.0
+                grad_norm_heads = 0.0
+
+                for name, param in model.named_parameters():
+                    if param.grad is not None and param.requires_grad:
+                        grad_norm_sq = torch.sum(param.grad ** 2).item()
+                        if name.startswith("encoder."):
+                            grad_norm_enc += grad_norm_sq
+                        elif name.startswith(("decoder.", "tf_cross_decoder.", "future_query_builder.", "rul_quantile_head.", "fc_rul", "fc_health", "shared_head", "traj_head")):
+                            grad_norm_dec += grad_norm_sq
+                        else:
+                            grad_norm_heads += grad_norm_sq
+
+                # Calculate update norms (difference from snapshot)
+                update_norm_enc = 0.0
+                update_norm_dec = 0.0
+                update_norm_heads = 0.0
+
+                for name, param in model.named_parameters():
+                    if param.requires_grad and name in param_snapshots:
+                        update_sq = torch.sum((param.data - param_snapshots[name]) ** 2).item()
+                        if name.startswith("encoder."):
+                            update_norm_enc += update_sq
+                        elif name.startswith(("decoder.", "tf_cross_decoder.", "future_query_builder.", "rul_quantile_head.", "fc_rul", "fc_health", "shared_head", "traj_head")):
+                            update_norm_dec += update_sq
+                        else:
+                            update_norm_heads += update_sq
+
+                running_grad_norm_encoder += grad_norm_enc ** 0.5
+                running_grad_norm_decoder += grad_norm_dec ** 0.5
+                running_grad_norm_heads += grad_norm_heads ** 0.5
+                running_update_norm_encoder += update_norm_enc ** 0.5
+                running_update_norm_decoder += update_norm_dec ** 0.5
+                running_update_norm_heads += update_norm_heads ** 0.5
+                n_norm_batches += 1
+
             running_train_loss += loss.item() * X_batch.size(0)
             n_train_samples += X_batch.size(0)
             
@@ -1195,7 +1372,39 @@ def train_world_model_universal_v3(
             history["train_crossing_rate_seq"].append(0.0)
             history["train_coverage_10_90_last"].append(0.0)
             history["train_coverage_10_90_seq"].append(0.0)
-        
+
+        # Freeze audit: log gradient/update norms
+        if n_norm_batches > 0:
+            avg_grad_norm_enc = running_grad_norm_encoder / n_norm_batches
+            avg_grad_norm_dec = running_grad_norm_decoder / n_norm_batches
+            avg_grad_norm_heads = running_grad_norm_heads / n_norm_batches
+            avg_update_norm_enc = running_update_norm_encoder / n_norm_batches
+            avg_update_norm_dec = running_update_norm_decoder / n_norm_batches
+            avg_update_norm_heads = running_update_norm_heads / n_norm_batches
+
+            print(f"[EncoderFreeze] epoch={epoch} grad_norm_enc={avg_grad_norm_enc:.4f} "
+                  f"grad_norm_dec={avg_grad_norm_dec:.4f} grad_norm_heads={avg_grad_norm_heads:.4f} "
+                  f"upd_norm_enc={avg_update_norm_enc:.6f} upd_norm_dec={avg_update_norm_dec:.6f} upd_norm_heads={avg_update_norm_heads:.6f}")
+
+            # Add to history for JSON export
+            if "freeze_audit" not in history:
+                history["freeze_audit"] = []
+            history["freeze_audit"].append({
+                "epoch": epoch,
+                "encoder_should_be_frozen": encoder_should_be_frozen,
+                "encoder_trainable_params": encoder_trainable_params,
+                "encoder_frozen_flag": encoder_frozen_flag,
+                "grad_norm_encoder": avg_grad_norm_enc,
+                "grad_norm_decoder": avg_grad_norm_dec,
+                "grad_norm_heads": avg_grad_norm_heads,
+                "update_norm_encoder": avg_update_norm_enc,
+                "update_norm_decoder": avg_update_norm_dec,
+                "update_norm_heads": avg_update_norm_heads,
+                "trainability": trainability
+            })
+        else:
+            print(f"[EncoderFreeze] epoch={epoch} no_norm_data")
+
         # Validation
         model.eval()
         running_val_loss = 0.0
@@ -1813,6 +2022,12 @@ def train_world_model_universal_v3(
         with open(results_dir / "metrics_val.json", "w") as f:
             json.dump(metrics_val, f, indent=2)
         print(f"  Saved metrics_train.json and metrics_val.json to {results_dir}")
+
+        # Save freeze audit data
+        if "freeze_audit" in history and history["freeze_audit"]:
+            with open(results_dir / "freeze_audit.json", "w") as f:
+                json.dump(history["freeze_audit"], f, indent=2)
+            print(f"  Saved freeze_audit.json to {results_dir}")
         
         # Stage -1: FD004 checkpoint re-selection based on val_rmse_last
         if dataset_name.upper() == "FD004" and "rmse_last" in metrics_val:

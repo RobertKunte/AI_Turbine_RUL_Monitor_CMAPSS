@@ -71,6 +71,7 @@ class EngineTrajectory:
     rul_sigma: Optional[np.ndarray] = None  # shape (T,) - optional RUL sigma trajectory (usually constant for encoder EOL)
     hi_damage: Optional[np.ndarray] = None  # shape (T,) - optional damage-based HI trajectory
     hi_cal: Optional[np.ndarray] = None     # shape (T,) - optional calibrated HI (v4) trajectory
+    hi_true: Optional[np.ndarray] = None    # shape (T,) - optional true/target HI trajectory (what model was trained on)
 
 
 def load_model_from_experiment(

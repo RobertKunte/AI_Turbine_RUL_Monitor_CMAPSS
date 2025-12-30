@@ -1382,6 +1382,61 @@ def get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_config() -> ExperimentConfig:
     return cfg
 
 
+def get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_hiheavy_config() -> ExperimentConfig:
+    """
+    Ablation A: HI-heavy loss for wm_v3_fd004_b2_tf_cross_qr_b21_traj
+
+    Based on wm_v3_fd004_b2_tf_cross_qr_b21_traj but with:
+    - Higher HI loss weight (hi_loss_weight=5.0 instead of 2.0)
+    - Lower EOL loss weight (eol_loss_weight=0.1 instead of 5.0)
+    - Shorter training (num_epochs=10) for quick signal
+
+    Goal: Test if HI dynamics improve with stronger HI supervision.
+    """
+    cfg = copy.deepcopy(get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_config())
+    cfg["experiment_name"] = "wm_v3_fd004_b2_tf_cross_qr_b21_traj_hiheavy"
+
+    wmp = cfg.setdefault("world_model_params", {})
+    training = cfg.setdefault("training_params", {})
+
+    # HI-heavy loss configuration
+    wmp["hi_loss_weight"] = 5.0  # Increased from 2.0
+    wmp["eol_loss_weight"] = 0.1  # Decreased from 5.0
+
+    # Shorter training for ablation
+    training["num_epochs"] = 10
+
+    return cfg
+
+
+def get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_unfreeze_all_config() -> ExperimentConfig:
+    """
+    Ablation B: Unfreeze all encoder layers for wm_v3_fd004_b2_tf_cross_qr_b21_traj
+
+    Based on wm_v3_fd004_b2_tf_cross_qr_b21_traj but with:
+    - freeze_encoder_epochs=0 (no initial freezing)
+    - unfreeze_encoder_layers=-1 (unfreeze all layers, or implement "all" support)
+    - Shorter training (num_epochs=10) for quick signal
+
+    Goal: Test if full encoder adaptation improves dynamics KPIs.
+    """
+    cfg = copy.deepcopy(get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_config())
+    cfg["experiment_name"] = "wm_v3_fd004_b2_tf_cross_qr_b21_traj_unfreeze_all"
+
+    wmp = cfg.setdefault("world_model_params", {})
+    training = cfg.setdefault("training_params", {})
+
+    # Unfreeze all encoder layers
+    wmp["freeze_encoder"] = False
+    wmp["freeze_encoder_epochs"] = 0
+    wmp["unfreeze_encoder_layers"] = -1  # -1 means unfreeze all layers
+
+    # Shorter training for ablation
+    training["num_epochs"] = 10
+
+    return cfg
+
+
 def get_fd004_wm_v1_p0_softcap_k3_hm_pad_e50_config() -> ExperimentConfig:
     """
     P0 cap-collapse fix (ADR-0010) + Stage-1 horizon padding + extended training:
@@ -4810,6 +4865,11 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_wm_v3_fd004_b2_tf_cross_qr_b20_last_config()
     if experiment_name == "wm_v3_fd004_b2_tf_cross_qr_b21_traj":
         return get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_config()
+    # B2 Ablations
+    if experiment_name == "wm_v3_fd004_b2_tf_cross_qr_b21_traj_hiheavy":
+        return get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_hiheavy_config()
+    if experiment_name == "wm_v3_fd004_b2_tf_cross_qr_b21_traj_unfreeze_all":
+        return get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_unfreeze_all_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":

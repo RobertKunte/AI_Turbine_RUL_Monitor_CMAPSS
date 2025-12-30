@@ -1089,6 +1089,9 @@ def build_trajectories(
     max_rul: int,
     is_world_model: bool = False,
     is_world_model_v3: bool = False,
+    experiment_dir: Optional[Path] = None,
+    use_hi_true_target: bool = True,
+    plot_rul_proxy_hi: bool = False,
 ) -> Tuple[List[EngineTrajectory], Dict[int, Dict[str, np.ndarray]]]:
     """
     Baut pro Engine Trajektorien für HI + RUL.
@@ -1112,7 +1115,35 @@ def build_trajectories(
     """
     trajectories: List[EngineTrajectory] = []
     raw_by_unit: Dict[int, Dict[str, np.ndarray]] = {}
-    
+
+    # Determine HI target type and calibration
+    hi_target_type = "phys_v3"  # Default
+    hi_calibrator_path = None
+    calibrator = None
+
+    if experiment_dir is not None:
+        summary_path = experiment_dir / "summary.json"
+        if summary_path.exists():
+            try:
+                with open(summary_path, 'r') as f:
+                    summary = json.load(f)
+                hi_target_type = summary.get("hi_target_type", "phys_v3")
+                hi_calibrator_path = summary.get("hi_calibrator_path")
+            except Exception as e:
+                print(f"Warning: Could not load HI target info from summary.json: {e}")
+
+    # Load calibrator if specified
+    if hi_calibrator_path and experiment_dir:
+        try:
+            from src.analysis.hi_calibration import load_hi_calibrator
+            calibrator = load_hi_calibrator(experiment_dir / hi_calibrator_path)
+            print(f"Loaded HI calibrator: {hi_calibrator_path}")
+        except Exception as e:
+            print(f"Warning: Could not load HI calibrator {hi_calibrator_path}: {e}")
+            calibrator = None
+
+    print(f"HI target type: {hi_target_type}, Calibrator: {'Yes' if calibrator else 'No'}")
+
     for i, unit_id in enumerate(unit_ids_test):
         unit_id = int(unit_id)
         
@@ -1155,6 +1186,39 @@ def build_trajectories(
             cap=float(max_rul),
         )
         
+        # Extract actual HI target used in training
+        hi_true_target_traj = None
+        if use_hi_true_target:
+            # Try to get HI target from dataframe columns
+            hi_target_col = None
+            if hi_target_type == "phys_v3" and "HI_phys_v3" in df_engine.columns:
+                hi_target_col = "HI_phys_v3"
+            elif hi_target_type == "phys_v2" and "HI_phys_v2" in df_engine.columns:
+                hi_target_col = "HI_phys_v2"
+            elif hi_target_type == "damage" and "HI_damage" in df_engine.columns:
+                hi_target_col = "HI_damage"
+
+            if hi_target_col:
+                # Extract HI target values at the same cycles as HI predictions
+                engine_hi_targets = df_engine.set_index("TimeInCycles")[hi_target_col]
+                hi_true_target_traj = engine_hi_targets.loc[cycles_hi].values
+
+                # Apply calibration if available
+                if calibrator is not None:
+                    from src.analysis.hi_calibration import calibrate_hi_array
+                    hi_true_target_traj = calibrate_hi_array(hi_true_target_traj, calibrator)
+
+                # Ensure proper bounds
+                hi_true_target_traj = np.clip(hi_true_target_traj, 0.0, 1.0)
+                print(f"  Engine {unit_id}: Loaded {hi_target_col} target, range [{hi_true_target_traj.min():.3f}, {hi_true_target_traj.max():.3f}]")
+            else:
+                print(f"  Warning: HI target column not found for type '{hi_target_type}' in engine {unit_id}")
+
+        # Optional: RUL-derived proxy HIs (for comparison)
+        max_rul_for_hi = float(max_rul if max_rul is not None else 125.0)
+        hi_rulproxy_health = true_rul_traj / max_rul_for_hi  # Health proxy: higher RUL = healthier
+        hi_rulproxy_damage = 1.0 - (true_rul_traj / max_rul_for_hi)  # Damage proxy: lower RUL = more damage
+
         trajectories.append(EngineTrajectory(
             unit_id=unit_id,
             cycles=cycles_hi,  # Only cycles where HI is defined
@@ -1162,6 +1226,8 @@ def build_trajectories(
             true_rul=true_rul_traj,
             pred_rul=pred_rul_traj,
             hi_damage=hi_damage_vals,  # Optional damage-based HI trajectory
+            hi_true=hi_true_target_traj,  # Actual HI target used in training
+            hi_cal=None,  # Could add calibrated HI if needed
         ))
 
         raw_by_unit[unit_id] = {
@@ -1170,9 +1236,170 @@ def build_trajectories(
             "pred_rul_clipped": pred_rul_traj.astype(float),
             "true_rul_uncapped": true_rul_uncapped.astype(float),
             "true_rul_clipped": true_rul_traj.astype(float),
+            "hi_true_target": hi_true_target_traj,
+            "hi_rulproxy_health": hi_rulproxy_health,
+            "hi_rulproxy_damage": hi_rulproxy_damage,
         }
     
     return trajectories, raw_by_unit
+
+
+def compute_hi_comparison_stats(
+    trajectories: List[EngineTrajectory],
+    hi_target_type: str,
+    calibrator_used: bool,
+) -> dict:
+    """Compute HI comparison statistics for diagnostics."""
+    stats = {
+        "hi_target_type": hi_target_type,
+        "calibrator_used": calibrator_used,
+        "engines": {}
+    }
+
+    for traj in trajectories:
+        if traj.hi_true is None or len(traj.hi_true) == 0:
+            continue
+
+        engine_stats = {
+            "unit_id": traj.unit_id,
+            "n_points": len(traj.hi_true),
+            "hi_true_range": [float(traj.hi_true.min()), float(traj.hi_true.max())],
+            "hi_pred_range": [float(traj.hi.min()), float(traj.hi.max())],
+        }
+
+        # Compute correlation and error metrics
+        try:
+            corr = np.corrcoef(traj.hi_true, traj.hi)[0, 1]
+            mae = np.mean(np.abs(traj.hi_true - traj.hi))
+            mse = np.mean((traj.hi_true - traj.hi) ** 2)
+            rmse = np.sqrt(mse)
+
+            engine_stats.update({
+                "correlation": float(corr) if not np.isnan(corr) else None,
+                "mae": float(mae),
+                "rmse": float(rmse),
+            })
+        except Exception as e:
+            engine_stats["error"] = str(e)
+
+        stats["engines"][str(traj.unit_id)] = engine_stats
+
+    # Compute aggregate stats
+    if stats["engines"]:
+        correlations = [e["correlation"] for e in stats["engines"].values() if e.get("correlation") is not None]
+        maes = [e["mae"] for e in stats["engines"].values() if "mae" in e]
+        rmses = [e["rmse"] for e in stats["engines"].values() if "rmse" in e]
+
+        stats["aggregate"] = {
+            "n_engines": len(stats["engines"]),
+            "correlation_mean": float(np.mean(correlations)) if correlations else None,
+            "correlation_std": float(np.std(correlations)) if correlations else None,
+            "mae_mean": float(np.mean(maes)) if maes else None,
+            "mae_std": float(np.std(maes)) if maes else None,
+            "rmse_mean": float(np.mean(rmses)) if rmses else None,
+            "rmse_std": float(np.std(rmses)) if rmses else None,
+        }
+
+    return stats
+
+
+def plot_hi_true_pred_trajectories(
+    trajectories: List[EngineTrajectory],
+    out_path: Path,
+    title: str = "HI True vs Pred Trajectories",
+    max_engines: int = 10,
+    hi_target_type: str = "phys_v3",
+    calibrator_used: bool = False,
+    plot_rul_proxy_hi: bool = False,
+) -> None:
+    """
+    Plot HI_true vs HI_pred overlay for diagnostics (dual axis with RUL).
+
+    This is similar to plot_hi_rul_trajectories but emphasizes HI_true vs HI_pred comparison
+    for understanding whether dynamics issues are in the targets or the model.
+    """
+    num_engines = min(len(trajectories), max_engines)
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+    axes = axes.flatten()
+
+    # Collect global statistics for title
+    all_plateaus = []
+    all_onset_fracs = []
+
+    for idx, traj in enumerate(trajectories[:max_engines]):
+        ax1 = axes[idx]
+
+        # Primary axis: HI (with dynamic scaling)
+        hi_values = []
+        if traj.hi_true is not None:
+            hi_values.extend(traj.hi_true)
+        hi_values.extend(traj.hi)
+        if hi_values:
+            hi_min, hi_max = min(hi_values), max(hi_values)
+            hi_range = hi_max - hi_min
+            hi_padding = max(0.05, hi_range * 0.1) if hi_range > 0 else 0.1
+            ax1.set_ylim([max(0, hi_min - hi_padding), min(1.1, hi_max + hi_padding)])
+
+        # Plot HI trajectories
+        ax1.plot(traj.cycles, traj.hi, 'g-', linewidth=2, label='HI Pred', alpha=0.7)
+        if traj.hi_true is not None:
+            ax1.plot(traj.cycles, traj.hi_true, 'k--', linewidth=2, label='HI True Target', alpha=0.8)
+
+        # Optional: Plot RUL-derived proxy HIs
+        if plot_rul_proxy_hi:
+            # These would need to be computed and stored in EngineTrajectory
+            # For now, we'll skip this as the raw_by_unit has them
+            pass
+
+        ax1.set_xlabel('Time in Cycles')
+        ax1.set_ylabel('Health Index', color='g')
+        ax1.tick_params(axis='y', labelcolor='g')
+        ax1.grid(True, alpha=0.3)
+
+        # Secondary axis: RUL
+        ax2 = ax1.twinx()
+        ax2.plot(traj.cycles, traj.true_rul, 'b-', linewidth=2, label='True RUL', alpha=0.7)
+        ax2.plot(traj.cycles, traj.pred_rul, 'r--', linewidth=2, label='Pred RUL', alpha=0.7)
+        ax2.set_ylabel('RUL [cycles]', color='b')
+        ax2.tick_params(axis='y', labelcolor='b')
+
+        # Combine legends
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
+
+        # Calculate per-engine statistics
+        if traj.hi_true is not None and len(traj.hi_true) > 10:
+            # Simple plateau detection: find where HI_true stays above 0.9 for extended period
+            hi_above_09 = traj.hi_true > 0.9
+            if hi_above_09.sum() > 10:  # At least 10 cycles above 0.9
+                plateau_end = np.where(hi_above_09)[0][-1]
+                plateau_ratio = plateau_end / len(traj.hi_true)
+                all_plateaus.append(plateau_ratio)
+
+                # Onset fraction: where HI_true drops below 0.8
+                hi_below_08 = traj.hi_true < 0.8
+                if hi_below_08.any():
+                    onset_cycle = np.where(hi_below_08)[0][0]
+                    onset_frac = onset_cycle / len(traj.hi_true)
+                    all_onset_fracs.append(onset_frac)
+
+    # Add HI target info to title
+    title += f" (Target: {hi_target_type}"
+    if calibrator_used:
+        title += " + Calibrated"
+    title += ")"
+
+    # Add global statistics to title if available
+    if all_plateaus and all_onset_fracs:
+        avg_plateau = np.mean(all_plateaus)
+        avg_onset = np.mean(all_onset_fracs)
+        title += ".3f"
+
+    plt.suptitle(title, fontsize=12, y=0.98)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
 
 
 def select_degraded_engines(
@@ -1316,8 +1543,10 @@ def plot_hi_rul_trajectories(
         else:
             ax1.set_ylim([0, 1.1])
         
-        ax1.plot(traj.cycles, traj.hi, 'g-', linewidth=2, label='Health Index', alpha=0.7)
-        
+        ax1.plot(traj.cycles, traj.hi, 'g-', linewidth=2, label='HI Pred', alpha=0.7)
+        if traj.hi_true is not None:
+            ax1.plot(traj.cycles, traj.hi_true, 'k--', linewidth=2, label='HI True', alpha=0.8)
+
         ax1.set_xlabel('Time in Cycles')
         ax1.set_ylabel('Health Index', color='g')
         ax1.tick_params(axis='y', labelcolor='g')
@@ -2354,6 +2583,9 @@ def run_diagnostics_for_run(
         max_rul=max_rul,
         is_world_model=is_world_model,
         is_world_model_v3=is_world_model_v3,
+        experiment_dir=experiment_dir,
+        use_hi_true_target=True,
+        plot_rul_proxy_hi=False,
     )
     
     print(f"  Built trajectories for {len(trajectories)} engines")
@@ -2697,6 +2929,33 @@ def run_diagnostics_for_run(
             max_engines=10,
         )
         print(f"  Saved HI+RUL trajectory plots for {len(selected_trajectories)} engines")
+
+        # Enhanced plot: HI_true vs HI_pred overlay for dynamics analysis
+        # Extract HI target info for plotting
+        hi_target_type = summary.get("hi_target_type", "phys_v3") if 'summary' in locals() else "phys_v3"
+        hi_calibrator_path = summary.get("hi_calibrator_path") if 'summary' in locals() else None
+        calibrator_used = hi_calibrator_path is not None
+
+        plot_hi_true_pred_trajectories(
+            trajectories=selected_trajectories,
+            out_path=experiment_dir / "hi_rul_truepred_10_degraded.png",
+            title=f"{dataset_name} HI True vs Pred Analysis – 10 degraded engines",
+            max_engines=10,
+            hi_target_type=hi_target_type,
+            calibrator_used=calibrator_used,
+            plot_rul_proxy_hi=False,
+        )
+        print(f"  Saved HI_true vs HI_pred overlay plots for {len(selected_trajectories)} engines")
+
+        # Save HI comparison stats to JSON
+        hi_stats = compute_hi_comparison_stats(
+            trajectories=selected_trajectories,
+            hi_target_type=hi_target_type,
+            calibrator_used=calibrator_used,
+        )
+        with open(experiment_dir / "hi_truepred_stats_10_degraded.json", "w") as f:
+            json.dump(hi_stats, f, indent=2)
+        print(f"  Saved HI comparison stats for {len(selected_trajectories)} engines")
         
         # 4. Separate HI Damage trajectory plot (if damage HI is available)
         # Check again on selected trajectories to ensure we have damage HI in the selected set
