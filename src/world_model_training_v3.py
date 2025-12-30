@@ -537,6 +537,52 @@ def train_world_model_universal_v3(
     unfreeze_encoder_layers = int(getattr(world_model_config, "unfreeze_encoder_layers", 0) or 0)
     encoder_lr_mult = float(getattr(world_model_config, "encoder_lr_mult", 0.1) or 0.1)
 
+    def _set_requires_grad(module: nn.Module, flag: bool) -> None:
+        for p in module.parameters():
+            p.requires_grad = flag
+
+    def _freeze_encoder() -> None:
+        """Freeze all encoder parameters."""
+        _set_requires_grad(model.encoder, False)
+        model.encoder.eval()
+
+    def _partial_unfreeze_encoder(*, unfreeze_last_k: int) -> list[str]:
+        """
+        Unfreeze encoder layers based on unfreeze_last_k:
+        - unfreeze_last_k > 0: unfreeze last K transformer layers
+        - unfreeze_last_k == -1: unfreeze all layers (full encoder)
+        Returns list of unfrozen module names for logging.
+        """
+        # First freeze everything
+        _set_requires_grad(model.encoder, False)
+
+        unfrozen_modules: list[str] = []
+
+        # Handle unfreeze all layers (-1)
+        if unfreeze_last_k == -1:
+            _set_requires_grad(model.encoder, True)
+            unfrozen_modules.append("encoder.* (all layers)")
+            model.encoder.train()
+            return unfrozen_modules
+
+        # Try to unfreeze last K transformer layers
+        if hasattr(model.encoder, "transformer") and hasattr(model.encoder.transformer, "layers"):
+            layers = model.encoder.transformer.layers
+            if layers is not None and unfreeze_last_k > 0:
+                k = min(int(unfreeze_last_k), len(layers))
+                # Unfreeze last k layers
+                for idx, layer in enumerate(list(layers)[-k:], start=len(layers) - k):
+                    _set_requires_grad(layer, True)
+                    unfrozen_modules.append(f"encoder.transformer.layers[{idx}]")
+
+        # Always unfreeze shared_head if present (part of encoder)
+        if hasattr(model.encoder, "shared_head") and model.encoder.shared_head is not None:
+            _set_requires_grad(model.encoder.shared_head, True)
+            unfrozen_modules.append("encoder.shared_head")
+
+        model.encoder.train()
+        return unfrozen_modules
+
     # Initialize encoder freezing state
     did_initial_unfreeze = False
 
@@ -604,52 +650,6 @@ def train_world_model_universal_v3(
     freeze_encoder_n = int(getattr(world_model_config, "freeze_encoder_epochs_after_eol_on", 0) or 0)
     eol_on_epoch: Optional[int] = None
     eol_became_active_epoch: Optional[int] = None
-
-    def _set_requires_grad(module: nn.Module, flag: bool) -> None:
-        for p in module.parameters():
-            p.requires_grad = flag
-
-    def _freeze_encoder() -> None:
-        """Freeze all encoder parameters."""
-        _set_requires_grad(model.encoder, False)
-        model.encoder.eval()
-
-    def _partial_unfreeze_encoder(*, unfreeze_last_k: int) -> list[str]:
-        """
-        Unfreeze encoder layers based on unfreeze_last_k:
-        - unfreeze_last_k > 0: unfreeze last K transformer layers
-        - unfreeze_last_k == -1: unfreeze all layers (full encoder)
-        Returns list of unfrozen module names for logging.
-        """
-        # First freeze everything
-        _set_requires_grad(model.encoder, False)
-
-        unfrozen_modules: list[str] = []
-
-        # Handle unfreeze all layers (-1)
-        if unfreeze_last_k == -1:
-            _set_requires_grad(model.encoder, True)
-            unfrozen_modules.append("encoder.* (all layers)")
-            model.encoder.train()
-            return unfrozen_modules
-
-        # Try to unfreeze last K transformer layers
-        if hasattr(model.encoder, "transformer") and hasattr(model.encoder.transformer, "layers"):
-            layers = model.encoder.transformer.layers
-            if layers is not None and unfreeze_last_k > 0:
-                k = min(int(unfreeze_last_k), len(layers))
-                # Unfreeze last k layers
-                for idx, layer in enumerate(list(layers)[-k:], start=len(layers) - k):
-                    _set_requires_grad(layer, True)
-                    unfrozen_modules.append(f"encoder.transformer.layers[{idx}]")
-
-        # Always unfreeze shared_head if present (part of encoder)
-        if hasattr(model.encoder, "shared_head") and model.encoder.shared_head is not None:
-            _set_requires_grad(model.encoder.shared_head, True)
-            unfrozen_modules.append("encoder.shared_head")
-
-        model.encoder.train()
-        return unfrozen_modules
 
     def summarize_trainability(model: nn.Module) -> dict:
         """Summarize parameter trainability statistics."""
