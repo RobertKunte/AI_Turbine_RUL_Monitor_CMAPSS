@@ -1020,6 +1020,11 @@ def train_world_model_universal_v3(
             eol_became_active_epoch = int(epoch)
 
         # Stage B: Partial unfreeze after initial freeze period
+        # Encoder freeze semantics:
+        #   Epochs 0 to (freeze_encoder_epochs-1): encoder frozen
+        #   Epoch freeze_encoder_epochs: unfreezing happens HERE, encoder trainable for this epoch
+        #   Epochs (freeze_encoder_epochs+1) onwards: encoder remains unfrozen
+        # Example: freeze_encoder_epochs=10 means frozen [0-9], unfrozen starting epoch 10
         if (not did_initial_unfreeze) and freeze_encoder_epochs > 0 and epoch == freeze_encoder_epochs:
             unfrozen = _partial_unfreeze_encoder(unfreeze_last_k=unfreeze_encoder_layers)
             did_initial_unfreeze = True
@@ -1058,6 +1063,11 @@ def train_world_model_universal_v3(
                 print(f"  Param group {pg_idx}: {n_params:,} params, lr={effective_lr:.6f} "
                       f"{'(encoder, lr_mult=' + str(encoder_lr_mult) + ')' if effective_lr != lr else '(decoder/heads)'}")
 
+            # Special logging for transition epoch
+            enc_params_after = count_trainable_params(model.encoder)[0]
+            print(f"[EncoderFreeze] *** TRANSITION EPOCH {epoch} ***")
+            print(f"  Encoder unfrozen this epoch: now training with {enc_params_after:,} encoder params")
+
         # Optional: freeze encoder briefly when EOL starts to protect representation
         eol_freeze_active = False
         if freeze_encoder_n > 0 and eol_on_epoch is not None and (epoch - eol_on_epoch) < freeze_encoder_n:
@@ -1066,7 +1076,15 @@ def train_world_model_universal_v3(
 
         # Get trainability summary for logging
         trainability = summarize_trainability(model)
-        encoder_should_be_frozen = (freeze_encoder or (freeze_encoder_epochs > 0 and epoch < freeze_encoder_epochs)) or eol_freeze_active
+
+        # Determine freeze state AFTER unfreezing logic has run
+        if freeze_encoder_epochs > 0 and not did_initial_unfreeze:
+            # Still in frozen period (epoch < freeze_encoder_epochs, unfreeze hasn't happened yet)
+            encoder_should_be_frozen = True
+        else:
+            # Either: no freeze config, OR already unfrozen, OR this is transition epoch (just unfroze)
+            encoder_should_be_frozen = freeze_encoder or eol_freeze_active
+
         encoder_trainable_params = trainability["encoder"]["trainable"]
         decoder_trainable_params = trainability["decoder_heads"]["trainable"]
         encoder_frozen_flag = trainability["encoder"]["frozen"]
@@ -1075,9 +1093,16 @@ def train_world_model_universal_v3(
         encoder_frozen = encoder_frozen_flag
 
         # Log freeze state with component breakdown
-        print(f"[EncoderFreeze] epoch={epoch} should_be_frozen={encoder_should_be_frozen} "
-              f"encoder_trainable={encoder_trainable_params:,} decoder_trainable={decoder_trainable_params:,} "
-              f"frozen_flag={encoder_frozen_flag}")
+        if epoch == freeze_encoder_epochs and did_initial_unfreeze:
+            # Transition epoch already logged above, just show final state
+            print(f"[EncoderFreeze] Training epoch {epoch} with unfrozen encoder: "
+                  f"{encoder_trainable_params:,} encoder params + {decoder_trainable_params:,} decoder/head params")
+        else:
+            # Normal logging
+            print(f"[EncoderFreeze] epoch={epoch} frozen={encoder_frozen_flag} "
+                  f"encoder_trainable={encoder_trainable_params:,} decoder_trainable={decoder_trainable_params:,}")
+            if eol_freeze_active:
+                print(f"  [EOL temp freeze active: epoch {epoch - eol_on_epoch} of {freeze_encoder_n}]")
 
         # Take parameter snapshots for update norm calculation
         param_snapshots = {}

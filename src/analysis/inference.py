@@ -394,6 +394,30 @@ def load_model_from_experiment(
         use_hi_in_eol = wm_cfg.get("use_hi_in_eol", False)
         use_hi_slope_in_eol = wm_cfg.get("use_hi_slope_in_eol", False)
 
+        # Read decoder configuration (v3 enhancement)
+        decoder_type = wm_cfg.get("decoder_type", "lstm")
+
+        # Read tf_cross-specific parameters (safe defaults if missing)
+        future_max_len = wm_cfg.get("future_max_len", 256)
+        cond_dim = wm_cfg.get("cond_dim", 0)
+        quantiles = wm_cfg.get("quantiles", [0.1, 0.5, 0.9])
+        dec_ff = wm_cfg.get("dec_ff", None)  # None defaults to dim_feedforward in model
+
+        print(f"  Decoder config: type={decoder_type}")
+        if decoder_type == "tf_cross":
+            print(f"    tf_cross params: future_max_len={future_max_len}, cond_dim={cond_dim}, "
+                  f"quantiles={quantiles}, dec_ff={dec_ff or dim_feedforward}")
+
+        # Backwards compatibility: infer decoder_type from checkpoint if not in summary.json
+        if decoder_type == "lstm":  # Default means potentially missing from summary.json
+            # Check checkpoint keys to detect actual architecture
+            if "tf_cross_decoder.decoder.layers.0.self_attn.in_proj_weight" in state_dict:
+                decoder_type = "tf_cross"
+                print(f"  [Backwards Compat] Inferred decoder_type='tf_cross' from checkpoint keys")
+                print(f"  [Backwards Compat] Using default tf_cross params (summary.json missing decoder config)")
+            elif "decoder.weight_ih_l0" in state_dict:
+                print(f"  [Backwards Compat] Confirmed decoder_type='lstm' from checkpoint keys")
+
         model = WorldModelUniversalV3(
             input_size=input_dim,
             d_model=d_model,
@@ -411,6 +435,12 @@ def load_model_from_experiment(
             horizon=horizon,
             use_hi_in_eol=use_hi_in_eol,
             use_hi_slope_in_eol=use_hi_slope_in_eol,
+            # Decoder configuration (v3 enhancement)
+            decoder_type=decoder_type,
+            future_max_len=future_max_len,
+            cond_dim=cond_dim,
+            quantiles=quantiles,
+            dec_ff=dec_ff,
         )
         
         # Load state dict for world model v3
@@ -418,10 +448,27 @@ def load_model_from_experiment(
             model.load_state_dict(state_dict, strict=True)
             print("  Successfully loaded world model v3 checkpoint (strict=True)")
         except RuntimeError as e:
-            print(f"  Warning: Could not load with strict=True: {e}")
-            print("  Attempting to load with strict=False...")
+            print(f"  ERROR: Could not load checkpoint with strict=True")
+            print(f"  Error details: {str(e)[:200]}...")
+            print(f"  Decoder type: {decoder_type}")
+
+            # Fail-fast for non-LSTM decoders (strict=False would silently drop weights)
+            if decoder_type in {"tf_cross", "tf_ar", "tf_ar_xattn"}:
+                print(f"\n  [CRITICAL] Cannot load {decoder_type} checkpoint with strict=False")
+                print(f"  This would silently ignore decoder weights and produce invalid predictions.")
+                print(f"  Possible causes:")
+                print(f"    - summary.json missing decoder_type or tf_cross parameters")
+                print(f"    - Checkpoint saved with different decoder_type than summary.json")
+                print(f"  Solution: Verify summary.json contains correct decoder config")
+                raise RuntimeError(
+                    f"Decoder architecture mismatch: cannot load {decoder_type} checkpoint. "
+                    f"Check summary.json for decoder_type and parameters."
+                )
+
+            # Allow strict=False only for LSTM (more forgiving for legacy checkpoints)
+            print(f"  Attempting strict=False (LSTM decoder only)...")
             model.load_state_dict(state_dict, strict=False)
-            print("  Loaded world model v3 checkpoint (strict=False)")
+            print(f"  Loaded with strict=False - verify model outputs are correct!")
         
         model = model.to(device)
         return model, config

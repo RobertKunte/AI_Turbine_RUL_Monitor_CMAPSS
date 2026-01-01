@@ -1175,6 +1175,10 @@ def build_trajectories(
             print(f"Warning: Could not load HI calibrator {hi_calibrator_path}: {e}")
             calibrator = None
 
+    # Detect unsupervised HI modes (no ground truth by design)
+    UNSUPERVISED_HI_TYPES = {"phys_v3"}  # Expand as needed
+    is_unsupervised_hi = hi_target_type in UNSUPERVISED_HI_TYPES
+
     # Resolve HI target column once (before loop)
     hi_target_col = None
     if use_hi_true_target and len(df_test_fe) > 0:
@@ -1186,14 +1190,26 @@ def build_trajectories(
         if hi_target_col:
             print(f"[Diagnostics] HI target column resolved: '{hi_target_col}' for type '{hi_target_type}'")
         else:
-            # Emit ONE warning only
-            print(f"[Diagnostics] Warning: HI target column not found for type '{hi_target_type}'. "
-                  f"Available columns: {[c for c in sample_df.columns if 'HI' in c or 'hi' in c or 'health' in c.lower()][:10]}. "
-                  f"Skipping HI_true overlays.")
+            if is_unsupervised_hi:
+                # Clear INFO for unsupervised modes (expected behavior)
+                print(f"[Diagnostics] INFO: HI type '{hi_target_type}' is unsupervised - "
+                      f"no ground truth available by design.")
+                print(f"[Diagnostics]   Model trained with unsupervised HI target. "
+                      f"Predictions shown without ground truth comparison.")
+            else:
+                # WARNING for supervised modes (unexpected missing column)
+                hi_cols = [c for c in sample_df.columns if 'HI' in c or 'hi' in c or 'health' in c.lower()][:10]
+                print(f"[Diagnostics] WARNING: HI target column not found for supervised type '{hi_target_type}'.")
+                print(f"[Diagnostics]   Available HI-like columns: {hi_cols}")
+                print(f"[Diagnostics]   Skipping HI_true overlays.")
+
             use_hi_true_target = False  # Disable HI_true for all engines
 
-    print(f"[Diagnostics] HI target type: {hi_target_type}, Column: {hi_target_col or 'None'}, "
-          f"Calibrator: {'Yes' if calibrator else 'No'}")
+    print(f"[Diagnostics] HI Configuration Summary:")
+    print(f"  Type: {hi_target_type} ({'unsupervised' if is_unsupervised_hi else 'supervised'})")
+    print(f"  Ground truth: {hi_target_col or ('None (by design)' if is_unsupervised_hi else 'None (missing!)')}")
+    print(f"  Calibrator: {'Yes' if calibrator else 'No'}")
+    print(f"  Overlays: {'No (unsupervised mode)' if is_unsupervised_hi else ('Yes' if hi_target_col else 'No')}")
 
     for i, unit_id in enumerate(unit_ids_test):
         unit_id = int(unit_id)
