@@ -98,6 +98,23 @@ def _load_experiment_metrics(experiment_dir: Path) -> Tuple[List, Dict, Optional
             metrics_data = json.load(f)
         eol_metrics = _parse_eol_metrics_json(metrics_data, config)
         condition_map = None  # Will load separately if needed
+
+        # If parsing failed (old format without y_true_eol/y_pred_eol), run inference
+        if not eol_metrics:
+            print(f"[FailureCaseLibrary] Old format detected, running inference to regenerate metrics...")
+            from src.analysis.inference import run_inference_for_experiment
+
+            result = run_inference_for_experiment(
+                experiment_dir=str(experiment_dir),
+                return_hi_trajectories=False,
+            )
+
+            if isinstance(result, tuple) and len(result) >= 2:
+                eol_metrics = result[0]
+                condition_map = result[2] if len(result) > 2 else None
+            else:
+                eol_metrics = result
+                condition_map = None
     else:
         print(f"[FailureCaseLibrary] Running inference to generate metrics...")
         from src.analysis.inference import run_inference_for_experiment
@@ -132,6 +149,17 @@ def _parse_eol_metrics_json(metrics_data: Dict, config: Dict) -> List:
     y_true = metrics_data.get("y_true_eol", [])
     y_pred = metrics_data.get("y_pred_eol", [])
     nasa_scores = metrics_data.get("nasa_scores", [])
+
+    # Fallback: if y_true_eol or y_pred_eol are missing, reconstruct from errors
+    if not y_true or not y_pred:
+        if errors and nasa_scores:
+            print("[FailureCaseLibrary] Warning: y_true_eol/y_pred_eol missing, reconstructing from errors")
+            # We have errors but not y_true/y_pred - this is an old format
+            # We can't reconstruct the actual values without more info, so we need to run inference
+            return []  # Signal that we need to run inference
+        else:
+            print("[FailureCaseLibrary] Error: Insufficient data in eol_metrics.json")
+            return []
 
     # Try to get quantiles if available
     q10_list = metrics_data.get("q10_eol", [None] * len(errors))
@@ -169,8 +197,7 @@ def _load_condition_ids_from_data(experiment_dir: Path, config: Dict) -> Dict[in
         from src.data_loading import load_cmapps_subset
 
         df_train, df_test, y_test_true = load_cmapps_subset(
-            dataset=dataset,
-            subset_name="test",
+            fd_id=dataset,  # Correct parameter name
         )
 
         # Extract condition IDs per unit
@@ -496,8 +523,9 @@ def save_failure_case_library(
 
     # 2. Save cases.csv
     df = pd.DataFrame([asdict(c) for c in library.all_cases])
-    # Convert lists to strings for CSV
-    df['labels'] = df['labels'].apply(lambda x: ','.join(x) if x else '')
+    # Convert lists to strings for CSV (only if DataFrame is not empty)
+    if not df.empty and 'labels' in df.columns:
+        df['labels'] = df['labels'].apply(lambda x: ','.join(x) if x else '')
     df.to_csv(failure_cases_dir / "cases.csv", index=False)
 
     # 3. Save individual case files for selected top-K

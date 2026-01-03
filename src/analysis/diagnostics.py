@@ -2442,6 +2442,8 @@ def run_diagnostics_for_run(
         # Use metrics directly from evaluate_world_model_v3_eol (100% consistent with training)
         eol_metrics_dict = {
             "errors": errors,
+            "y_true_eol": y_true_eol,  # Add for failure case library
+            "y_pred_eol": rul_pred_full_np,  # Add for failure case library
             "mean_error": test_metrics_diag["Bias"],
             "std_error": float(np.std(errors)),
             "mean_abs_error": test_metrics_diag["MAE"],
@@ -2563,6 +2565,8 @@ def run_diagnostics_for_run(
         # Diese Werte sind 100% identisch mit den Werten im Training!
         eol_metrics_dict = {
             "errors": errors,  # errors = rul_pred_full_np - y_true_eol (bereits aus capped Werten)
+            "y_true_eol": y_true_eol,  # Add for failure case library
+            "y_pred_eol": rul_pred_full_np,  # Add for failure case library
             "mean_error": pt["bias"],  # Direkt von evaluate_on_test_data
             "std_error": float(np.std(errors)),
             "mean_abs_error": pt["mae"],  # Direkt von evaluate_on_test_data
