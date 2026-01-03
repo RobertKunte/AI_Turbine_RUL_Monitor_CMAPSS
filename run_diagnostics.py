@@ -88,11 +88,11 @@ def run_diagnostics_for_experiment(
             failure_cases_k=failure_cases_k,
         )
 
-        print(f"\n✓ Diagnostics completed for {experiment_name}")
+        print(f"\n[OK] Diagnostics completed for {experiment_name}")
         return True
 
     except Exception as e:
-        print(f"\n❌ Error running diagnostics for {experiment_name}: {e}")
+        print(f"\n[ERROR] Error running diagnostics for {experiment_name}: {e}")
         import traceback
         traceback.print_exc()
         return False

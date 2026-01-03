@@ -1,9 +1,23 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 import numpy as np
 
 from src.metrics import compute_eol_errors_and_nasa
+
+
+@dataclass
+class EngineEOLMetrics:
+    """Per-engine End-of-Life prediction metrics."""
+    unit_id: int
+    true_rul: float
+    pred_rul: float
+    error: float
+    nasa: float
+    q10: Optional[float] = None
+    q50: Optional[float] = None
+    q90: Optional[float] = None
 
 
 def evaluate_eol_metrics(

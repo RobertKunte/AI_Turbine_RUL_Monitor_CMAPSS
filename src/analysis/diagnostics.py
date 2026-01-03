@@ -401,7 +401,7 @@ def generate_all_diagnostics(
     print(f"  EOL RMSE:              {diagnostics_summary['rmse']:.2f} cycles")
     print(f"  EOL MAE:               {diagnostics_summary['mae']:.2f} cycles")
     print(f"  EOL Bias (mean error): {diagnostics_summary['bias']:.2f} cycles")
-    print(f"  EOL R²:                {diagnostics_summary['r2']:.4f}")
+    print(f"  EOL R^2:               {diagnostics_summary['r2']:.4f}")
     print(f"  EOL NASA Score (sum):  {diagnostics_summary['nasa_sum']:.2f}")
     print(f"  EOL NASA Score (mean): {diagnostics_summary['nasa_mean']:.4f}")
     
@@ -422,7 +422,7 @@ def generate_all_diagnostics(
             bias_diff = abs(diagnostics_bias - test_bias)
             print(f"    Bias: Test={test_bias:.4f}, Diagnostics={diagnostics_bias:.4f} (diff: {bias_diff:.4f})")
             if bias_diff > 0.5:  # Tolerance: 0.5 cycles
-                print(f"    ⚠️  WARNING: Bias difference > 0.5 cycles - please verify consistency")
+                print(f"    [WARNING]  WARNING: Bias difference > 0.5 cycles - please verify consistency")
         
         # Compare RMSE
         test_rmse = _get_last_style(test_metrics, "rmse")
@@ -431,7 +431,7 @@ def generate_all_diagnostics(
             rmse_diff = abs(diagnostics_rmse - test_rmse)
             print(f"    RMSE: Test={test_rmse:.4f}, Diagnostics={diagnostics_rmse:.4f} (diff: {rmse_diff:.4f})")
             if rmse_diff > 0.5:  # Tolerance: 0.5 cycles
-                print(f"    ⚠️  WARNING: RMSE difference > 0.5 cycles - please verify consistency")
+                print(f"    [WARNING]  WARNING: RMSE difference > 0.5 cycles - please verify consistency")
         
         # Compare NASA mean
         # Prefer nasa_last_mean if present
@@ -441,9 +441,9 @@ def generate_all_diagnostics(
             nasa_diff = abs(diagnostics_nasa_mean - test_nasa_mean)
             print(f"    NASA Mean: Test={test_nasa_mean:.4f}, Diagnostics={diagnostics_nasa_mean:.4f} (diff: {nasa_diff:.4f})")
             if nasa_diff > 1.0:  # Tolerance: 1.0
-                print(f"    ⚠️  ERROR: NASA mean difference > 1.0 - please check RUL capping / engine aggregation logic")
+                print(f"    [WARNING]  ERROR: NASA mean difference > 1.0 - please check RUL capping / engine aggregation logic")
             elif nasa_diff > 0.1:
-                print(f"    ⚠️  WARNING: NASA mean difference > 0.1 - minor inconsistency detected")
+                print(f"    [WARNING]  WARNING: NASA mean difference > 0.1 - minor inconsistency detected")
         
         # Overall status
         all_ok = (
@@ -452,9 +452,9 @@ def generate_all_diagnostics(
             (test_nasa_mean is None or abs(diagnostics_nasa_mean - test_nasa_mean) <= 1.0)
         )
         if all_ok:
-            print(f"    ✅ OK: diagnostics metrics are consistent with test_metrics")
+            print(f"    [OK] OK: diagnostics metrics are consistent with test_metrics")
         else:
-            print(f"    ⚠️  INCONSISTENCY DETECTED: Please review RUL capping, engine order, and metric computation")
+            print(f"    [WARNING]  INCONSISTENCY DETECTED: Please review RUL capping, engine order, and metric computation")
     
     print(f"Diagnostics complete and saved to summary.json")
     
@@ -805,13 +805,13 @@ def build_eval_data(
                 if 0 <= idx < len(y_test_true):
                     y_true_eol.append(y_test_true[idx])
                 else:
-                    print(f"  ⚠️  Warning: unit_id {unit_id} not found in y_test_true, using fallback")
+                    print(f"  [WARNING]  Warning: unit_id {unit_id} not found in y_test_true, using fallback")
                     y_true_eol.append(y_test_true[-1] if len(y_test_true) > 0 else max_rul)
             y_true_eol = np.array(y_true_eol)
             y_true_eol = np.minimum(y_true_eol, max_rul)
     else:
         # Length mismatch - create mapping
-        print(f"  ⚠️  WARNING: Length mismatch! y_test_true={len(y_test_true)}, unit_ids_test={len(unit_ids_test_np)}")
+        print(f"  [WARNING]  WARNING: Length mismatch! y_test_true={len(y_test_true)}, unit_ids_test={len(unit_ids_test_np)}")
         unit_id_to_y_idx = {i + 1: i for i in range(len(y_test_true))}
         y_true_eol = []
         for unit_id in unit_ids_test_np:
@@ -1626,7 +1626,7 @@ def plot_hi_rul_trajectories(
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
         
-        ax1.set_title(f'Engine #{traj.unit_id} – HI + RUL (degraded)')
+        ax1.set_title(f'Engine #{traj.unit_id} - HI + RUL (degraded)')
     
     # Hide unused subplots
     for idx in range(num_engines, len(axes)):
@@ -2034,21 +2034,21 @@ def run_diagnostics_for_run(
         # Check if it's an encoder-only checkpoint error
         error_msg = str(e)
         if "encoder-only" in error_msg.lower() or "no head params" in error_msg.lower():
-            print(f"  ⚠️  Checkpoint issue detected: {error_msg}")
-            print(f"  ⚠️  Skipping diagnostics for {run_name} - checkpoint appears incomplete")
+            print(f"  [WARNING]  Checkpoint issue detected: {error_msg}")
+            print(f"  [WARNING]  Skipping diagnostics for {run_name} - checkpoint appears incomplete")
             return
         else:
             # Other RuntimeError - re-raise with traceback
-            print(f"  ❌ Error loading model: {e}")
+            print(f"  [ERROR] Error loading model: {e}")
             import traceback
             traceback.print_exc()
-            print(f"  ⚠️  Skipping diagnostics for {run_name} due to model loading error")
+            print(f"  [WARNING]  Skipping diagnostics for {run_name} due to model loading error")
             return
     except Exception as e:
-        print(f"  ❌ Error loading model: {e}")
+        print(f"  [ERROR] Error loading model: {e}")
         import traceback
         traceback.print_exc()
-        print(f"  ⚠️  Skipping diagnostics for {run_name} due to model loading error")
+        print(f"  [WARNING]  Skipping diagnostics for {run_name} due to model loading error")
         return
     
     # Check if this is a world model (use same logic as load_model_from_experiment)
@@ -2082,15 +2082,15 @@ def run_diagnostics_for_run(
     
     if is_world_model:
         if is_world_model_v3:
-            print(f"  ✓ Detected World Model v3 experiment: {experiment_name}")
+            print(f"  [OK] Detected World Model v3 experiment: {experiment_name}")
             print(f"    model_type={model_type}, encoder_type={encoder_type}")
             print("  Will use HI head output for diagnostics (not EOL proxy)")
         else:
-            print(f"  ✓ Detected World Model v2 experiment: {experiment_name}")
+            print(f"  [OK] Detected World Model v2 experiment: {experiment_name}")
             print(f"    model_type={model_type}, encoder_type={encoder_type}")
             print("  Will use EOL prediction as HI proxy for diagnostics")
     else:
-        print(f"  ✓ Detected RUL/HI experiment: {experiment_name}")
+        print(f"  [OK] Detected RUL/HI experiment: {experiment_name}")
     
     # Extract config parameters
     max_rul = config.get("max_rul", 125)
@@ -2290,9 +2290,9 @@ def run_diagnostics_for_run(
             import pickle
             with open(scaler_path, "rb") as f:
                 scaler_loaded = pickle.load(f)
-            print(f"  ✓ Loaded scaler from {scaler_path}")
+            print(f"  [OK] Loaded scaler from {scaler_path}")
         except Exception as e:
-            print(f"  ⚠️  Could not load scaler from {scaler_path}: {e}")
+            print(f"  [WARNING] Could not load scaler from {scaler_path}: {e}")
     
     # Stage -1: Load feature_cols.json for exact feature reconstruction
     feature_cols_path = experiment_dir / "feature_cols.json"
@@ -2344,7 +2344,7 @@ def run_diagnostics_for_run(
                 f"mean={float(np.nanmean(hi_v3_test)):.4f}"
             )
         except Exception as e:
-            print(f"  ⚠️  Could not compute HI_phys_v3 for diagnostics: {e}")
+            print(f"  [WARNING]  Could not compute HI_phys_v3 for diagnostics: {e}")
 
     # If we loaded a scaler from the experiment directory, prefer it over the
     # one fitted on-the-fly in build_eval_data to exactly mirror training –
@@ -2361,7 +2361,7 @@ def run_diagnostics_for_run(
             print("  Using loaded scaler for consistency with training")
             scaler_dict = scaler_loaded
         except AssertionError as e:
-            print(f"  ⚠️  Loaded scaler feature_dim mismatch, keeping diagnostics scaler: {e}")
+            print(f"  [WARNING]  Loaded scaler feature_dim mismatch, keeping diagnostics scaler: {e}")
 
     # Log high-level feature grouping for encoder/decoder design
     groups = group_feature_columns(feature_cols)
@@ -2388,7 +2388,7 @@ def run_diagnostics_for_run(
                     f"This indicates feature configuration mismatch between training and diagnostics. "
                     f"Check that diagnostics reconstructs the exact same features as training."
                 )
-            print(f"[Stage-1] Verified feature dimension: {actual_features} == {expected_features} ✓")
+            print(f"[Stage-1] Verified feature dimension: {actual_features} == {expected_features} [OK]")
         
         # Stage -1: Log cap_targets consistency
         target_cfg = config.get("target_cfg", {})
@@ -2595,13 +2595,13 @@ def run_diagnostics_for_run(
         nasa_mean_computed = float(np.mean(nasa_scores_for_plots))
         nasa_mean_from_eval = nasa_pt["score_mean"]
         if abs(nasa_mean_computed - nasa_mean_from_eval) > 1e-6:
-            print(f"  ⚠️  WARNING: NASA mean mismatch!")
+            print(f"  [WARNING]  WARNING: NASA mean mismatch!")
             print(f"     From evaluate_on_test_data: {nasa_mean_from_eval:.6f}")
             print(f"     Computed from nasa_scores: {nasa_mean_computed:.6f}")
             print(f"     Difference: {abs(nasa_mean_computed - nasa_mean_from_eval):.6f}")
             print(f"     Using value from evaluate_on_test_data (training-consistent)")
         else:
-            print(f"  ✓ NASA mean matches: {nasa_mean_from_eval:.6f}")
+            print(f"  [OK] NASA mean matches: {nasa_mean_from_eval:.6f}")
 
         print(f"  Test RMSE (from evaluate_on_test_data): {pt['rmse']:.2f} cycles")
         print(f"  Test MAE  (from evaluate_on_test_data): {pt['mae']:.2f} cycles")
@@ -2749,7 +2749,7 @@ def run_diagnostics_for_run(
                 }
             )
     except Exception as e:
-        print(f"  ⚠️  Warning: failed to compute some dynamics KPIs: {e}")
+        print(f"  [WARNING]  Warning: failed to compute some dynamics KPIs: {e}")
 
     def _nanmean(xs: List[float]) -> float:
         arr = np.asarray(xs, dtype=float)
@@ -2818,11 +2818,11 @@ def run_diagnostics_for_run(
             f"slope_err_early={kpis_agg['rul_slope_abs_error_early_mean']:.3f}"
         )
     except Exception as e:
-        print(f"  ⚠️  Warning: could not write dynamics_kpis.json: {e}")
+        print(f"  [WARNING]  Warning: could not write dynamics_kpis.json: {e}")
 
     if short_seq_curv_skipped > 0:
         print(
-            f"  ⚠️  KPI warning: curvature undefined for {short_seq_curv_skipped} engines (sequence length < 3). "
+            f"  [WARNING]  KPI warning: curvature undefined for {short_seq_curv_skipped} engines (sequence length < 3). "
             "hi_curvature set to null."
         )
 
@@ -2831,11 +2831,11 @@ def run_diagnostics_for_run(
         if np.isfinite(kpis_agg.get("hi_plateau_ratio_mean", np.nan)):
             v = float(kpis_agg["hi_plateau_ratio_mean"])
             if not (0.0 <= v <= 1.0):
-                print(f"  ⚠️  KPI sanity: hi_plateau_ratio_mean out of [0,1]: {v}")
+                print(f"  [WARNING]  KPI sanity: hi_plateau_ratio_mean out of [0,1]: {v}")
         if np.isfinite(kpis_agg.get("rul_saturation_rate_clipped_mean", np.nan)):
             v = float(kpis_agg["rul_saturation_rate_clipped_mean"])
             if not (0.0 <= v <= 1.0):
-                print(f"  ⚠️  KPI sanity: rul_saturation_rate_clipped_mean out of [0,1]: {v}")
+                print(f"  [WARNING]  KPI sanity: rul_saturation_rate_clipped_mean out of [0,1]: {v}")
     except Exception:
         pass
     
@@ -2843,10 +2843,10 @@ def run_diagnostics_for_run(
     trajectories_with_damage = [t for t in trajectories if t.hi_damage is not None and len(t.hi_damage) > 0]
     has_damage_hi = len(trajectories_with_damage) > 0
     if has_damage_hi:
-        print(f"  ✓ Damage HI trajectories detected: {len(trajectories_with_damage)}/{len(trajectories)} engines have damage HI")
+        print(f"  [OK] Damage HI trajectories detected: {len(trajectories_with_damage)}/{len(trajectories)} engines have damage HI")
         print(f"    Will create separate damage plot")
     else:
-        print(f"  ⚠️  No damage HI trajectories found (model may not have damage_head)")
+        print(f"  [WARNING]  No damage HI trajectories found (model may not have damage_head)")
     
     # Select degraded engines
     print("[6] Selecting degraded engines...")
@@ -2863,9 +2863,9 @@ def run_diagnostics_for_run(
     # Check if selected trajectories have damage HI
     selected_with_damage = [t for t in selected_trajectories if t.hi_damage is not None and len(t.hi_damage) > 0]
     if has_damage_hi and len(selected_with_damage) > 0:
-        print(f"  ✓ {len(selected_with_damage)}/{len(selected_trajectories)} selected engines have damage HI - will plot")
+        print(f"  [OK] {len(selected_with_damage)}/{len(selected_trajectories)} selected engines have damage HI - will plot")
     elif has_damage_hi and len(selected_with_damage) == 0:
-        print(f"  ⚠️  Warning: Damage HI available but none in selected engines - damage plot may be empty")
+        print(f"  [WARNING]  Warning: Damage HI available but none in selected engines - damage plot may be empty")
     
     # Generate plots (save directly in experiment directory, not in diagnostics subfolder)
     print("[7] Generating publication plots...")
@@ -3034,7 +3034,7 @@ def run_diagnostics_for_run(
                 title=f"{dataset_name} Health Index Damage Trajectories – 10 degraded engines",
                 max_engines=10,
             )
-            print(f"  ✓ Saved HI Damage trajectory plots to {experiment_dir / 'hi_damage_10_degraded.png'}")
+            print(f"  [OK] Saved HI Damage trajectory plots to {experiment_dir / 'hi_damage_10_degraded.png'}")
 
             # Additional diagnostics for HI_phys_v3-based experiments:
             # 1) True HI_phys_v3 trajectories for several engines.
@@ -3084,9 +3084,9 @@ def run_diagnostics_for_run(
                         title=f"{dataset_name} HI_cal_v2 (v4) vs HI_phys_v3 at EOL",
                     )
         elif has_damage_hi:
-            print(f"  ⚠️  Skipping HI Damage plot: damage HI exists but not in selected degraded engines")
+            print(f"  [WARNING]  Skipping HI Damage plot: damage HI exists but not in selected degraded engines")
         else:
-            print(f"  ℹ️  Skipping HI Damage plot: model does not have damage_head")
+            print(f"  [INFO] Skipping HI Damage plot: model does not have damage_head")
     else:
         print(f"  Skipping HI+RUL trajectory plot (no trajectories available)")
     
@@ -3187,9 +3187,9 @@ def run_diagnostics_for_run(
             summary_obj["test_nasa_mean"] = float(diag_test_metrics["nasa_mean"])
 
         summary_path.write_text(json.dumps(summary_obj, indent=2), encoding="utf-8")
-        print(f"  ✓ Wrote diagnostics_test_metrics (without overwriting training test_metrics): {summary_path}")
+        print(f"  [OK] Wrote diagnostics_test_metrics (without overwriting training test_metrics): {summary_path}")
     except Exception as e:
-        print(f"  ⚠️  WARNING: failed to update summary.json with diagnostics metrics: {e}")
+        print(f"  [WARNING]  WARNING: failed to update summary.json with diagnostics metrics: {e}")
 
     # Build failure case library if requested
     if enable_failure_cases:
@@ -3205,11 +3205,11 @@ def run_diagnostics_for_run(
 
             save_failure_case_library(library, experiment_dir, save_plots=True)
         except Exception as e:
-            print(f"  ⚠️  WARNING: Failed to build failure case library: {e}")
+            print(f"  [WARNING]  WARNING: Failed to build failure case library: {e}")
             import traceback
             traceback.print_exc()
 
-    print(f"\n✅ Diagnostics complete for {dataset_name}!")
+    print(f"\n[OK] Diagnostics complete for {dataset_name}!")
     print(f"  Plots saved to: {experiment_dir}")
     print(f"  Metrics saved to: {metrics_path}")
     if enable_failure_cases:
