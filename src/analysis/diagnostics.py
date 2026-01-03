@@ -1992,16 +1992,20 @@ def run_diagnostics_for_run(
     dataset_name: str,
     run_name: str,
     device: Optional[torch.device] = None,
+    enable_failure_cases: bool = False,
+    failure_cases_k: int = 10,
 ) -> None:
     """
     Lädt Konfiguration + Modell aus dem Experiment-Ordner und führt vollständige
     Diagnostik durch (Notebook-basiert, für alle Datasets).
-    
+
     Args:
         exp_dir: Base directory for experiments (e.g., "results")
         dataset_name: Dataset name (e.g., "FD001", "FD002", "FD003", "FD004")
         run_name: Experiment name (e.g., "fd004_phase3_universal_v2_ms_cnn_d96")
         device: PyTorch device (if None, auto-detect)
+        enable_failure_cases: Build failure case library
+        failure_cases_k: Number of top-K worst cases to select
     """
     from src.analysis.inference import load_model_from_experiment
     
@@ -3186,10 +3190,30 @@ def run_diagnostics_for_run(
         print(f"  ✓ Wrote diagnostics_test_metrics (without overwriting training test_metrics): {summary_path}")
     except Exception as e:
         print(f"  ⚠️  WARNING: failed to update summary.json with diagnostics metrics: {e}")
-    
+
+    # Build failure case library if requested
+    if enable_failure_cases:
+        try:
+            from src.analysis.failure_case_library import build_failure_case_library, save_failure_case_library
+
+            print(f"\n[Failure Case Library] Building library with K={failure_cases_k}...")
+            library = build_failure_case_library(
+                experiment_dir=experiment_dir,
+                K=failure_cases_k,
+                ranking_metric="nasa_last_sum",  # Use NASA score as default
+            )
+
+            save_failure_case_library(library, experiment_dir, save_plots=True)
+        except Exception as e:
+            print(f"  ⚠️  WARNING: Failed to build failure case library: {e}")
+            import traceback
+            traceback.print_exc()
+
     print(f"\n✅ Diagnostics complete for {dataset_name}!")
     print(f"  Plots saved to: {experiment_dir}")
     print(f"  Metrics saved to: {metrics_path}")
+    if enable_failure_cases:
+        print(f"  Failure cases saved to: {experiment_dir / 'failure_cases'}")
 
 
 # ============================================================================

@@ -42,49 +42,55 @@ def run_diagnostics_for_experiment(
     experiment_name: str,
     dataset_name: str,
     device: torch.device,
+    enable_failure_cases: bool = False,
+    failure_cases_k: int = 10,
 ) -> bool:
     """
     Run diagnostics for a single experiment.
-    
+
     Args:
         experiment_name: Name of the experiment
         dataset_name: Dataset name (e.g., "FD004")
         device: PyTorch device
-    
+        enable_failure_cases: Build failure case library
+        failure_cases_k: Number of top-K worst cases to select
+
     Returns:
         True if successful, False otherwise
     """
     results_dir = Path("results") / dataset_name.lower() / experiment_name
-    
+
     if not results_dir.exists():
         print(f"  ⚠️  Experiment directory not found: {results_dir}")
         print(f"     Skipping diagnostics for {experiment_name}")
         return False
-    
+
     # Check if model file exists
     model_files = list(results_dir.glob("*.pt"))
     if not model_files:
         print(f"  ⚠️  No model file found in {results_dir}")
         print(f"     Skipping diagnostics for {experiment_name}")
         return False
-    
+
     try:
         print(f"\n{'='*80}")
         print(f"Running diagnostics for: {experiment_name}")
         print(f"Dataset: {dataset_name}")
         print(f"Experiment directory: {results_dir}")
         print(f"{'='*80}\n")
-        
+
         run_diagnostics_for_run(
             exp_dir=results_dir.parent.parent,  # results/ (go up from results/<dataset>/<name> to results/)
             dataset_name=dataset_name,
             run_name=experiment_name,
             device=device,
+            enable_failure_cases=enable_failure_cases,
+            failure_cases_k=failure_cases_k,
         )
-        
+
         print(f"\n✓ Diagnostics completed for {experiment_name}")
         return True
-        
+
     except Exception as e:
         print(f"\n❌ Error running diagnostics for {experiment_name}: {e}")
         import traceback
@@ -119,7 +125,18 @@ def main():
         choices=["auto", "cpu", "cuda"],
         help="Device to use (default: auto-detect)",
     )
-    
+    parser.add_argument(
+        "--failure_cases",
+        action="store_true",
+        help="Build failure case library for the experiment",
+    )
+    parser.add_argument(
+        "--failure_cases_k",
+        type=int,
+        default=10,
+        help="Number of top-K worst cases to select (default: 10)",
+    )
+
     args = parser.parse_args()
     
     # Determine device
@@ -196,6 +213,8 @@ def main():
             experiment_name=experiment_name,
             dataset_name=dataset_name,
             device=device,
+            enable_failure_cases=args.failure_cases,
+            failure_cases_k=args.failure_cases_k,
         )
         
         if success:

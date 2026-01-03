@@ -1804,6 +1804,8 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             dataset_name=dataset_name,
             run_name=experiment_name,
             device=device,
+            enable_failure_cases=True,  # Automatically generate failure case library
+            failure_cases_k=10,  # Top-10 worst cases
         )
         
         # Reload summary to get updated info
