@@ -3232,21 +3232,55 @@ def run_diagnostics_for_run(
     except Exception as e:
         print(f"  [WARNING]  WARNING: failed to update summary.json with diagnostics metrics: {e}")
 
-    # Build failure case library if requested
+    # Build failure case library / report if requested
     if enable_failure_cases:
         try:
-            from src.analysis.failure_case_library import build_failure_case_library, save_failure_case_library
+            from src.analysis.failure_case_analysis import generate_failure_case_report
+            from src.analysis.inference import EngineEOLMetrics
 
-            print(f"\n[Failure Case Library] Building library with K={failure_cases_k}...")
-            library = build_failure_case_library(
+            print(f"\n[Failure Case Analysis] Generating compact report with K={failure_cases_k}...")
+            
+            # 1. Convert dictionary metrics to List[EngineEOLMetrics]
+            # eol_metrics_dict contains numpy arrays: 'y_true_eol', 'y_pred_eol', 'errors', 'nasa_scores'
+            # unit_ids_test is available in local scope
+            
+            eol_metrics_objects = []
+            # Ensure we have nasa scores (computed for plots above)
+            nasa_scores_arr = eol_metrics_dict.get("nasa_scores")
+            
+            num_samples = len(unit_ids_test)
+            for i in range(num_samples):
+                uid = int(unit_ids_test[i])
+                y_true = float(eol_metrics_dict["y_true_eol"][i])
+                y_pred = float(eol_metrics_dict["y_pred_eol"][i])
+                err = float(eol_metrics_dict["errors"][i])
+                nasa = float(nasa_scores_arr[i]) if nasa_scores_arr is not None else 0.0
+                
+                # Check for optional quantiles if available in test_metrics_diag (unlikely here but good practice)
+                # For now just basic metrics
+                
+                m = EngineEOLMetrics(
+                    unit_id=uid,
+                    true_rul=y_true,
+                    pred_rul=y_pred,
+                    error=err,
+                    nasa=nasa
+                )
+                eol_metrics_objects.append(m)
+                
+            # 2. Convert trajectories list to Dict[int, EngineTrajectory]
+            traj_dict = {int(t.unit_id): t for t in trajectories}
+            
+            # 3. Generate Report
+            generate_failure_case_report(
                 experiment_dir=experiment_dir,
-                K=failure_cases_k,
-                ranking_metric="nasa_last_sum",  # Use NASA score as default
+                eol_metrics=eol_metrics_objects,
+                trajectories=traj_dict,
+                K=failure_cases_k
             )
-
-            save_failure_case_library(library, experiment_dir, save_plots=True)
+            
         except Exception as e:
-            print(f"  [WARNING]  WARNING: Failed to build failure case library: {e}")
+            print(f"  [WARNING]  WARNING: Failed to generate failure case report: {e}")
             import traceback
             traceback.print_exc()
 
