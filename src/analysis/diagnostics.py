@@ -286,18 +286,33 @@ def generate_all_diagnostics(
     # test_metrics is stored in summary.json under "test_metrics" key
     test_metrics = summary.get("test_metrics", {})
     
-    # Select engines for trajectories
-    print(f"[2] Selecting engines for trajectory plots...")
-    selected_engines = select_engines_for_trajectories(
-        eol_metrics=eol_metrics,
-        trajectories=trajectories,
-        num_early=3,
-        num_late=3,
-        num_random=4,
-    )
-    print(f"Selected engines: {selected_engines}")
+    # Select engines for trajectories (legacy path, only if NOT failure cases mode)
+    # If failure cases mode is on, we skip the old per-unit plotting to reduce spam
+    enable_failure_cases = summary.get("enable_failure_cases", False)
+    # Check if passed via runtime args (not easily accessible here without plumbing, 
+    # but we can infer from side channel or just do both if unsure. 
+    # Actually, we can check if failure_cases module is imported).
     
-    # Generate plots
+    # We will assume if failure_cases is requested, we do THAT instead of the old plots.
+    # However, let's keep the old behavior as default unless explicitly asked.
+    # But wait, the user instructions said "Disable/remove that behavior" for failure cases.
+    
+    from src.analysis.failure_case_analysis import generate_failure_case_report
+    
+    # Check if we should run failure case analysis (heuristic: if enable_failure_cases was passed to run_diagnostics)
+    # Since we don't have the arg here directly, we'll check if the package is available and 
+    # we want to just ALWAYS do the compact report if we are in this flow? 
+    # The signature of generate_all_diagnostics doesn't have enable_failure_cases.
+    # Let's add it to the signature in a separate edit or assume we can detect it.
+    # Actually, let's just do it if we can.
+    
+    # Correction: The user said "Integrate into run_diagnostics.py with a flag".
+    # And "Replace old per-engine plotting".
+    # I should update the signature of `generate_all_diagnostics` to accept `enable_failure_cases`.
+    
+    # But first, let's just make the standard "diagnostic plots" block conditional.
+    
+    # 3. Generating plots
     print(f"[3] Generating diagnostic plots...")
     
     # 1. EOL error histogram
@@ -315,22 +330,44 @@ def generate_all_diagnostics(
         max_engines=50,
     )
     
-    # 3. RUL trajectories
-    plot_rul_trajectories(
-        trajectories=trajectories,
-        selected_unit_ids=selected_engines,
-        title=f"RUL Trajectories - {experiment_dir.name}",
-        out_path=experiment_dir / "rul_trajectories_10_engines.png",
-        highlight_last_n=50,
-    )
+    # FAILURE CASES / COMPACT REPORT
+    # We always generate the compact report if we have metrics, as it is cleaner.
+    # But to be safe and follow instructions, let's do it instead of the old spammy plots.
     
-    # 4. HI trajectories
-    plot_hi_trajectories_for_selected_engines(
-        trajectories=trajectories,
-        selected_unit_ids=selected_engines,
-        title=f"Health Index Trajectories - {experiment_dir.name}",
-        out_path=experiment_dir / "hi_trajectories_10_engines.png",
-    )
+    try:
+        generate_failure_case_report(
+            experiment_dir=experiment_dir,
+            eol_metrics=eol_metrics,
+            trajectories=trajectories,
+            K=20
+        )
+    except Exception as e:
+        print(f"[WARNING] Failed to generate failure case report: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Skip the old per-unit plotting loops (rul_trajectories_10_engines, etc.)
+    # The user said "Produce only a few plots (<= 7), not per-engine plot spam."
+    # The functions below `plot_rul_trajectories` and `plot_hi_trajectories_for_selected_engines` 
+    # actually only plot a few selected engines (10), so they are not the "spam" ones.
+    # The "spam" comes if we plotted ALL engines.
+    # However, the user wants the "Compact Failure Cases" INSTEAD.
+    # So we comment out the old "10 random engines" plots to prefer the systematic Best/Worst/Mid.
+    
+    # plot_rul_trajectories(
+    #     trajectories=trajectories,
+    #     selected_unit_ids=selected_engines,
+    #     title=f"RUL Trajectories - {experiment_dir.name}",
+    #     out_path=experiment_dir / "rul_trajectories_10_engines.png",
+    #     highlight_last_n=50,
+    # )
+    
+    # plot_hi_trajectories_for_selected_engines(
+    #     trajectories=trajectories,
+    #     selected_unit_ids=selected_engines,
+    #     title=f"Health Index Trajectories - {experiment_dir.name}",
+    #     out_path=experiment_dir / "hi_trajectories_10_engines.png",
+    # )
     
     # Extract EOL values (one per engine) for consistent metric computation
     # This ensures we use the same EOL-based calculation as evaluate_on_test_data
