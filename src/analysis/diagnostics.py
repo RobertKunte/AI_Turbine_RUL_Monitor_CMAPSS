@@ -3237,8 +3237,53 @@ def run_diagnostics_for_run(
         try:
             from src.analysis.failure_case_analysis import generate_failure_case_report
             from src.analysis.inference import EngineEOLMetrics
+            from src.analysis.quantile_calibration import (
+                compute_quantile_calibration_last,
+                write_quantile_calibration_artifacts,
+                plot_quantile_reliability
+            )
 
             print(f"\n[Failure Case Analysis] Generating compact report with K={failure_cases_k}...")
+            
+            # --- QUANTILE CALIBRATION (Start) ---
+            qc_result = None
+            qc_lookup = {}
+            try:
+                wm_cfg = summary_obj.get("world_model_config", {})
+                decoder_type = wm_cfg.get("decoder_type", "lstm")
+                
+                # Only attempt if model is likely to support quantiles
+                if decoder_type == "tf_cross":
+                    print("[Quantile] Computing calibration metrics for LAST predictions...")
+                    quantiles_cfg = wm_cfg.get("quantiles", [0.1, 0.5, 0.9])
+                    
+                    # We pass 'y_true_eol' from eol_metrics_dict, which corresponds to unit_ids_test
+                    qc_result = compute_quantile_calibration_last(
+                        model=model,
+                        df_test=df_test_fe,
+                        y_test_true=eol_metrics_dict["y_true_eol"],
+                        feature_cols=feature_cols,
+                        scaler_dict=scaler_dict,
+                        quantiles=quantiles_cfg,
+                        past_len=past_len,
+                        max_rul=max_rul,
+                        device=device
+                    )
+                    
+                    if qc_result is not None:
+                        write_quantile_calibration_artifacts(experiment_dir / "failure_cases", qc_result)
+                        plot_quantile_reliability(
+                            experiment_dir / "failure_cases" / "quantile_reliability_last.png",
+                            qc_result.y_true, qc_result.y_pred_q10, qc_result.y_pred_q50, qc_result.y_pred_q90
+                        )
+                        
+                        # Create lookup for loop below
+                        qc_lookup = {int(u): i for i, u in enumerate(qc_result.unit_ids)}
+                        
+            except Exception as e:
+                print(f"  [WARNING] Quantile calibration failed: {e}")
+                # import traceback; traceback.print_exc()
+            # --- QUANTILE CALIBRATION (End) ---
             
             # 1. Convert dictionary metrics to List[EngineEOLMetrics]
             # eol_metrics_dict contains numpy arrays: 'y_true_eol', 'y_pred_eol', 'errors', 'nasa_scores'
@@ -3259,12 +3304,24 @@ def run_diagnostics_for_run(
                 # Check for optional quantiles if available in test_metrics_diag (unlikely here but good practice)
                 # For now just basic metrics
                 
+                q10 = None
+                q50 = None
+                q90 = None
+                if uid in qc_lookup:
+                    idx = qc_lookup[uid]
+                    q10 = float(qc_result.y_pred_q10[idx])
+                    q50 = float(qc_result.y_pred_q50[idx])
+                    q90 = float(qc_result.y_pred_q90[idx])
+                
                 m = EngineEOLMetrics(
                     unit_id=uid,
                     true_rul=y_true,
                     pred_rul=y_pred,
                     error=err,
-                    nasa=nasa
+                    nasa=nasa,
+                    q10=q10,
+                    q50=q50,
+                    q90=q90
                 )
                 eol_metrics_objects.append(m)
                 

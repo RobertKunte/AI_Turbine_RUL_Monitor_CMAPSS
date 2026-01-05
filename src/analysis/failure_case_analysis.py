@@ -41,9 +41,25 @@ def compute_last_errors_per_unit(
         }
         
         # Add optional quantiles if available, defaulting to None
-        row["q10_pred"] = getattr(m, "q10", None)
-        row["q50_pred"] = getattr(m, "q50", None)
-        row["q90_pred"] = getattr(m, "q90", None)
+        q10 = getattr(m, "q10", None)
+        q50 = getattr(m, "q50", None)
+        q90 = getattr(m, "q90", None)
+        
+        row["pred_q10_last"] = q10
+        row["pred_q50_last"] = q50
+        row["pred_q90_last"] = q90
+        
+        # Derived metrics
+        interval = None
+        overconf = False
+        if q10 is not None and q90 is not None:
+            interval = float(q90 - q10)
+            # Overconfidence: Large Error (>= 25) AND Small Interval (<= 10)
+            if abs_err >= 25.0 and interval <= 10.0:
+                overconf = True
+                
+        row["interval_q90_q10_last"] = interval
+        row["overconfident_flag"] = overconf
             
         data.append(row)
         
@@ -247,6 +263,19 @@ def plot_rul_grid_worst20(
                              traj.pred_rul - 2*sigma, 
                              traj.pred_rul + 2*sigma, 
                              color='red', alpha=0.1)
+                             
+        # Plot LAST quantile interval if available
+        if not row.empty:
+            r = row.iloc[0]
+            q10 = r.get("pred_q10_last")
+            q90 = r.get("pred_q90_last")
+            if q10 is not None and q90 is not None and not pd.isna(q10):
+                 last_t = traj.cycles[-1]
+                 # Draw vertical bar for [q10, q90]
+                 ax.vlines(last_t, q10, q90, color='purple', alpha=0.6, linewidth=2, zorder=10)
+                 # Draw caps
+                 ax.plot(last_t, q10, marker='_', color='purple', markersize=6)
+                 ax.plot(last_t, q90, marker='_', color='purple', markersize=6)
 
         ax.set_title(f"U{uid} | Err: {err_str}", fontsize=9)
         
