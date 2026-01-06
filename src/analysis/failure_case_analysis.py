@@ -12,6 +12,11 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 from src.analysis.inference import EngineEOLMetrics, EngineTrajectory
+from src.analysis.failure_tags import (
+    compute_failure_tags_for_all, 
+    generate_condition_report, 
+    compute_extended_groups
+)
 
 @dataclass
 class FailureAnalysisConfig:
@@ -307,18 +312,43 @@ def generate_failure_case_report(
     # 1. Compute errors & Rank
     df = compute_last_errors_per_unit(eol_metrics)
     
+    # --- PHASE 2: Tags & Condition Report ---
+    print("  [Phase2] Computing failure tags and condition report...")
+    df = compute_failure_tags_for_all(df, trajectories)
+    
+    # Generate condition report
+    generate_condition_report(df, failure_dir)
+    
     # 2. Select Groups
     worst_20, best_20, mid_20 = select_groups_from_last_error(df, K)
+    
+    # Phase 2: Extended groups
+    ext_groups = compute_extended_groups(df, K)
+    worst_over = ext_groups["worst20_over"]
+    worst_under = ext_groups["worst20_under"]
     
     groups = {
         "worst20": worst_20,
         "best20": best_20,
-        "mid20": mid_20
+        "mid20": mid_20,
+        "worst20_over": worst_over,
+        "worst20_under": worst_under
     }
     
     # 3. CSV Reports
+    # Save df with tags as cases_tags.csv (or cases.csv)
+    # The requirement says "failure_cases/cases_tags.csv (or add columns to cases.csv)"
+    # We will overwrite cases.csv as it is a superset now, but also save cases_tags.csv for explicit compliance
+    df.to_csv(failure_dir / "cases.csv", index=False)
+    df.to_csv(failure_dir / "cases_tags.csv", index=False)
+    
+    # selected_groups.csv
+    # We use the updated 'groups' dict which now has 5 keys
+    # write_cases_csv logic will handle it if we modify it to accept the dict directly?
+    # Our write_cases_csv takes (df, groups, out_dir). Let's use it.
+    # Note: write_cases_csv writes cases.csv again. That's fine.
     write_cases_csv(df, groups, failure_dir)
-    print(f"  Saved CSVs to {failure_dir}")
+    print(f"  Saved CSVs (cases, cases_tags, condition_report) to {failure_dir}")
     
     # 4. Plots
     # Stats for titles
@@ -332,13 +362,22 @@ def generate_failure_case_report(
     plot_rul_overlay_group(trajectories, best_20, "Best 20", get_stats(best_20), failure_dir / "rul_overlay_best20.png")
     plot_rul_overlay_group(trajectories, mid_20, "Mid 20", get_stats(mid_20), failure_dir / "rul_overlay_mid20.png")
     
+    # New Phase 2 Plots
+    plot_rul_overlay_group(trajectories, worst_over, "Worst 20 (Over-Estimation)", get_stats(worst_over), failure_dir / "rul_overlay_worst20_over.png")
+    plot_rul_overlay_group(trajectories, worst_under, "Worst 20 (Under-Estimation)", get_stats(worst_under), failure_dir / "rul_overlay_worst20_under.png")
+    
     # B) HI Overlays
     plot_hi_overlay_group(trajectories, worst_20, "Worst 20", failure_dir / "hi_overlay_worst20.png")
     plot_hi_overlay_group(trajectories, best_20, "Best 20", failure_dir / "hi_overlay_best20.png")
     plot_hi_overlay_group(trajectories, mid_20, "Mid 20", failure_dir / "hi_overlay_mid20.png")
+    
+    # New Phase 2 Plots
+    plot_hi_overlay_group(trajectories, worst_over, "Worst 20 (Over)", failure_dir / "hi_overlay_worst20_over.png")
+    plot_hi_overlay_group(trajectories, worst_under, "Worst 20 (Under)", failure_dir / "hi_overlay_worst20_under.png")
     
     # C) Grid Plot
     plot_rul_grid_worst20(trajectories, worst_20, df, failure_dir / "rul_grid_worst20.png")
     
     print(f"  Saved plots to {failure_dir}")
     print(f"[FailureCases] Done. Selected {len(worst_20)} worst, {len(best_20)} best, {len(mid_20)} mid.")
+    print(f"             + {len(worst_over)} worst-over, {len(worst_under)} worst-under.")
