@@ -1251,20 +1251,33 @@ def train_world_model_universal_v3(
 
         # Store parameter snapshots for update norm calculation
         param_snapshots = None
+        epoch_metrics = {}
         
-        for batch_idx, batch in enumerate(train_loader):
-            # Backward-compatible unpacking: (X,Y,cond) or (X,Y,cond,mask)
-            if isinstance(batch, (tuple, list)) and len(batch) == 4:
-                X_batch, Y_batch, cond_batch, mask_batch = batch
+        # B2.2: Switch loader if HI-Dynamics enabled
+        loader_to_use = train_loader_pairs if use_hi_dynamics else train_loader
+        
+        for batch_idx, batch in enumerate(loader_to_use):
+            X_batch_t1 = None # Initialize for standard loader
+            
+            # Backward-compatible unpacking
+            if isinstance(batch, (tuple, list)):
+                if len(batch) == 5: # HI-Dynamics Paired Loader: (X_t, X_t1, Y, C, M)
+                    X_batch, X_batch_t1, Y_batch, cond_batch, mask_batch = batch
+                elif len(batch) == 4: # Standard Loader with Mask: (X, Y, C, M)
+                    X_batch, Y_batch, cond_batch, mask_batch = batch
+                else: # Standard Loader: (X, Y, C)
+                    X_batch, Y_batch, cond_batch = batch
+                    mask_batch = None
             else:
-                X_batch, Y_batch, cond_batch = batch
-                mask_batch = None
+                 raise ValueError(f"Unexpected batch type: {type(batch)}")
 
             X_batch = X_batch.to(device)
             Y_batch = Y_batch.to(device)
             cond_batch = cond_batch.to(device)
             if mask_batch is not None:
                 mask_batch = mask_batch.to(device)
+            if X_batch_t1 is not None:
+                X_batch_t1 = X_batch_t1.to(device)
 
             # ------------------------------------------------------------------
             # Define target_traj_rul immediately after batch unpacking (ALWAYS available)
