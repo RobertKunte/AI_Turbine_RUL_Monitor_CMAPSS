@@ -738,6 +738,8 @@ class WorldModelUniversalV3(nn.Module):
         cond_dim: int = 0,
         quantiles: List[float] = None,
         dec_ff: Optional[int] = None,
+        # B2.2: HI-Dynamics Self-Supervision
+        use_hi_dynamics: bool = False,
     ):
         super().__init__()
         
@@ -902,6 +904,19 @@ class WorldModelUniversalV3(nn.Module):
                 nn.init.kaiming_uniform_(m.weight, nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        
+        # HI-Dynamics prediction head (predicts next-step HI from current encoder state)
+        # Small MLP: Linear -> ReLU -> Linear. No final activation (logits) or Sigmoid (configurable?).
+        # User requested: "Small MLP (Linear -> ReLU -> Linear). No final sigmoid by default."
+        if self.use_hi_dynamics:
+            self.hi_dyn_head = nn.Sequential(
+                nn.Linear(encoder_d_model, encoder_d_model // 2),
+                nn.ReLU(),
+                nn.Linear(encoder_d_model // 2, 1)
+            )
+            # Init dynamics head weights explicitly if needed, but kaiming above covers it (via module iteration)
+            # Just ensure last layer is somewhat centered?
+            # Let's trust standard init for now.
     
     def forward(
         self,
@@ -942,8 +957,16 @@ class WorldModelUniversalV3(nn.Module):
         h_shared = self.shared_head(enc_emb)  # (B, d_model)
         
         # HI prediction from shared features (sigmoid to [0, 1])
+        # HI prediction from shared features (sigmoid to [0, 1])
         hi_logit = self.fc_health(h_shared)  # (B, 1)
         hi_pred = torch.sigmoid(hi_logit)  # (B, 1)
+        
+        # HI-Dynamics prediction (predicts next-step HI)
+        hi_dyn_pred = None
+        if self.use_hi_dynamics:
+             # Predict next HI from raw encoder embedding (or shared features?)
+             # User prompt says "Compute hi_dyn = hi_dyn_head(enc_emb)"
+             hi_dyn_pred = self.hi_dyn_head(enc_emb) # (B, 1)
         
         # --- Decoder Setup ---
         if decoder_targets is not None and horizon is None:
@@ -1095,6 +1118,11 @@ class WorldModelUniversalV3(nn.Module):
             outputs["rul_q_last"] = rul_q_seq[:, -1, :]  # (B, 3)
             # Convenience: point predictions from q50
             outputs["rul_pred_last"] = rul_q_seq[:, -1, 1:2]  # (B, 1)
+            outputs["rul_pred_last"] = rul_q_seq[:, -1, 1:2]  # (B, 1)
             outputs["rul_pred_seq"] = rul_q_seq[:, :, 1]  # (B, T_future)
         
+        # Add HI-Dynamics output
+        if self.use_hi_dynamics:
+            outputs["hi_dyn"] = hi_dyn_pred # (B, 1)
+            
         return outputs

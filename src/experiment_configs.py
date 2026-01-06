@@ -1871,7 +1871,6 @@ def get_fd002_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config() -> ExperimentConfig:
     # Change ONLY decoder_type
     wmp = cfg.setdefault("world_model_params", {})
     wmp["decoder_type"] = "tf_ar"
-    # Ensure max_rul = 125 (cap 125)
     wmp["max_rul"] = 125
     
     return cfg
@@ -1970,7 +1969,6 @@ def get_fd003_wm_v1_p0_softcap_k3_hm_pad_dec_tf_ar_config() -> ExperimentConfig:
     # Change ONLY decoder_type
     wmp = cfg.setdefault("world_model_params", {})
     wmp["decoder_type"] = "tf_ar"
-    # Ensure max_rul = 125 (cap 125)
     wmp["max_rul"] = 125
     
     return cfg
@@ -2105,6 +2103,67 @@ def get_fd004_transformer_latent_worldmodel_v1_from_encoder_v5_659_rulonly_v1_co
     wmp["rul_sample_weight_min"] = 0.2
     wmp["rul_sample_weight_max"] = 3.0
     return cfg
+
+def get_wm_v3_fd004_b22_hi_dyn_tf_cross_qr_config() -> ExperimentConfig:
+    """
+    B2.2: Transformer Cross-Attention Decoder with Quantile RUL Head + HI-Dynamics Self-Supervision.
+    
+    Part of Track B2 (Architecture - Decoder Variants).
+    Implements non-autoregressive Transformer decoder with cross-attention + quantile regression.
+    
+    Based on wm_v3_fd004_b2_tf_cross_qr_b20_last baseline with:
+    - decoder_type="tf_cross" (non-AR Transformer decoder with cross-attention)
+    - Quantile RUL head predicting q10, q50, q90
+    - b2_loss_mode="last" (loss only on last timestep)
+    - Pinball loss + quantile crossing penalty
+    - NEW: HI-Dynamics Self-Supervision (use_hi_dynamics=True)
+    - NEW: Increased decoder feedforward dimension (dec_ff=384)
+    
+    All other settings preserved for comparability.
+    """
+    cfg = copy.deepcopy(get_wm_v3_fd004_b2_tf_cross_qr_b20_last_config())
+    cfg["experiment_name"] = "wm_v3_fd004_b22_hi_dyn_tf_cross_qr"
+
+    wmp = cfg.setdefault("world_model_params", {})
+
+    # Decoder configuration changes
+    wmp["dec_ff"] = 384 # Increased from 256
+
+    # B2.2: HI-Dynamics Self-Supervision
+    wmp["use_hi_dynamics"] = True
+    wmp["w_hi_dyn"] = 0.5
+    wmp["w_hi_dyn_mono"] = 0.03
+    wmp["w_hi_dyn_smooth"] = 0.02
+    wmp["hi_dyn_huber_beta"] = 0.1
+    
+    # Ensure max_rul = 125 (cap 125)
+    wmp["max_rul"] = 125
+    
+    # Keep other settings from base (quantiles, lambda_cross, b2_loss_mode="last", etc.)
+    
+    return cfg
+
+def get_wm_v3_fd004_b23_hi_dyn_traj_tf_cross_qr_config() -> ExperimentConfig:
+    """
+    B2.3: HI-Dynamics + B2.1 Trajectory (Composite).
+    
+    This combines B2.1 (trajectory stability) and B2.2 (HI dynamics)
+    to test if they are complementary.
+    
+    Based on wm_v3_fd004_b22_hi_dyn_tf_cross_qr but with b2_loss_mode="traj"
+    and trajectory loss weight set to 1.0.
+    """
+    cfg = copy.deepcopy(get_wm_v3_fd004_b22_hi_dyn_tf_cross_qr_config())
+    cfg["experiment_name"] = "wm_v3_fd004_b23_hi_dyn_traj_tf_cross_qr"
+    
+    wmp = cfg.setdefault("world_model_params", {})
+    
+    # Change b2_loss_mode to "traj" and set traj_loss_weight
+    wmp["b2_loss_mode"] = "traj"
+    wmp["traj_loss_weight"] = 1.0 # Standard
+    
+    return cfg
+
 
 def get_fd003_transformer_encoder_ms_dt_v1_config() -> ExperimentConfig:
     """

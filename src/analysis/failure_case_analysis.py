@@ -17,6 +17,10 @@ from src.analysis.failure_tags import (
     generate_condition_report, 
     compute_extended_groups
 )
+from src.analysis.diagnostics_hi import (
+    compute_hi_reaction_metrics,
+    plot_hi_reaction_hist
+)
 
 @dataclass
 class FailureAnalysisConfig:
@@ -378,6 +382,36 @@ def generate_failure_case_report(
     # C) Grid Plot
     plot_rul_grid_worst20(trajectories, worst_20, df, failure_dir / "rul_grid_worst20.png")
     
+    # --- PHASE 2.2: HI Reaction Metrics ---
+    print("  [Phase2.2] Computing HI reaction statistics...")
+    hi_stats_summary = {}
+    
+    # Define groups to analyze
+    target_groups = ["worst20", "best20", "mid20", "worst20_over", "worst20_under"]
+    
+    for grp in target_groups:
+        if grp not in groups or not groups[grp]:
+            continue
+            
+        uids = groups[grp]
+        # Compute metrics
+        stats = compute_hi_reaction_metrics(trajectories, uids, grp, failure_dir)
+        
+        if stats:
+            hi_stats_summary[grp] = stats
+            
+            # Plot Histogram (using the csv detail file or re-deriving? plot function takes df_details)
+            # The compute function saves a CSV. Let's load it back or modify compute to return df.
+            # To avoid refactoring too much, let's just re-read the CSV we just saved.
+            detail_csv_path = failure_dir / f"hi_reaction_details_{grp.replace(' ', '_')}.csv"
+            if detail_csv_path.exists():
+                df_details = pd.read_csv(detail_csv_path)
+                plot_hi_reaction_hist(df_details, grp, failure_dir / f"hi_reaction_hist_{grp}.png")
+
+    # Save summary JSON
+    with open(failure_dir / "hi_reaction_metrics.json", "w") as f:
+        json.dump(hi_stats_summary, f, indent=2)
+
     print(f"  Saved plots to {failure_dir}")
     print(f"[FailureCases] Done. Selected {len(worst_20)} worst, {len(best_20)} best, {len(mid_20)} mid.")
     print(f"             + {len(worst_over)} worst-over, {len(worst_under)} worst-under.")

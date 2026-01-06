@@ -144,6 +144,13 @@ def train_world_model_universal_v3(
         results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     
+    # B2.2 HI Dynamics parameters
+    use_hi_dynamics = bool(getattr(world_model_config, "use_hi_dynamics", False))
+    w_hi_dyn = float(getattr(world_model_config, "w_hi_dyn", 0.5))
+    w_hi_dyn_mono = float(getattr(world_model_config, "w_hi_dyn_mono", 0.03))
+    w_hi_dyn_smooth = float(getattr(world_model_config, "w_hi_dyn_smooth", 0.02))
+    hi_dyn_huber_beta = float(getattr(world_model_config, "hi_dyn_huber_beta", 0.1))
+
     if kernel_sizes is None:
         kernel_sizes = [3, 5, 9]
     
@@ -199,6 +206,10 @@ def train_world_model_universal_v3(
           f"w={world_model_config.eol_tail_weight:.2f}")
     print(f"  HI fusion into EOL: use_hi_in_eol={world_model_config.use_hi_in_eol}, "
           f"use_hi_slope_in_eol={world_model_config.use_hi_slope_in_eol}")
+    print(f"  HI Dynamics (B2.2): enabled={use_hi_dynamics}")
+    if use_hi_dynamics:
+        print(f"    w_hi_dyn={w_hi_dyn:.2f}, w_mono={w_hi_dyn_mono:.2f}, w_smooth={w_hi_dyn_smooth:.2f}")
+    
     print(f"{'='*80}\n")
     
     # Compute trajectory step weights if needed
@@ -414,6 +425,7 @@ def train_world_model_universal_v3(
     # 4. Create dataloaders
     # ===================================================================
     print("\n[4] Creating dataloaders...")
+    # Create standard dataloaders
     if horizon_mask_train_split is not None:
         train_dataset = TensorDataset(X_train_scaled, Y_train_split, cond_ids_train_split, horizon_mask_train_split)
         val_dataset = TensorDataset(X_val_scaled, Y_val, cond_ids_val, horizon_mask_val)
@@ -423,6 +435,76 @@ def train_world_model_universal_v3(
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    # B2.2: Create Paired Windows Dataloaders (if enabled)
+    # We need sequences (t, t+1) from the SAME split (train or val).
+    # Since we already split by engine, X_train_split contains only train engines, X_val only val engines.
+    
+    train_loader_pairs = None
+    val_loader_pairs = None
+    
+    if use_hi_dynamics:
+        print("\n[4b] Creating Paired Windows for HI Dynamics...")
+        
+        def create_paired_dataset(X_split, unit_ids_split, Y_split, cond_ids_split, horizon_mask_split):
+            # 1. Identify valid pairs: unit_id[i] == unit_id[i+1]
+            # Note: unit_ids_split might need to be derived or passed.
+            # We didn't explicitly return unit_ids_train_split above, let's derive it using the mask.
+            # Oh, we didn't save unit_ids_train_split variable? 
+            # We computed indices: train_indices.
+            pass
+        
+        # We need unit_ids for the split data
+        unit_ids_train_split = unit_ids_train[train_indices]
+        unit_ids_val_split = unit_ids_train[val_indices] # Wait, unit_ids_train contains all train/val units from build_sliding_windows
+        
+        def build_pairs(X, Y, units, conds, masker):
+            # Mask for Valid Pairs: Unit(t) == Unit(t+1)
+            # We inspect adjacent elements indices [:-1] and [1:]
+            pair_mask = (units[:-1] == units[1:])
+            
+            X_t = X[:-1][pair_mask]
+            X_t1 = X[1:][pair_mask]
+            Y_t = Y[:-1][pair_mask] # We keep Y_t for standard losses if we mix them, or just metadata
+            cond_t = conds[:-1][pair_mask] # Should be same as next usually
+            
+            mask_t = None
+            if masker is not None:
+                mask_t = masker[:-1][pair_mask]
+                
+            return X_t, X_t1, Y_t, cond_t, mask_t
+
+        # Train pairs
+        X_t, X_t1, Y_t, C_t, M_t = build_pairs(X_train_scaled, Y_train_split, unit_ids_train_split, cond_ids_train_split, horizon_mask_train_split)
+        if M_t is not None:
+             train_ds_pairs = TensorDataset(X_t, X_t1, Y_t, C_t, M_t)
+        else:
+             train_ds_pairs = TensorDataset(X_t, X_t1, Y_t, C_t)
+        
+        train_loader_pairs = DataLoader(train_ds_pairs, batch_size=batch_size, shuffle=True)
+        print(f"  Train pairs: {len(X_t)} (from {len(X_train_scaled)} samples)")
+
+        # Val pairs
+        Xv_t, Xv_t1, Yv_t, Cv_t, Mv_t = build_pairs(X_val_scaled, Y_val, unit_ids_val_split, cond_ids_val, horizon_mask_val)
+        if Mv_t is not None:
+             val_ds_pairs = TensorDataset(Xv_t, Xv_t1, Yv_t, Cv_t, Mv_t)
+        else:
+             val_ds_pairs = TensorDataset(Xv_t, Xv_t1, Yv_t, Cv_t)
+             
+        val_loader_pairs = DataLoader(val_ds_pairs, batch_size=batch_size, shuffle=False)
+        print(f"  Val pairs: {len(Xv_t)} (from {len(X_val_scaled)} samples)")
+    
+    # We will use train_loader_pairs for the HI loop if enabled.
+    # To keep code simple, if use_hi_dynamics is True, we essentially have two parallel loaders?
+    # Or we can just use the pairs loader for EVERYTHING?
+    # If we use pairs loader, we lose the last sample of each unit (X_t without X_t1).
+    # That is acceptable for training (very few samples lost).
+    # Let's switch to using ONLY the paired loader if use_hi_dynamics is True, to ensure every batch has the pair.
+    
+    if use_hi_dynamics:
+        print("  [Switch] Replacing standard loaders with Paired Loaders for training.")
+        train_loader = train_loader_pairs
+        val_loader = val_loader_pairs
     
     # ===================================================================
     # 5. Initialize model
@@ -464,7 +546,9 @@ def train_world_model_universal_v3(
         future_max_len=future_max_len,
         cond_dim=cond_dim,
         quantiles=quantiles,
+
         dec_ff=dec_ff,
+        use_hi_dynamics=use_hi_dynamics,
     ).to(device)
     
     num_params = sum(p.numel() for p in model.parameters())
