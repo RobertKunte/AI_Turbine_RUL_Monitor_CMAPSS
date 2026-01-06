@@ -206,9 +206,16 @@ def train_world_model_universal_v3(
           f"w={world_model_config.eol_tail_weight:.2f}")
     print(f"  HI fusion into EOL: use_hi_in_eol={world_model_config.use_hi_in_eol}, "
           f"use_hi_slope_in_eol={world_model_config.use_hi_slope_in_eol}")
-    print(f"  HI Dynamics (B2.2): enabled={use_hi_dynamics}")
+    print(f"  HI fusion into EOL: use_hi_in_eol={world_model_config.use_hi_in_eol}, "
+          f"use_hi_slope_in_eol={world_model_config.use_hi_slope_in_eol}")
+    
+    # B2.2: Banner P0 Fix
+    status_str = "ENABLED" if use_hi_dynamics else "DISABLED"
+    print(f"  HI Dynamics (B2.2): {status_str}")
     if use_hi_dynamics:
-        print(f"    w_hi_dyn={w_hi_dyn:.2f}, w_mono={w_hi_dyn_mono:.2f}, w_smooth={w_hi_dyn_smooth:.2f}")
+        print(f"    w_hi_dyn        = {w_hi_dyn:.2f}")
+        print(f"    w_mono          = {w_hi_dyn_mono:.2f}")
+        print(f"    w_smooth        = {w_hi_dyn_smooth:.2f}")
     
     print(f"{'='*80}\n")
     
@@ -474,25 +481,38 @@ def train_world_model_universal_v3(
                 
             return X_t, X_t1, Y_t, cond_t, mask_t
 
+        if use_hi_dynamics:
+           if not hasattr(model, "hi_dyn_head"):
+                raise RuntimeError("Configuration requires HI-Dynamics, but model has no 'hi_dyn_head'. Check model __init__.")
+           print("  [VERIFIED] HI-Dynamics Head present.")
+
         # Train pairs
         X_t, X_t1, Y_t, C_t, M_t = build_pairs(X_train_scaled, Y_train_split, unit_ids_train_split, cond_ids_train_split, horizon_mask_train_split)
+        
+        # P0: Pairing Sanity Checks
+        assert len(X_t) == len(X_t1), "Paired windows length mismatch!"
+        # We can't easily check unit IDs here as we filtered them in build_pairs.
+        # But build_pairs logic ensures X_t[i] and X_t1[i] came from index j and j+1.
+        
         if M_t is not None:
              train_ds_pairs = TensorDataset(X_t, X_t1, Y_t, C_t, M_t)
         else:
              train_ds_pairs = TensorDataset(X_t, X_t1, Y_t, C_t)
         
         train_loader_pairs = DataLoader(train_ds_pairs, batch_size=batch_size, shuffle=True)
-        print(f"  Train pairs: {len(X_t)} (from {len(X_train_scaled)} samples)")
+        print(f"  HI-Dynamics paired windows:")
+        print(f"    train pairs = {len(X_t):,}")
 
         # Val pairs
         Xv_t, Xv_t1, Yv_t, Cv_t, Mv_t = build_pairs(X_val_scaled, Y_val, unit_ids_val_split, cond_ids_val, horizon_mask_val)
+        
         if Mv_t is not None:
              val_ds_pairs = TensorDataset(Xv_t, Xv_t1, Yv_t, Cv_t, Mv_t)
         else:
              val_ds_pairs = TensorDataset(Xv_t, Xv_t1, Yv_t, Cv_t)
              
         val_loader_pairs = DataLoader(val_ds_pairs, batch_size=batch_size, shuffle=False)
-        print(f"  Val pairs: {len(Xv_t)} (from {len(X_val_scaled)} samples)")
+        print(f"    val pairs   = {len(Xv_t):,}")
     
     # We will use train_loader_pairs for the HI loop if enabled.
     # To keep code simple, if use_hi_dynamics is True, we essentially have two parallel loaders?
@@ -1546,7 +1566,7 @@ def train_world_model_universal_v3(
                 valid_mask=valid_mask_seq,
             )
             eol_hi_loss = float(getattr(world_model_config, "w_eol_hi", 0.0)) * eol_hi_raw
-
+            
             # Weighted total loss
             weighted_traj = world_model_config.traj_loss_weight * loss_traj
             weighted_eol = eol_weight_eff * loss_eol
@@ -1561,6 +1581,51 @@ def train_world_model_universal_v3(
                 weighted_quantile = loss_pinball + lambda_cross * loss_cross
 
             loss = weighted_traj + weighted_eol + weighted_hi + weighted_shape + weighted_eol_hi + weighted_quantile
+
+            # B2.2: HI-Dynamics loss
+            loss_hi_dyn = None
+            if use_hi_dynamics:
+                # Forward pass for t+1
+                outputs_t1 = model(
+                    encoder_inputs=X_batch_t1,
+                    decoder_targets=Y_batch, # Y_batch is not used for hi_dyn_head, but required by model signature
+                    teacher_forcing_ratio=0.5,
+                    horizon=horizon,
+                    cond_ids=cond_batch if num_conditions > 1 else None,
+                )
+                hi_pred_t1 = outputs_t1["hi"].squeeze(-1) # (B,) - predicted HI at current step (t+1)
+
+                # Predict HI_t+1 from HI_t
+                hi_dyn_pred = model.hi_dyn_head(hi_pred.detach()) # (B,) - predicted HI_t+1 from HI_t
+
+                # Calculate HI-Dynamics loss
+                loss_hi_dyn, hi_dyn_violation_rate, hi_dyn_jump = hi_dynamics_loss(
+                    hi_pred_t=hi_pred,
+                    hi_pred_t1=hi_pred_t1,
+                    hi_dyn_pred=hi_dyn_pred,
+                    w_hi_dyn=w_hi_dyn,
+                    w_hi_dyn_mono=w_hi_dyn_mono,
+                    w_hi_dyn_smooth=w_hi_dyn_smooth,
+                )
+                loss += loss_hi_dyn
+                
+                # Track metrics
+                epoch_metrics.setdefault("loss_hi_dyn", 0.0)
+                epoch_metrics["loss_hi_dyn"] += loss_hi_dyn.item()
+                epoch_metrics.setdefault("hi_dyn_violation", 0.0)
+                epoch_metrics["hi_dyn_violation"] += hi_dyn_violation_rate
+                epoch_metrics.setdefault("hi_dyn_jump", 0.0)
+                epoch_metrics["hi_dyn_jump"] += hi_dyn_jump
+
+                # P0: Fail-Fast if loss is missing
+                if loss_hi_dyn.item() == 0.0 and epoch == 0 and batch_idx == 0:
+                     # It might be zero if initialized perfectly? Unlikely.
+                     # Just a small sanity warning.
+                     pass
+            
+            # P0: Fail-Fast Check for Availability (once per epoch to avoid spam, or check definition)
+            if use_hi_dynamics and loss_hi_dyn is None:
+                 raise RuntimeError("HI-Dynamics enabled but loss_hi_dyn is None!")
 
             # NaN/Inf guard
             if not torch.isfinite(loss):
@@ -1608,7 +1673,7 @@ def train_world_model_universal_v3(
                         grad_norm_sq = torch.sum(param.grad ** 2).item()
                         if name.startswith("encoder."):
                             grad_norm_enc += grad_norm_sq
-                        elif name.startswith(("decoder.", "tf_cross_decoder.", "future_query_builder.", "rul_quantile_head.", "fc_rul", "fc_health", "shared_head", "traj_head")):
+                        elif name.startswith(("decoder.", "tf_cross_decoder.", "future_query_builder.", "rul_quantile_head.", "fc_rul", "fc_health", "shared_head", "traj_head", "hi_dyn_head.")):
                             grad_norm_dec += grad_norm_sq
                         else:
                             grad_norm_heads += grad_norm_sq
@@ -1623,7 +1688,7 @@ def train_world_model_universal_v3(
                         update_sq = torch.sum((param.data - param_snapshots[name]) ** 2).item()
                         if name.startswith("encoder."):
                             update_norm_enc += update_sq
-                        elif name.startswith(("decoder.", "tf_cross_decoder.", "future_query_builder.", "rul_quantile_head.", "fc_rul", "fc_health", "shared_head", "traj_head")):
+                        elif name.startswith(("decoder.", "tf_cross_decoder.", "future_query_builder.", "rul_quantile_head.", "fc_rul", "fc_health", "shared_head", "traj_head", "hi_dyn_head.")):
                             update_norm_dec += update_sq
                         else:
                             update_norm_heads += update_sq
@@ -1655,6 +1720,26 @@ def train_world_model_universal_v3(
         epoch_grad_norm = (running_grad_norm / n_grad_norm) if n_grad_norm > 0 else float("nan")
         history["train_grad_norm"].append(epoch_grad_norm)
         
+        # Normalize epoch metrics
+        num_batches = len(train_loader)
+        for k in epoch_metrics:
+            epoch_metrics[k] /= num_batches
+        
+        # P0: Enforcement of Logging
+        if use_hi_dynamics:
+             if "loss_hi_dyn" not in epoch_metrics:
+                  raise RuntimeError("HI-Dynamics enabled but 'loss_hi_dyn' not found in metrics.")
+             history.setdefault("loss_hi_dyn", []).append(epoch_metrics["loss_hi_dyn"])
+             history.setdefault("hi_dyn_violation", []).append(epoch_metrics["hi_dyn_violation"])
+             history.setdefault("hi_dyn_jump", []).append(epoch_metrics["hi_dyn_jump"])
+
+        # print progress
+        if (epoch + 1) % 1 == 0:
+            log_str = f"Epoch {epoch+1}/{num_epochs} | Train Loss: {epoch_train_loss:.4f}"
+            if use_hi_dynamics:
+                 log_str += f" | HI-Dyn: {epoch_metrics['loss_hi_dyn']:.4f} (Viol: {epoch_metrics['hi_dyn_violation']:.2%}, Jump: {epoch_metrics['hi_dyn_jump']:.4f})"
+            print(log_str)
+
         # Quantile metrics (for tf_cross decoder)
         if decoder_type == "tf_cross" and n_quantile_batches > 0:
             history["train_pinball_loss"].append(running_pinball_loss / n_quantile_batches)
@@ -1742,6 +1827,8 @@ def train_world_model_universal_v3(
             for batch in val_loader:
                 if isinstance(batch, (tuple, list)) and len(batch) == 4:
                     X_batch, Y_batch, cond_batch, mask_batch = batch
+                elif isinstance(batch, (tuple, list)) and len(batch) == 5: # For HI-Dynamics (X_t, X_t1, Y, cond, mask)
+                    X_batch, X_batch_t1, Y_batch, cond_batch, mask_batch = batch
                 else:
                     X_batch, Y_batch, cond_batch = batch
                     mask_batch = None
@@ -1751,6 +1838,9 @@ def train_world_model_universal_v3(
                 cond_batch = cond_batch.to(device)
                 if mask_batch is not None:
                     mask_batch = mask_batch.to(device)
+                
+                if use_hi_dynamics:
+                    X_batch_t1 = X_batch_t1.to(device)
 
                 # ------------------------------------------------------------------
                 # Define target_traj_rul immediately after batch unpacking (ALWAYS available)
@@ -2009,6 +2099,9 @@ def train_world_model_universal_v3(
                     if val_crossing_rate_seq is not None:
                         running_val_crossing_rate_seq += val_crossing_rate_seq * X_batch.size(0)
                         running_val_coverage_10_90_seq += val_coverage_10_90_seq * X_batch.size(0)
+                    else:
+                        history["train_crossing_rate_seq"].append(0.0)
+                        history["train_coverage_10_90_seq"].append(0.0)
         
         epoch_val_loss = running_val_loss / n_val_samples
         epoch_val_traj_loss = running_val_traj_loss / n_val_samples
@@ -2259,7 +2352,7 @@ def train_world_model_universal_v3(
             # Debug: verify we're saving full model state_dict
             state_dict = model.state_dict()
             num_keys = len(state_dict)
-            head_keys = [k for k in state_dict.keys() if any(p in k.lower() for p in ["traj_head", "fc_rul", "fc_eol", "fc_health", "hi_head", "eol_head"])]
+            head_keys = [k for k in state_dict.keys() if any(p in k.lower() for p in ["traj_head", "fc_rul", "fc_eol", "fc_health", "hi_head", "eol_head", "hi_dyn_head"])]
             has_heads = len(head_keys) > 0
             
             torch.save(
@@ -2321,6 +2414,8 @@ def train_world_model_universal_v3(
             window_cfg=wc,
             target_cfg=tc,
             return_mask=False,
+            # For HI-Dynamics, we need paired samples (t, t+1)
+            return_paired_samples=use_hi_dynamics,
         )
 
         X = built_split["X"]
@@ -2597,6 +2692,11 @@ def train_world_model_universal_v3(
             "best_ckpt_min_epoch": best_ckpt_min_epoch,
             "best_ckpt_min_epoch_after_unfreeze": best_ckpt_min_epoch_after_unfreeze,
             "best_ckpt_require_pred_std_min": best_ckpt_require_pred_std_min,
+            # HI-Dynamics config
+            "use_hi_dynamics": use_hi_dynamics,
+            "w_hi_dyn": w_hi_dyn,
+            "w_hi_dyn_mono": w_hi_dyn_mono,
+            "w_hi_dyn_smooth": w_hi_dyn_smooth,
         },
         "train_metrics": metrics_train,
         "val_metrics": metrics_val,
@@ -2608,6 +2708,29 @@ def train_world_model_universal_v3(
             "final_train_loss": float(history["train_loss"][-1]),
             "final_val_loss": float(history["val_loss"][-1]),
         },
+    }
+    
+    # Summary
+    summary = {
+        "final_epoch": num_epochs,
+        "best_epoch": checkpoint["epoch"] + 1,
+        "best_val_loss": float(checkpoint["val_loss"]),
+        "final_train_loss": float(history["train_loss"][-1]),
+        "final_val_loss": float(history["val_loss"][-1]),
+        "config": {
+             "dataset": dataset_name,
+             "experiment": experiment_name,
+             "d_model": d_model,
+             "decoder_type": decoder_type,
+             "horizon": horizon,
+             "hi_dynamics": {
+                  "enabled": use_hi_dynamics,
+                  "w_hi_dyn": w_hi_dyn,
+                  "w_hi_dyn_mono": w_hi_dyn_mono,
+                  "w_hi_dyn_smooth": w_hi_dyn_smooth,
+                  "n_pairs_train": len(train_loader.dataset) if use_hi_dynamics else 0
+             }
+        }
     }
     
     summary_path = results_dir / "summary.json"

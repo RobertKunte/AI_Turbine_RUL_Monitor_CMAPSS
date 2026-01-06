@@ -352,6 +352,15 @@ class WorldModelTrainingConfig:
     eol_hi_temperature: float = 0.05
     eol_hi_p_min: float = 0.2
 
+    # --------------------------------------------------
+    # B2.2: Leakage-Free HI-Dynamics Self-Supervision
+    # --------------------------------------------------
+    use_hi_dynamics: bool = False
+    w_hi_dyn: float = 0.5
+    w_hi_dyn_mono: float = 0.03
+    w_hi_dyn_smooth: float = 0.02
+    hi_dyn_huber_beta: float = 0.1
+
 
 def compute_trajectory_step_weights(
     horizon: int,

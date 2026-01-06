@@ -25,10 +25,14 @@ def compute_hi_reaction_metrics(
     Metrics:
     - t_react: First cycle where (HI < 0.98) OR (Slope < -0.001)
     - reaction_delay: t_eol - t_react
+    - reaction_delay: t_eol - t_react
     - reaction_delay_norm: (t_eol - t_react) / t_eol
     - never_reacted_rate: Fraction of units where condition never met
+    - late_reaction_rate: Fraction of units where HI never drops below 0.98 (regardless of slope)
     - mean/median reaction_delay
+    - mean/p90 overshoot_last: Prediction error at EOL (pred - true)
     """
+
     if not unit_ids:
         return {}
 
@@ -41,6 +45,8 @@ def compute_hi_reaction_metrics(
         traj = trajectories[uid]
         cycles = traj.cycles
         hi = traj.hi if hasattr(traj, "hi") and traj.hi is not None else None
+        pred_rul = traj.pred_rul if hasattr(traj, "pred_rul") and traj.pred_rul is not None else None
+        true_rul = traj.true_rul if hasattr(traj, "true_rul") and traj.true_rul is not None else None
         
         if hi is None:
             continue
@@ -57,6 +63,9 @@ def compute_hi_reaction_metrics(
         # We can ignore first few cycles? Let's take first index.
         cross_indices = np.where(hi < HI_REACT_THRESH)[0]
         t_react_thresh = cycles[cross_indices[0]] if len(cross_indices) > 0 else None
+        
+        # Late reaction: purely based on threshold
+        late_reaction = (len(cross_indices) == 0)
         
         # 2. Slope Logic (optional but good for noisy HI)
         # Compute rolling slope
@@ -83,15 +92,24 @@ def compute_hi_reaction_metrics(
             t_react = t_eol # Placeholder? Or None?
             reacted = False
             delay = 0
+            delay = 0
             delay_norm = 0.0
+            
+        # Overshoot Last (pred - true at EOL)
+        overshoot_last = 0.0
+        if pred_rul is not None and true_rul is not None:
+             # EOL is the last index
+             overshoot_last = float(pred_rul[-1] - true_rul[-1])
             
         rows.append({
             "unit_id": uid,
             "t_eol": float(t_eol),
             "t_react": float(t_react) if reacted else None,
             "reacted": reacted,
+            "late_reaction": late_reaction, # True if HI > 0.98 always
             "delay": float(delay),
-            "delay_norm": float(delay_norm)
+            "delay_norm": float(delay_norm),
+            "overshoot_last": float(overshoot_last)
         })
         
     if not rows:
@@ -104,6 +122,13 @@ def compute_hi_reaction_metrics(
     n_reacted = df["reacted"].sum()
     never_reacted_rate = 1.0 - (n_reacted / n_total)
     
+    # Late reaction rate (specific to threshold)
+    late_reaction_rate = df["late_reaction"].mean()
+    
+    # Overshoot stats
+    mean_overshoot_last = df["overshoot_last"].mean()
+    p90_overshoot_last = df["overshoot_last"].quantile(0.90)
+    
     mean_delay = df[df["reacted"]]["delay"].mean() if n_reacted > 0 else 0.0
     median_delay = df[df["reacted"]]["delay"].median() if n_reacted > 0 else 0.0
     
@@ -113,11 +138,19 @@ def compute_hi_reaction_metrics(
         "group": group_name,
         "n_units": n_total,
         "n_reacted": int(n_reacted),
+        "n_reacted": int(n_reacted),
         "never_reacted_rate": float(never_reacted_rate),
+        "late_reaction_rate": float(late_reaction_rate),
         "mean_delay": float(mean_delay),
         "median_delay": float(median_delay),
-        "mean_delay_norm": float(mean_delay_norm)
+        "mean_delay_norm": float(mean_delay_norm),
+        "mean_overshoot_last": float(mean_overshoot_last),
+        "p90_overshoot_last": float(p90_overshoot_last)
     }
+    
+    # Print summary to console for P1 visibility
+    print(f"  [{group_name}] never_reacted={never_reacted_rate:.2%}, late_reaction={late_reaction_rate:.2%}, "
+          f"overshoot_last(mean/p90)={mean_overshoot_last:.1f}/{p90_overshoot_last:.1f}")
     
     # Save CSV details
     out_dir.mkdir(parents=True, exist_ok=True)
