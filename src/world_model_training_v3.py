@@ -481,10 +481,6 @@ def train_world_model_universal_v3(
                 
             return X_t, X_t1, Y_t, cond_t, mask_t
 
-        if use_hi_dynamics:
-           if not hasattr(model, "hi_dyn_head"):
-                raise RuntimeError("Configuration requires HI-Dynamics, but model has no 'hi_dyn_head'. Check model __init__.")
-           print("  [VERIFIED] HI-Dynamics Head present.")
 
         # Train pairs
         X_t, X_t1, Y_t, C_t, M_t = build_pairs(X_train_scaled, Y_train_split, unit_ids_train_split, cond_ids_train_split, horizon_mask_train_split)
@@ -573,6 +569,16 @@ def train_world_model_universal_v3(
     
     num_params = sum(p.numel() for p in model.parameters())
     encoder_d_model = model.encoder.d_model
+    
+    # B2.2: Verify HI-Dynamics Head is present if enabled
+    if use_hi_dynamics:
+        if not hasattr(model, "hi_dyn_head") or model.hi_dyn_head is None:
+            raise RuntimeError(
+                "Configuration requires HI-Dynamics but model has no 'hi_dyn_head'. "
+                "Check WorldModelUniversalV3.__init__ for use_hi_dynamics parameter."
+            )
+        print("  [VERIFIED] HI-Dynamics Head present.")
+    
     print(f"  Model parameters: {num_params:,}")
     print(f"  Encoder: UniversalEncoderV2 (d_model={encoder_d_model}, num_layers={num_layers})")
     if decoder_type == "lstm":
