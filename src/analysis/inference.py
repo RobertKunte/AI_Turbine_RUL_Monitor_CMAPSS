@@ -425,6 +425,13 @@ def load_model_from_experiment(
                 print(f"  [Backwards Compat] Overriding num_layers: config={num_layers} -> checkpoint={inferred_num_layers}")
                 num_layers = inferred_num_layers
         
+        # Backwards compatibility: infer dim_feedforward from checkpoint
+        if "encoder.seq_encoder.layers.0.linear1.weight" in state_dict:
+            inferred_dim_ff = state_dict["encoder.seq_encoder.layers.0.linear1.weight"].shape[0]
+            if inferred_dim_ff != dim_feedforward:
+                print(f"  [Backwards Compat] Overriding dim_feedforward: config={dim_feedforward} -> checkpoint={inferred_dim_ff}")
+                dim_feedforward = inferred_dim_ff
+        
         # Backwards compatibility: infer use_hi_dynamics from checkpoint
         use_hi_dynamics = any(k.startswith("hi_dyn_head.") for k in state_dict.keys())
         if use_hi_dynamics:
