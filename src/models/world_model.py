@@ -757,6 +757,7 @@ class WorldModelUniversalV3(nn.Module):
         self.use_hi_in_eol = use_hi_in_eol
         self.use_hi_slope_in_eol = use_hi_slope_in_eol
         self.decoder_type = decoder_type
+        self.use_hi_dynamics = use_hi_dynamics
         
         # Import UniversalEncoderV2
         from .universal_encoder_v1 import UniversalEncoderV2
