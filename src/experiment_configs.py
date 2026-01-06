@@ -4937,6 +4937,13 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         return get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_hiheavy_config()
     if experiment_name == "wm_v3_fd004_b2_tf_cross_qr_b21_traj_unfreeze_all":
         return get_wm_v3_fd004_b2_tf_cross_qr_b21_traj_unfreeze_all_config()
+
+    # B2.2: HI-Dynamics
+    if experiment_name == "wm_v3_fd004_b22_hi_dyn_tf_cross_qr":
+        return get_wm_v3_fd004_b22_hi_dyn_tf_cross_qr_config()
+    # B2.3: HI-Dynamics + Trajectory
+    if experiment_name == "wm_v3_fd004_b23_hi_dyn_traj_tf_cross_qr":
+        return get_wm_v3_fd004_b23_hi_dyn_traj_tf_cross_qr_config()
     if experiment_name == "fd004_state_encoder_v3_damage_msdt_v1":
         return get_fd004_state_encoder_v3_damage_msdt_v1_config()
     if experiment_name == "fd004_transformer_latent_worldmodel_v1":
