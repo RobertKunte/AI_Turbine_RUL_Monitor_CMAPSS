@@ -261,19 +261,35 @@ def load_model_from_experiment(
         has_lstm_decoder = "decoder.weight_ih_l0" in state_dict
         has_tf_cross_decoder = any(k.startswith("tf_cross_decoder.") for k in state_dict.keys())
         has_hi_dyn_head = any(k.startswith("hi_dyn_head.") for k in state_dict.keys())
+        has_rul_quantile_head = any(k.startswith("rul_quantile_head.") for k in state_dict.keys())
+        has_future_query_builder = any(k.startswith("future_query_builder.") for k in state_dict.keys())
         has_v3_heads = (
             "fc_health.weight" in state_dict and 
             "fc_rul.weight" in state_dict and 
             "shared_head.0.weight" in state_dict and
             "traj_head.weight" in state_dict
         )
+        # Relaxed check for tf_cross models (may not have traj_head)
+        has_v3_minimal_heads = (
+            "fc_health.weight" in state_dict and 
+            "fc_rul.weight" in state_dict and 
+            "shared_head.0.weight" in state_dict
+        )
         
-        if (has_lstm_decoder or has_tf_cross_decoder or has_hi_dyn_head) and has_v3_heads:
-            # This looks like a world model v3
+        # Detect V3 with tf_cross decoder (prioritize tf_cross detection)
+        if has_tf_cross_decoder or has_rul_quantile_head or has_future_query_builder:
+            # This is definitely a V3 model with tf_cross decoder
             encoder_type = "world_model_universal_v3"
             is_world_model = True
             is_world_model_v3 = True
-            decoder_hint = "tf_cross" if has_tf_cross_decoder else "lstm"
+            print(f"Inferred world_model_universal_v3 from checkpoint state_dict (tf_cross)")
+            print(f"  tf_cross_decoder={has_tf_cross_decoder}, rul_quantile_head={has_rul_quantile_head}, hi_dyn_head={has_hi_dyn_head}")
+        elif (has_lstm_decoder or has_hi_dyn_head) and has_v3_heads:
+            # Standard V3 with LSTM decoder
+            encoder_type = "world_model_universal_v3"
+            is_world_model = True
+            is_world_model_v3 = True
+            decoder_hint = "lstm"
             print(f"Inferred world_model_universal_v3 from checkpoint state_dict (decoder={decoder_hint}, has_hi_dyn_head={has_hi_dyn_head})")
         # Check for world model v2 (has decoder and eol_head, but not fc_health/fc_rul)
         elif "decoder.weight_ih_l0" in state_dict and "eol_head.0.weight" in state_dict:
