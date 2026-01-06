@@ -257,16 +257,24 @@ def load_model_from_experiment(
     elif encoder_type is None:
         # If encoder_type is still None, try to infer from state_dict
         # Check for world model v3 first (has decoder, fc_health, fc_rul, shared_head, traj_head)
-        if ("decoder.weight_ih_l0" in state_dict and 
+        # Support both LSTM decoder and tf_cross decoder
+        has_lstm_decoder = "decoder.weight_ih_l0" in state_dict
+        has_tf_cross_decoder = any(k.startswith("tf_cross_decoder.") for k in state_dict.keys())
+        has_hi_dyn_head = any(k.startswith("hi_dyn_head.") for k in state_dict.keys())
+        has_v3_heads = (
             "fc_health.weight" in state_dict and 
             "fc_rul.weight" in state_dict and 
             "shared_head.0.weight" in state_dict and
-            "traj_head.weight" in state_dict):
+            "traj_head.weight" in state_dict
+        )
+        
+        if (has_lstm_decoder or has_tf_cross_decoder or has_hi_dyn_head) and has_v3_heads:
             # This looks like a world model v3
             encoder_type = "world_model_universal_v3"
             is_world_model = True
             is_world_model_v3 = True
-            print(f"Inferred world_model_universal_v3 from checkpoint state_dict (decoder + fc_health + fc_rul + shared_head + traj_head present)")
+            decoder_hint = "tf_cross" if has_tf_cross_decoder else "lstm"
+            print(f"Inferred world_model_universal_v3 from checkpoint state_dict (decoder={decoder_hint}, has_hi_dyn_head={has_hi_dyn_head})")
         # Check for world model v2 (has decoder and eol_head, but not fc_health/fc_rul)
         elif "decoder.weight_ih_l0" in state_dict and "eol_head.0.weight" in state_dict:
             # This looks like a world model v2
@@ -380,6 +388,32 @@ def load_model_from_experiment(
         decoder_num_layers = config.get("decoder_num_layers", 2)
         horizon = config.get("horizon", 40)
         
+        # Backwards compatibility: infer d_model from checkpoint if config value seems wrong
+        if "shared_head.0.weight" in state_dict:
+            inferred_d_model = state_dict["shared_head.0.weight"].shape[0]
+            if inferred_d_model != d_model:
+                print(f"  [Backwards Compat] Overriding d_model: config={d_model} -> checkpoint={inferred_d_model}")
+                d_model = inferred_d_model
+        
+        # Backwards compatibility: infer num_layers from checkpoint
+        encoder_layer_keys = [k for k in state_dict.keys() if k.startswith("encoder.seq_encoder.layers.")]
+        if encoder_layer_keys:
+            # Find max layer index
+            layer_indices = set()
+            for k in encoder_layer_keys:
+                parts = k.split(".")
+                if len(parts) > 3 and parts[3].isdigit():
+                    layer_indices.add(int(parts[3]))
+            inferred_num_layers = max(layer_indices) + 1 if layer_indices else num_layers
+            if inferred_num_layers != num_layers:
+                print(f"  [Backwards Compat] Overriding num_layers: config={num_layers} -> checkpoint={inferred_num_layers}")
+                num_layers = inferred_num_layers
+        
+        # Backwards compatibility: infer use_hi_dynamics from checkpoint
+        use_hi_dynamics = any(k.startswith("hi_dyn_head.") for k in state_dict.keys())
+        if use_hi_dynamics:
+            print(f"  [Backwards Compat] Detected hi_dyn_head in checkpoint, enabling use_hi_dynamics")
+        
         # Check for condition embeddings
         if "encoder.cond_emb.weight" in state_dict:
             num_conditions = state_dict["encoder.cond_emb.weight"].shape[0]
@@ -441,6 +475,8 @@ def load_model_from_experiment(
             cond_dim=cond_dim,
             quantiles=quantiles,
             dec_ff=dec_ff,
+            # B2.2: HI-Dynamics Self-Supervision
+            use_hi_dynamics=use_hi_dynamics,
         )
         
         # Load state dict for world model v3
