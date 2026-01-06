@@ -1604,18 +1604,20 @@ def train_world_model_universal_v3(
             # B2.2: HI-Dynamics loss
             loss_hi_dyn = None
             if use_hi_dynamics:
-                # Forward pass for t+1
+                # Get HI-Dynamics prediction from current forward pass (computed from enc_emb)
+                hi_dyn_pred = outputs.get("hi_dyn")  # (B, 1) - predicted HI_t+1 from enc_emb_t
+                if hi_dyn_pred is None:
+                    raise RuntimeError("HI-Dynamics enabled but model did not return 'hi_dyn' in outputs.")
+                
+                # Forward pass for t+1 to get actual HI prediction at t+1
                 outputs_t1 = model(
                     encoder_inputs=X_batch_t1,
-                    decoder_targets=Y_batch, # Y_batch is not used for hi_dyn_head, but required by model signature
+                    decoder_targets=Y_batch, # Y_batch is not used for hi_dyn, but required by model signature
                     teacher_forcing_ratio=0.5,
                     horizon=horizon,
                     cond_ids=cond_batch if num_conditions > 1 else None,
                 )
-                hi_pred_t1 = outputs_t1["hi"].squeeze(-1) # (B,) - predicted HI at current step (t+1)
-
-                # Predict HI_t+1 from HI_t
-                hi_dyn_pred = model.hi_dyn_head(hi_pred.detach()) # (B,) - predicted HI_t+1 from HI_t
+                hi_pred_t1 = outputs_t1["hi"].squeeze(-1) # (B,) - actual HI prediction at step (t+1)
 
                 # Calculate HI-Dynamics loss
                 loss_hi_dyn, hi_dyn_violation_rate, hi_dyn_jump = hi_dynamics_loss(
