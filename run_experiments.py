@@ -823,6 +823,12 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 eol_hi_threshold=world_model_params.get('eol_hi_threshold', 0.2),
                 eol_hi_temperature=world_model_params.get('eol_hi_temperature', 0.05),
                 eol_hi_p_min=world_model_params.get('eol_hi_p_min', 0.2),
+                # B2.2: Leakage-Free HI-Dynamics
+                use_hi_dynamics=bool(world_model_params.get('use_hi_dynamics', False)),
+                w_hi_dyn=float(world_model_params.get('w_hi_dyn', 0.5)),
+                w_hi_dyn_mono=float(world_model_params.get('w_hi_dyn_mono', 0.03)),
+                w_hi_dyn_smooth=float(world_model_params.get('w_hi_dyn_smooth', 0.02)),
+                hi_dyn_huber_beta=float(world_model_params.get('hi_dyn_huber_beta', 0.1)),
                 # Decoder type selection (World Model v3)
                 decoder_type=str(world_model_params.get('decoder_type', 'lstm')),
             )
