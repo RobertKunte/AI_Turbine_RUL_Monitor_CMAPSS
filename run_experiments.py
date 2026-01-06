@@ -765,6 +765,8 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             from src.world_model_training import WorldModelTrainingConfig
             
             world_model_params = config.get('world_model_params', {})
+            print(f"[DEBUG] world_model_params keys: {list(world_model_params.keys())}")
+            print(f"[DEBUG] use_hi_dynamics in params: {world_model_params.get('use_hi_dynamics')}")
             
             # Create WorldModelTrainingConfig (shared between UniversalV3 and Transformer-WorldModel V1)
             # For WorldModelV1 variants we prefer an explicit "future_horizon"
