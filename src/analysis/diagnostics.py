@@ -1018,29 +1018,44 @@ def compute_hi_trajectory_sliding(
                         rul_vals_raw.append(float(max_rul) / 2.0)
                         rul_vals.append(float(max_rul) / 2.0)
             else:
-                # EOL model returns (rul_pred, hi_last, hi_seq)
+                # EOL model returns (rul_pred, hi_last, hi_seq) or dict (WorldModelUniversalV3)
                 cond_t = torch.tensor([cond_id], dtype=torch.long).to(device)
                 out = model(x, cond_ids=cond_t)
+                
+                # Handle dict output from WorldModelUniversalV3
+                if isinstance(out, dict):
+                    # WorldModelUniversalV3 returns {'hi': ..., 'eol': ..., 'hi_seq': ..., ...}
+                    hi_last_val = float(out.get('hi', out.get('hi_last', torch.tensor(0.5)))[0].item())
+                    eol_tensor = out.get('eol', out.get('rul', torch.tensor([[max_rul / 2.0]])))
+                    if eol_tensor.ndim == 2:
+                        eol_val = float(eol_tensor[0, 0].item())
+                    else:
+                        eol_val = float(eol_tensor[0].item())
+                    eol_val_raw = max(0.0, float(eol_val))
+                    eol_val_clip = min(float(max_rul), eol_val_raw)
+                    hi_vals.append(hi_last_val)
+                    rul_vals_raw.append(eol_val_raw)
+                    rul_vals.append(eol_val_clip)
                 # Newer Transformer variants may append rul_sigma (v5u):
                 #   (rul_pred, hi_last, hi_seq, rul_sigma)
-                if isinstance(out, (tuple, list)) and len(out) >= 3:
+                elif isinstance(out, (tuple, list)) and len(out) >= 3:
                     rul_pred, hi_last, hi_seq = out[0], out[1], out[2]
+                    # HI_last ist der letzte Zeitschritt im Fenster
+                    hi_last_val = float(hi_seq[0, -1].item())
+                    # RUL prediction for this window
+                    if rul_pred.ndim == 2:
+                        eol_val = float(rul_pred[0, 0].item())
+                    else:
+                        eol_val = float(rul_pred[0].item())
+                    eol_val_raw = max(0.0, float(eol_val))
+                    eol_val_clip = min(float(max_rul), eol_val_raw)
+                    hi_vals.append(hi_last_val)
+                    rul_vals_raw.append(eol_val_raw)
+                    rul_vals.append(eol_val_clip)
                 else:
                     raise RuntimeError(
                         f"Unexpected encoder output type/len in sliding HI: {type(out)}"
                     )
-                # HI_last ist der letzte Zeitschritt im Fenster
-                hi_last_val = float(hi_seq[0, -1].item())
-                # RUL prediction for this window
-                if rul_pred.ndim == 2:
-                    eol_val = float(rul_pred[0, 0].item())
-                else:
-                    eol_val = float(rul_pred[0].item())
-                eol_val_raw = max(0.0, float(eol_val))
-                eol_val_clip = min(float(max_rul), eol_val_raw)
-                hi_vals.append(hi_last_val)
-                rul_vals_raw.append(eol_val_raw)
-                rul_vals.append(eol_val_clip)
                 
                 # Extract damage HI if damage_head is available
                 if has_damage_head:
