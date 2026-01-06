@@ -312,6 +312,7 @@ def generate_failure_case_report(
     """
     print(f"\n[FailureCases] Generating report for {experiment_dir.name}...")
     failure_dir = experiment_dir / "failure_cases"
+    failure_dir.mkdir(parents=True, exist_ok=True)
     
     # 1. Compute errors & Rank
     df = compute_last_errors_per_unit(eol_metrics)
