@@ -108,6 +108,11 @@ def forward_rul_only(model: nn.Module, X: torch.Tensor, cond_ids: Optional[torch
     # Check if model uses condition embeddings
     use_cond_emb = getattr(model, 'use_condition_embedding', False)
     
+    # Also check for WorldModelUniversalV3 which uses num_conditions attribute
+    num_conditions = getattr(model, 'num_conditions', None)
+    if num_conditions is not None and num_conditions > 1:
+        use_cond_emb = True
+    
     # For UniversalEncoderV2, cond_ids are always required if num_conditions > 1
     # But checking specific model type is brittle; rely on the flag + argument presence
     
