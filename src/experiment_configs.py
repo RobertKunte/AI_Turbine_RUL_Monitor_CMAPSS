@@ -2139,6 +2139,9 @@ def get_wm_v3_fd004_b22_hi_dyn_tf_cross_qr_config() -> ExperimentConfig:
     # Ensure max_rul = 125 (cap 125)
     wmp["max_rul"] = 125
     
+    # User Request: Set num_epochs to 50
+    cfg.setdefault("training_params", {})["num_epochs"] = 50
+    
     # Keep other settings from base (quantiles, lambda_cross, b2_loss_mode="last", etc.)
     
     return cfg
