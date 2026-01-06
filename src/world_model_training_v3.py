@@ -55,6 +55,7 @@ from src.loss import (
     hi_early_slope_regularizer,
     hi_curvature_loss,
     hi_eol_consistency_loss,
+    hi_dynamics_loss,
 )
 from src.training_utils import compute_global_trend_loss
 from src.eval.eol_eval import evaluate_eol_metrics

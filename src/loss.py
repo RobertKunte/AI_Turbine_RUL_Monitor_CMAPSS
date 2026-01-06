@@ -898,3 +898,74 @@ def rul_asymmetric_weighted_loss(pred, target,
     
     weighted_loss = weights * base_loss
     return weighted_loss.mean()
+
+
+def hi_dynamics_loss(
+    hi_pred_t: torch.Tensor,
+    hi_pred_t1: torch.Tensor,
+    hi_dyn_pred: torch.Tensor,
+    w_hi_dyn: float = 0.5,
+    w_hi_dyn_mono: float = 0.03,
+    w_hi_dyn_smooth: float = 0.02,
+    huber_beta: float = 0.1,
+) -> Tuple[torch.Tensor, float, float]:
+    """
+    Compute HI-Dynamics self-supervised loss for B2.2.
+    
+    The dynamics head predicts HI at t+1 from encoder state at t.
+    This loss compares:
+    - hi_dyn_pred: Model's prediction of HI at t+1 (from hi_dyn_head applied to enc_emb_t)
+    - hi_pred_t1: Actual model HI prediction at t+1 (from forward pass on X_t1)
+    
+    Components:
+    1. Huber loss between hi_dyn_pred and hi_pred_t1 (main self-supervision)
+    2. Monotonicity penalty: hi_dyn_pred should be <= hi_pred_t (HI should decrease)
+    3. Smoothness penalty: |hi_dyn_pred - hi_pred_t| should not be too large (no jumps)
+    
+    Args:
+        hi_pred_t: (B,) or (B,1) HI prediction at time t
+        hi_pred_t1: (B,) or (B,1) actual HI prediction at time t+1
+        hi_dyn_pred: (B,) or (B,1) dynamics head prediction of HI at t+1
+        w_hi_dyn: Weight for main Huber loss
+        w_hi_dyn_mono: Weight for monotonicity penalty
+        w_hi_dyn_smooth: Weight for smoothness penalty
+        huber_beta: Huber loss delta parameter
+    
+    Returns:
+        Tuple of:
+        - loss: Total weighted loss (Tensor)
+        - violation_rate: Fraction of samples where hi_dyn_pred > hi_pred_t (float)
+        - jump_p95: 95th percentile of |hi_dyn_pred - hi_pred_t| (float)
+    """
+    # Ensure shapes: flatten to (B,)
+    hi_pred_t = hi_pred_t.view(-1).float()
+    hi_pred_t1 = hi_pred_t1.view(-1).float()
+    hi_dyn_pred = hi_dyn_pred.view(-1).float()
+    
+    # 1. Main Huber loss between dynamics prediction and actual t+1 HI
+    huber_loss = F.smooth_l1_loss(hi_dyn_pred, hi_pred_t1.detach(), beta=huber_beta)
+    
+    # 2. Monotonicity penalty: hi_dyn_pred should be <= hi_pred_t
+    # Penalize when predicted next HI is higher than current HI (HI should decrease over time)
+    mono_violation = torch.relu(hi_dyn_pred - hi_pred_t.detach())
+    mono_loss = mono_violation.mean()
+    
+    # Violation rate for diagnostics
+    violation_rate = (hi_dyn_pred > hi_pred_t.detach()).float().mean().item()
+    
+    # 3. Smoothness penalty: penalize large jumps
+    jump = torch.abs(hi_dyn_pred - hi_pred_t.detach())
+    smooth_loss = jump.mean()
+    
+    # Jump p95 for diagnostics
+    if len(jump) > 0:
+        jump_sorted = torch.sort(jump)[0]
+        p95_idx = min(int(0.95 * len(jump)), len(jump) - 1)
+        jump_p95 = jump_sorted[p95_idx].item()
+    else:
+        jump_p95 = 0.0
+    
+    # Total loss
+    total_loss = w_hi_dyn * huber_loss + w_hi_dyn_mono * mono_loss + w_hi_dyn_smooth * smooth_loss
+    
+    return total_loss, violation_rate, jump_p95
