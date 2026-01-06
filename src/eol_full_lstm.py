@@ -823,7 +823,11 @@ def evaluate_on_test_data(
     
     # Check if model uses condition embeddings
     use_cond_emb = getattr(model, 'use_condition_embedding', False)
-    
+    # Also check for WorldModelUniversalV3 which uses num_conditions attribute
+    num_conditions = getattr(model, 'num_conditions', None)
+    if num_conditions is not None and num_conditions > 1:
+        use_cond_emb = True
+
     with torch.no_grad():
         X_test = X_test.to(device)
         cond_ids_test_tensor = cond_ids_test.to(device) if use_cond_emb and cond_ids_test is not None else None
