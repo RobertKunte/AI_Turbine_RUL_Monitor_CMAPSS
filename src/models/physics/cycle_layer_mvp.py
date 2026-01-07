@@ -66,6 +66,7 @@ class CycleLayerMVP(nn.Module):
         cp_t: float = 1150.0,
         t2_ambient: float = 518.67,
         p2_ambient: float = 14.7,
+        output_normalize: bool = True,
     ):
         super().__init__()
         self.n_targets = n_targets
@@ -114,6 +115,29 @@ class CycleLayerMVP(nn.Module):
             # Bounded PR range for head mode
             self.register_buffer("pr_min", torch.tensor([1.1, 1.1, 5.0]))
             self.register_buffer("pr_max", torch.tensor([2.0, 3.0, 20.0]))
+        
+        # =====================================================================
+        # Output Normalization Layer (fixes scale mismatch with StandardScaler'd targets)
+        # =====================================================================
+        # CycleLayerMVP outputs in raw thermodynamic units (°R, PSIA).
+        # Training targets are StandardScaler'd (mean≈0, std≈1).
+        # This layer learns affine transform: normalized = (raw - mean) / std
+        #
+        # Initialize with typical CMAPSS sensor ranges:
+        # T24 (Sensor2):  ~642 °R,    std ~5-10
+        # T30 (Sensor3):  ~1590 °R,   std ~6
+        # P30 (Sensor7):  ~553 PSIA,  std ~10
+        # T50 (Sensor4):  ~1408 °R,   std ~7
+        self.output_normalize = output_normalize
+        if output_normalize:
+            # Learnable mean/std for output normalization
+            # Initialize with approximate CMAPSS sensor statistics
+            init_mean = torch.tensor([642.0, 1590.0, 553.0, 1408.0])
+            init_std = torch.tensor([10.0, 10.0, 15.0, 10.0])
+            self.output_mean = nn.Parameter(init_mean)
+            self.output_std = nn.Parameter(init_std)
+            # Flag to print debug stats once
+            self._debug_printed = False
     
     def _safe_lower_bound(
         self,
@@ -404,6 +428,26 @@ class CycleLayerMVP(nn.Module):
         
         # Reshape back to (B, T, 4)
         cycle_pred = cycle_pred.reshape(B, T, self.n_targets)
+        
+        # =====================================================================
+        # Output Normalization: map raw thermo units to normalized space
+        # =====================================================================
+        if self.output_normalize:
+            # Apply learnable affine normalization: (raw - mean) / std
+            # Ensures cycle_pred is in same scale as StandardScaler'd targets
+            cycle_pred_raw = cycle_pred.clone()  # Keep for debug
+            cycle_pred = (cycle_pred - self.output_mean) / (self.output_std + 1e-6)
+            
+            # Debug: print scale stats once
+            if not self._debug_printed and self.training:
+                with torch.no_grad():
+                    print("\n[CycleLayerMVP] Scale Debug (epoch 0 batch):")
+                    print(f"  Raw pred stats: mean={cycle_pred_raw.mean():.2f}, std={cycle_pred_raw.std():.2f}")
+                    print(f"  Per-sensor raw mean: {[f'{cycle_pred_raw[..., i].mean():.1f}' for i in range(4)]}")
+                    print(f"  Output mean param: {self.output_mean.data.tolist()}")
+                    print(f"  Output std param:  {self.output_std.data.tolist()}")
+                    print(f"  Normalized pred: mean={cycle_pred.mean():.4f}, std={cycle_pred.std():.4f}")
+                self._debug_printed = True
         
         if not is_seq:
             cycle_pred = cycle_pred.squeeze(1)  # (B, n_targets)

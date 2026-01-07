@@ -55,6 +55,49 @@ def compute_power_balance_penalty(
     return total_penalty.mean()
 
 
+def compute_theta_prior_loss(
+    m_t: torch.Tensor,
+    upper_bound: float = 0.995,
+    lower_bound: float = 0.90,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compute anti-saturation prior for theta (degradation modifiers).
+    
+    Penalizes m(t) values that approach the upper bound (prevents m=1 collapse)
+    and optionally pushes away from lower bound.
+    
+    L_prior = mean(ReLU(m_t - upper_bound)) + 0.1 * mean(ReLU(lower_bound - m_t))
+    
+    Args:
+        m_t: Degradation modifiers (B, T, 6) or (B, 6)
+        upper_bound: Soft upper limit (default 0.995)
+        lower_bound: Soft lower limit (default 0.90)
+        mask: Optional mask (B, T) or (B, T, 1)
+        
+    Returns:
+        Scalar prior loss
+    """
+    # Upper bound penalty: ReLU(m_t - upper_bound)
+    upper_penalty = F.relu(m_t - upper_bound)
+    
+    # Lower bound penalty (weaker): 0.1 * ReLU(lower_bound - m_t)
+    lower_penalty = 0.1 * F.relu(lower_bound - m_t)
+    
+    total_penalty = upper_penalty + lower_penalty
+    
+    # Average over theta dimensions
+    total_penalty = total_penalty.mean(dim=-1)  # (B, T) or (B,)
+    
+    if mask is not None:
+        if mask.dim() == 3 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)  # (B, T)
+        total_penalty = total_penalty * mask
+        valid_count = mask.sum().clamp(min=1.0)
+        return total_penalty.sum() / valid_count
+    
+    return total_penalty.mean()
+
+
 def compute_cycle_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -317,6 +360,7 @@ class CycleBranchLoss(torch.nn.Module):
         self.lambda_smooth = lambda_smooth
         self.lambda_mono = lambda_mono
         self.lambda_power_balance = lambda_power_balance
+        self.lambda_theta_prior = getattr(self, 'lambda_theta_prior', 0.001)  # Anti-saturation
         self.cycle_loss_type = cycle_loss_type
         self.cycle_huber_beta = cycle_huber_beta
         self.mono_on_eta = mono_on_eta
@@ -382,12 +426,16 @@ class CycleBranchLoss(torch.nn.Module):
         # Apply curriculum to cycle loss weight (ramp up over epochs)
         lambda_cycle_curr = self.lambda_cycle * epoch_frac
         
+        # Theta prior (anti-saturation)
+        l_theta_prior = compute_theta_prior_loss(theta_seq, mask=mask)
+        
         # Combine
         total = (
             lambda_cycle_curr * l_cycle +
             self.lambda_smooth * l_smooth +
             self.lambda_mono * l_mono +
-            self.lambda_power_balance * l_power
+            self.lambda_power_balance * l_power +
+            self.lambda_theta_prior * l_theta_prior
         )
         
         components = {
@@ -395,6 +443,7 @@ class CycleBranchLoss(torch.nn.Module):
             "theta_smooth_loss": float(l_smooth.item()),
             "theta_mono_loss": float(l_mono.item()),
             "power_balance_loss": float(l_power.item()),
+            "theta_prior_loss": float(l_theta_prior.item()),
             "lambda_cycle_effective": lambda_cycle_curr,
             "total_cycle_branch_loss": float(total.item()),
         }

@@ -248,6 +248,18 @@ def cycle_branch_forward(
         "eta_nom": eta_nom,
         "m_t": m_t,
     }
+    
+    # Debug: print scale stats once at epoch 0
+    if epoch == 0 and not hasattr(components, '_target_debug_printed'):
+        with torch.no_grad():
+            print("\n[CycleBranch] Target Scale Debug (epoch 0):")
+            print(f"  cycle_target: mean={cycle_target.mean():.4f}, std={cycle_target.std():.4f}")
+            print(f"  cycle_pred:   mean={cycle_pred.mean():.4f}, std={cycle_pred.std():.4f}")
+            target_names = ["T24", "T30", "P30", "T50"]
+            for i, name in enumerate(target_names[:cycle_target.shape[-1]]):
+                print(f"    {name} target: mean={cycle_target[..., i].mean():.4f}, std={cycle_target[..., i].std():.4f}")
+                print(f"    {name} pred:   mean={cycle_pred[..., i].mean():.4f}, std={cycle_pred[..., i].std():.4f}")
+        components._target_debug_printed = True
     intermediates.update(layer_inter)
     
     return cycle_pred, cycle_target, m_t, eta_nom, intermediates
