@@ -346,6 +346,7 @@ def cycle_branch_loss(
         epoch_frac=epoch_frac,
         intermediates=intermediates,
         cond_ids=cond_ids,
+        epoch=epoch,
     )
     
     return total_loss, metrics

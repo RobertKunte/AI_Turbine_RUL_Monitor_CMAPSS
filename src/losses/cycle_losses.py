@@ -398,6 +398,7 @@ class CycleBranchLoss(torch.nn.Module):
         epoch_frac: float = 1.0,
         intermediates: Optional[dict] = None,
         cond_ids: Optional[torch.Tensor] = None,
+        epoch: int = 0,
     ) -> Tuple[torch.Tensor, dict]:
         """Compute combined cycle branch loss.
         
@@ -409,6 +410,7 @@ class CycleBranchLoss(torch.nn.Module):
             epoch_frac: Fraction of total epochs (for curriculum)
             intermediates: Optional dict with work_balance etc.
             cond_ids: Condition IDs (B,) for condition-wise normalization
+            epoch: Current epoch for epoch-specific debug
             
         Returns:
             total_loss: Scalar combined loss
@@ -442,35 +444,40 @@ class CycleBranchLoss(torch.nn.Module):
                 # "scaled" mode: target is already StandardScaled, use as-is
                 target_used = cycle_target
             
-            # Debug prints and sanity guard (once)
-            if not self._debug_printed:
+            # Debug prints at epochs 0 and 2
+            should_debug = (epoch == 0 and not self._debug_printed) or (epoch == 2)
+            if should_debug:
                 with torch.no_grad():
                     tgt_mean = cycle_target.mean().item()
                     tgt_std = cycle_target.std().item()
                     
-                    print(f"\n[CycleBranchLoss] Space Alignment Debug (cycle_target_space={self.cycle_target_space}):")
+                    print(f"\n[CycleBranchLoss] Epoch {epoch} Debug (cycle_target_space={self.cycle_target_space}):")
                     print(f"  cycle_pred (raw): mean={cycle_pred.mean():.2f}, std={cycle_pred.std():.2f}")
                     print(f"  cycle_target:     mean={tgt_mean:.4f}, std={tgt_std:.4f}")
                     print(f"  pred_used:        mean={pred_used.mean():.4f}, std={pred_used.std():.4f}")
                     print(f"  target_used:      mean={target_used.mean():.4f}, std={target_used.std():.4f}")
                     
-                    # Sanity guard
-                    target_looks_scaled = abs(tgt_mean) < 0.5 and 0.3 < tgt_std < 3.0
-                    target_looks_raw = abs(tgt_mean) > 50 or tgt_std > 20
-                    
-                    if self.cycle_target_space == "raw" and target_looks_scaled:
-                        print(f"  ⚠️ WARNING: cycle_target_space='raw' but target looks already scaled!")
-                        print(f"     Consider setting cycle_target_space='scaled' in config.")
-                    
-                    if self.cycle_target_space == "scaled" and target_looks_raw:
-                        print(f"  ⚠️ WARNING: cycle_target_space='scaled' but target looks raw!")
-                        print(f"     Consider setting cycle_target_space='raw' in config.")
-                    
-                    # Per-sensor check
+                    # Per-sensor stats
+                    print(f"  Per-sensor (scaled space):")
                     for i, name in enumerate(self.target_names[:cycle_pred.shape[-1]]):
-                        print(f"    {name}: pred_used={pred_used[..., i].mean():.4f}, target_used={target_used[..., i].mean():.4f}")
+                        pred_m = pred_used[..., i].mean().item()
+                        pred_s = pred_used[..., i].std().item()
+                        tgt_m = target_used[..., i].mean().item()
+                        tgt_s = target_used[..., i].std().item()
+                        delta = abs(pred_m - tgt_m)
+                        print(f"    {name}: pred_used({pred_m:.4f}±{pred_s:.2f}) vs target_used({tgt_m:.4f}±{tgt_s:.2f}) Δmean={delta:.4f}")
                     
-                self._debug_printed = True
+                    # Theta stats
+                    theta_mean = theta_seq.mean().item()
+                    theta_min = theta_seq.min().item()
+                    theta_max = theta_seq.max().item()
+                    near_upper = (theta_seq > 0.99).float().mean().item() * 100
+                    near_lower = (theta_seq < 0.91).float().mean().item() * 100
+                    sat_frac = near_upper + near_lower
+                    print(f"  Theta: mean={theta_mean:.4f}, range=[{theta_min:.4f}, {theta_max:.4f}], sat_frac={sat_frac:.1f}%")
+                    
+                    if epoch == 0:
+                        self._debug_printed = True
         
         # Cycle reconstruction loss (in normalized space)
         l_cycle = compute_cycle_loss(

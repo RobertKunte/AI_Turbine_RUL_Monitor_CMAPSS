@@ -5272,15 +5272,16 @@ def get_wm_v3_fd004_b22_cycle_config() -> ExperimentConfig:
         "targets": ["T24", "T30", "P30", "T50"],
         "optional_witnesses": ["Nf", "Nc", "Ps30"],
         
-        # Loss weights
-        "lambda_cycle": 0.1,         # Start conservative
-        "lambda_theta_smooth": 0.1,  # Stronger smoothness for interpretation
-        "lambda_theta_mono": 0.05,   # Weak monotonicity
-        "lambda_power_balance": 0.01,# Weak power balance
+        # Loss weights (increased for diagnostic training)
+        "lambda_cycle": 1.0,           # Was 0.1; stronger cycle loss
+        "lambda_theta_smooth": 0.1,    # Smoothness for interpretation
+        "lambda_theta_mono": 0.05,     # Weak monotonicity
+        "lambda_power_balance": 0.01,  # Weak power balance
+        "lambda_theta_prior": 0.003,   # Anti-saturation prior
         
         "cycle_loss_type": "huber",
         "cycle_huber_beta": 0.1,
-        "cycle_ramp_epochs": 10,     # Safe 10-epoch ramp
+        "cycle_ramp_epochs": 3,        # Fast ramp for diagnostic (was 10)
         
         # Architecture
         "nominal_head_type": "mlp",
