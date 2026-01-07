@@ -5263,11 +5263,11 @@ def get_wm_v3_fd004_b22_cycle_config() -> ExperimentConfig:
     - Provide physically interpretable m(t) alongside HI.
     """
     config = get_wm_v3_fd004_b22_hi_dyn_tf_cross_qr_config()
-    config.experiment_name = "wm_v3_fd004_b22_cycle"
+    config["experiment_name"] = "wm_v3_fd004_b22_cycle"
     
     # Cycle Branch Parameters
     # Using defaults similar to test but tuned for B2.2 integration safety
-    config.world_model_params["cycle_branch_params"] = {
+    config["world_model_params"]["cycle_branch_params"] = {
         "enable": True,
         "targets": ["T24", "T30", "P30", "T50"],
         "optional_witnesses": ["Nf", "Nc", "Ps30"],
