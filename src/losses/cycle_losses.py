@@ -359,6 +359,7 @@ class CycleBranchLoss(torch.nn.Module):
         target_names: Optional[list[str]] = None,
         cycle_target_mean: Optional[torch.Tensor] = None,
         cycle_target_std: Optional[torch.Tensor] = None,
+        cycle_target_space: str = "scaled",  # "scaled" or "raw"
     ):
         super().__init__()
         self.lambda_cycle = lambda_cycle
@@ -372,6 +373,7 @@ class CycleBranchLoss(torch.nn.Module):
         self.mono_on_dp = mono_on_dp
         self.mono_eps = mono_eps
         self.target_names = target_names or ["T24", "T30", "P30", "T50"]
+        self.cycle_target_space = cycle_target_space
         
         # Condition-wise normalization buffers (NOT learnable)
         if cycle_target_mean is not None:
@@ -401,7 +403,7 @@ class CycleBranchLoss(torch.nn.Module):
         
         Args:
             cycle_pred: Predicted sensors (B, T, n_targets) - RAW thermodynamic units
-            cycle_target: Target sensors (B, T, n_targets) - must be in SAME space as pred
+            cycle_target: Target sensors (B, T, n_targets) - StandardScaled if cycle_target_space='scaled'
             theta_seq: Degradation modifiers (B, T, 6)
             mask: Optional valid mask (B, T)
             epoch_frac: Fraction of total epochs (for curriculum)
@@ -415,8 +417,8 @@ class CycleBranchLoss(torch.nn.Module):
         # =====================================================================
         # Condition-wise normalization (Option A: fixed, no learnable params)
         # =====================================================================
-        pred_norm = cycle_pred
-        target_norm = cycle_target
+        pred_used = cycle_pred
+        target_used = cycle_target
         
         if self.cycle_target_mean is not None and self.cycle_target_std is not None and cond_ids is not None:
             # Get mean/std for each batch element based on cond_id
@@ -428,26 +430,51 @@ class CycleBranchLoss(torch.nn.Module):
                 mean = mean.unsqueeze(1)  # (B, 1, 4)
                 std = std.unsqueeze(1)    # (B, 1, 4)
             
-            # Normalize both pred and target
             eps = 1e-6
-            pred_norm = (cycle_pred - mean) / (std + eps)
-            target_norm = (cycle_target - mean) / (std + eps)
             
-            # Debug prints (once)
+            # Always normalize pred (raw -> scaled)
+            pred_used = (cycle_pred - mean) / (std + eps)
+            
+            # Only normalize target if in "raw" mode
+            if self.cycle_target_space == "raw":
+                target_used = (cycle_target - mean) / (std + eps)
+            else:
+                # "scaled" mode: target is already StandardScaled, use as-is
+                target_used = cycle_target
+            
+            # Debug prints and sanity guard (once)
             if not self._debug_printed:
                 with torch.no_grad():
-                    print("\n[CycleBranchLoss] Condition-wise Normalization Debug:")
+                    tgt_mean = cycle_target.mean().item()
+                    tgt_std = cycle_target.std().item()
+                    
+                    print(f"\n[CycleBranchLoss] Space Alignment Debug (cycle_target_space={self.cycle_target_space}):")
                     print(f"  cycle_pred (raw): mean={cycle_pred.mean():.2f}, std={cycle_pred.std():.2f}")
-                    print(f"  cycle_target (raw): mean={cycle_target.mean():.2f}, std={cycle_target.std():.2f}")
-                    print(f"  pred_norm: mean={pred_norm.mean():.4f}, std={pred_norm.std():.4f}")
-                    print(f"  target_norm: mean={target_norm.mean():.4f}, std={target_norm.std():.4f}")
+                    print(f"  cycle_target:     mean={tgt_mean:.4f}, std={tgt_std:.4f}")
+                    print(f"  pred_used:        mean={pred_used.mean():.4f}, std={pred_used.std():.4f}")
+                    print(f"  target_used:      mean={target_used.mean():.4f}, std={target_used.std():.4f}")
+                    
+                    # Sanity guard
+                    target_looks_scaled = abs(tgt_mean) < 0.5 and 0.3 < tgt_std < 3.0
+                    target_looks_raw = abs(tgt_mean) > 50 or tgt_std > 20
+                    
+                    if self.cycle_target_space == "raw" and target_looks_scaled:
+                        print(f"  ⚠️ WARNING: cycle_target_space='raw' but target looks already scaled!")
+                        print(f"     Consider setting cycle_target_space='scaled' in config.")
+                    
+                    if self.cycle_target_space == "scaled" and target_looks_raw:
+                        print(f"  ⚠️ WARNING: cycle_target_space='scaled' but target looks raw!")
+                        print(f"     Consider setting cycle_target_space='raw' in config.")
+                    
+                    # Per-sensor check
                     for i, name in enumerate(self.target_names[:cycle_pred.shape[-1]]):
-                        print(f"    {name} raw_pred={cycle_pred[..., i].mean():.2f}, norm_pred={pred_norm[..., i].mean():.4f}")
+                        print(f"    {name}: pred_used={pred_used[..., i].mean():.4f}, target_used={target_used[..., i].mean():.4f}")
+                    
                 self._debug_printed = True
         
         # Cycle reconstruction loss (in normalized space)
         l_cycle = compute_cycle_loss(
-            pred_norm, target_norm,
+            pred_used, target_used,
             loss_type=self.cycle_loss_type,
             huber_beta=self.cycle_huber_beta,
             mask=mask,
