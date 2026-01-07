@@ -101,7 +101,76 @@ def build_seq2seq_samples_from_df(
 # ===================================================================
 
 from dataclasses import dataclass, field
-from typing import Optional, Literal
+from typing import Optional, Literal, List
+
+
+@dataclass
+class CycleBranchConfig:
+    """Configuration for the auxiliary physics cycle branch (Mode 1 Factorized).
+    
+    This enables a differentiable 0D thermodynamic cycle model that predicts
+    sensor outputs from operating conditions and degradation parameters.
+    
+    Mode 1 Factorized: η_eff = η_nom(ops) × m(t)
+    where m(t) are slow-varying degradation modifiers.
+    """
+    # Master switch
+    enable: bool = False
+    
+    # Semantic target sensor names (resolved via cmapss_sensors.yaml)
+    targets: List[str] = field(default_factory=lambda: ["T24", "T30", "P30", "T50"])
+    
+    # --------------------------------------------------
+    # Loss weights
+    # --------------------------------------------------
+    lambda_cycle: float = 0.1
+    lambda_theta_smooth: float = 0.05
+    lambda_theta_mono: float = 0.01
+    cycle_loss_type: Literal["mse", "huber"] = "huber"
+    cycle_huber_beta: float = 0.1
+    cycle_ramp_epochs: int = 10  # Curriculum: ramp lambda_cycle from 0 to full
+    
+    # --------------------------------------------------
+    # Monotonicity settings (separate flags, both default OFF)
+    # --------------------------------------------------
+    mono_on_eta_mods: bool = False  # Apply mono to eta modifiers (m_fan..m_lpt)
+    mono_on_dp_mod: bool = False    # Apply mono to dp modifier (m_dp_comb)
+    mono_eps: float = 1e-4          # Tolerance before penalizing increases
+    
+    # --------------------------------------------------
+    # Degradation modifier bounds (sigmoid-scaled)
+    # --------------------------------------------------
+    m_bounds_eta: tuple = (0.85, 1.00)  # [m_fan, m_lpc, m_hpc, m_hpt, m_lpt]
+    m_bounds_dp: tuple = (0.90, 1.00)   # m_dp_comb
+    
+    # --------------------------------------------------
+    # NominalHead configuration
+    # --------------------------------------------------
+    nominal_head_type: Literal["table", "mlp"] = "table"  # 'table' preferred for multi-cond
+    nominal_head_hidden: int = 16
+    eta_nom_bounds: tuple = (0.80, 0.99)
+    
+    # --------------------------------------------------
+    # dp_nom constant (combustor pressure drop ratio)
+    # --------------------------------------------------
+    dp_nom_constant: float = 0.95
+    
+    # --------------------------------------------------
+    # Pressure ratio handling (MVP: per-condition constants)
+    # --------------------------------------------------
+    pr_mode: Literal["per_cond", "head"] = "per_cond"
+    pr_head_hidden: int = 16
+    
+    # --------------------------------------------------
+    # Optional degradation warmup (freeze m=1 for k epochs)
+    # --------------------------------------------------
+    deg_warmup_epochs: int = 0
+    
+    # --------------------------------------------------
+    # ParamHeadTheta6 architecture
+    # --------------------------------------------------
+    param_head_hidden: int = 64
+    param_head_num_layers: int = 2
 
 
 @dataclass
@@ -360,6 +429,11 @@ class WorldModelTrainingConfig:
     w_hi_dyn_mono: float = 0.03
     w_hi_dyn_smooth: float = 0.02
     hi_dyn_huber_beta: float = 0.1
+
+    # --------------------------------------------------
+    # B-Track: Differentiable Cycle Branch (Option B)
+    # --------------------------------------------------
+    cycle_branch: CycleBranchConfig = field(default_factory=CycleBranchConfig)
 
 
 def compute_trajectory_step_weights(

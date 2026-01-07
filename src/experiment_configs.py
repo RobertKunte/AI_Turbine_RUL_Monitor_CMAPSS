@@ -5203,5 +5203,46 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
         elif "small_regularized" in experiment_name or "small" in experiment_name:
             return get_fd004_transformer_small_regularized()
     
+    if experiment_name == "fd004_transformer_worldmodel_v1_cycle_test":
+        return get_fd004_transformer_worldmodel_v1_cycle_test_config()
+    
     raise ValueError(f"Could not find experiment config for: {experiment_name}")
+
+
+def get_fd004_transformer_worldmodel_v1_cycle_test_config() -> ExperimentConfig:
+    """
+    Cycle Branch Integration Test Config (FD004).
+    
+    Based on 'fd004_transformer_worldmodel_v1_h10_eolfocus', but enables
+    the differentiable cycle branch to predict sensor values from ops + m(t).
+    """
+    base = get_fd004_transformer_worldmodel_v1_h10_eolfocus_config()
+    config = copy.deepcopy(base)
+    
+    config["experiment_name"] = "fd004_transformer_worldmodel_v1_cycle_test"
+    
+    # Add cycle branch parameters to world_model_params
+    # These will be parsed by run_experiments.py to build CycleBranchConfig
+    config["world_model_params"]["cycle_branch_params"] = {
+        "enable": True,
+        "targets": ["T24", "T30", "P30", "T50"],
+        "lambda_cycle": 0.1,
+        "lambda_theta_smooth": 0.05,
+        "lambda_theta_mono": 0.0,
+        "cycle_loss_type": "huber",
+        "cycle_huber_beta": 0.1,
+        "cycle_ramp_epochs": 10,
+        "nominal_head_type": "mlp",  # Simple MLP for test stability
+        "nominal_head_hidden": 32,
+        "param_head_hidden": 64,
+        "param_head_num_layers": 2,
+        "pr_mode": "head",  # Learnable PRs
+        "pr_head_hidden": 16,
+        "dp_nom_constant": 0.95,
+        "mono_on_eta_mods": True,
+        "mono_on_dp_mod": False,
+        "mono_eps": 1e-4,
+    }
+    
+    return config
 

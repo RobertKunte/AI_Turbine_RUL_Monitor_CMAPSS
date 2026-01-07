@@ -1712,6 +1712,11 @@ def run_inference_for_experiment(
          use_cond_emb = getattr(model.encoder, "use_condition_embedding", False) or \
                         getattr(model.encoder, "use_condition_fusion", False)
     
+    # Also check for WorldModelUniversalV3 which uses num_conditions attribute
+    num_conditions = getattr(model, 'num_conditions', None)
+    if num_conditions is not None and num_conditions > 1:
+        use_cond_emb = True
+    
     # If model uses condition embeddings, we MUST provide them if available
     # If cond_ids_split is None but model needs them, we have a problem (handled in forward)
     if use_cond_emb:

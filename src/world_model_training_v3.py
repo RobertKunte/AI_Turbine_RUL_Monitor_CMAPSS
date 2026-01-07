@@ -67,6 +67,21 @@ from src.utils.feature_pipeline_contract import (
     validate_feature_pipeline_config,
 )
 
+# B-Track: Cycle Branch imports (conditional to avoid import errors if not used)
+try:
+    from src.utils.cycle_branch_helper import (
+        initialize_cycle_branch,
+        cycle_branch_forward,
+        cycle_branch_loss,
+        get_cycle_branch_parameters,
+        log_cycle_branch_metrics,
+        CycleBranchComponents,
+    )
+    CYCLE_BRANCH_AVAILABLE = True
+except Exception as e:
+    print(f"[CycleBranch] Import failed: {e}")
+    CYCLE_BRANCH_AVAILABLE = False
+
 
 def train_world_model_universal_v3(
     df_train: pd.DataFrame,
@@ -638,6 +653,30 @@ def train_world_model_universal_v3(
                 )
     
     # ===================================================================
+    # 5b. Initialize Cycle Branch (B-Track)
+    # ===================================================================
+    cycle_branch_components = None
+    use_cycle_branch = False
+    cycle_cfg = getattr(world_model_config, "cycle_branch", None)
+    
+    if cycle_cfg is not None and getattr(cycle_cfg, "enable", False):
+        if CYCLE_BRANCH_AVAILABLE:
+            cycle_branch_components = initialize_cycle_branch(
+                cfg=cycle_cfg,
+                z_dim=encoder_d_model,  # Use encoder output dimension
+                feature_cols=feature_cols,
+                num_conditions=num_conditions,
+                device=device,
+            )
+            if cycle_branch_components is not None:
+                use_cycle_branch = True
+                print(f"[CycleBranch] Enabled with {len(cycle_cfg.targets)} targets")
+            else:
+                print("[CycleBranch] Initialization failed, continuing without cycle branch")
+        else:
+            print("[CycleBranch] cycle_branch.enable=True but module not available")
+    
+    # ===================================================================
     # 6. Training loop
     # ===================================================================
     print("\n[6] Training model...")
@@ -875,6 +914,13 @@ def train_world_model_universal_v3(
             param_groups.append({"params": other_params, "lr": lr})
         if enc_params:
             param_groups.append({"params": enc_params, "lr": lr * encoder_lr_mult})
+        
+        # B-Track: Add cycle branch parameters
+        if use_cycle_branch and cycle_branch_components is not None:
+            cycle_params = get_cycle_branch_parameters(cycle_branch_components)
+            if cycle_params:
+                param_groups.append({"params": cycle_params, "lr": lr})
+                print(f"[CycleBranch] Added {len(cycle_params)} param tensors to optimizer")
 
         # If no trainable params, create empty optimizer (shouldn't happen, but safety)
         if not param_groups:
@@ -1649,6 +1695,46 @@ def train_world_model_universal_v3(
             if use_hi_dynamics and loss_hi_dyn is None:
                  raise RuntimeError("HI-Dynamics enabled but loss_hi_dyn is None!")
 
+            # B-Track: Cycle Branch loss
+            loss_cycle_branch = None
+            if use_cycle_branch and cycle_branch_components is not None:
+                # Get encoder embedding for cycle branch
+                enc_emb = outputs.get("enc_emb")  # (B, T, d_model) or (B, d_model)
+                if enc_emb is None:
+                    # Fallback: use encoder output if enc_emb not in outputs
+                    # This might need adjustment based on model architecture
+                    with torch.no_grad():
+                        print(f"[CycleBranch] Warning: 'enc_emb' not found in model outputs, skipping batch")
+                else:
+                    # Forward pass through cycle branch
+                    cycle_pred, cycle_target, m_t, eta_nom, _ = cycle_branch_forward(
+                        components=cycle_branch_components,
+                        X_batch=X_batch,
+                        z_t=enc_emb,
+                        cond_ids=cond_batch if num_conditions > 1 else None,
+                        cfg=cycle_cfg,
+                        epoch=epoch,
+                    )
+                    
+                    # Compute cycle loss
+                    loss_cycle_branch, cycle_metrics = cycle_branch_loss(
+                        components=cycle_branch_components,
+                        cycle_pred=cycle_pred,
+                        cycle_target=cycle_target,
+                        m_t=m_t,
+                        cfg=cycle_cfg,
+                        epoch=epoch,
+                        num_epochs=num_epochs,
+                        mask=mask_batch,
+                    )
+                    
+                    loss += loss_cycle_branch
+                    
+                    # Track metrics
+                    for k, v in cycle_metrics.items():
+                        epoch_metrics.setdefault(f"cycle_{k}", 0.0)
+                        epoch_metrics[f"cycle_{k}"] += v
+
             # NaN/Inf guard
             if not torch.isfinite(loss):
                 print(f"\n❌ Non-finite loss detected at epoch {epoch+1}, batch {batch_idx}. Aborting training.")
@@ -1755,11 +1841,19 @@ def train_world_model_universal_v3(
              history.setdefault("hi_dyn_violation", []).append(epoch_metrics["hi_dyn_violation"])
              history.setdefault("hi_dyn_jump", []).append(epoch_metrics["hi_dyn_jump"])
 
+        # B-Track: Cycle Branch metrics logging
+        if use_cycle_branch:
+            for k in list(epoch_metrics.keys()):
+                if k.startswith("cycle_"):
+                    history.setdefault(k, []).append(epoch_metrics[k])
+
         # print progress
         if (epoch + 1) % 1 == 0:
             log_str = f"Epoch {epoch+1}/{num_epochs} | Train Loss: {epoch_train_loss:.4f}"
             if use_hi_dynamics:
                  log_str += f" | HI-Dyn: {epoch_metrics['loss_hi_dyn']:.4f} (Viol: {epoch_metrics['hi_dyn_violation']:.2%}, Jump: {epoch_metrics['hi_dyn_jump']:.4f})"
+            if use_cycle_branch and "cycle_cycle_loss" in epoch_metrics:
+                 log_str += f" | Cycle: {epoch_metrics['cycle_cycle_loss']:.4f}"
             print(log_str)
 
         # Quantile metrics (for tf_cross decoder)

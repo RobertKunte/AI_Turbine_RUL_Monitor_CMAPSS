@@ -1,0 +1,132 @@
+# CMAPSS Sensor Configuration — Semantic-to-Index Mapping
+# Use this to resolve semantic names (T24, P30, ...) to dataset sensor indices (S1..S21)
+
+cmapss_operating_settings:
+  - name: TRA
+    key: setting_1
+    desc: Throttle Resolver Angle
+  - name: Altitude
+    key: setting_2
+    desc: Altitude
+  - name: Mach
+    key: setting_3
+    desc: Mach number
+
+cmapss_sensors:
+  T2:
+    idx: 1
+    symbol: "T2"
+    unit: "°R"
+    desc: "Total temperature at fan inlet"
+  T24:
+    idx: 2
+    symbol: "T24"
+    unit: "°R"
+    desc: "Total temperature at LPC outlet"
+  T30:
+    idx: 3
+    symbol: "T30"
+    unit: "°R"
+    desc: "Total temperature at HPC outlet"
+  T50:
+    idx: 4
+    symbol: "T50"
+    unit: "°R"
+    desc: "Total temperature at LPT outlet"
+  P2:
+    idx: 5
+    symbol: "P2"
+    unit: "PSIA"
+    desc: "Pressure at fan inlet"
+  P15:
+    idx: 6
+    symbol: "P15"
+    unit: "PSIA"
+    desc: "Total pressure in bypass-duct"
+  P30:
+    idx: 7
+    symbol: "P30"
+    unit: "PSIA"
+    desc: "Total pressure at HPC outlet"
+  Nf:
+    idx: 8
+    symbol: "Nf"
+    unit: "rpm"
+    desc: "Physical fan speed"
+  Nc:
+    idx: 9
+    symbol: "Nc"
+    unit: "rpm"
+    desc: "Physical core speed"
+  epr:
+    idx: 10
+    symbol: "epr"
+    unit: "-"
+    desc: "Engine pressure ratio (P50/P2)"
+  Ps30:
+    idx: 11
+    symbol: "Ps30"
+    unit: "PSIA"
+    desc: "Static pressure at HPC outlet"
+  phi:
+    idx: 12
+    symbol: "phi"
+    unit: "pps/psi"
+    desc: "Ratio of fuel flow to Ps30"
+  NRf:
+    idx: 13
+    symbol: "NRf"
+    unit: "rpm"
+    desc: "Corrected fan speed"
+  NRc:
+    idx: 14
+    symbol: "NRc"
+    unit: "rpm"
+    desc: "Corrected core speed"
+  BPR:
+    idx: 15
+    symbol: "BPR"
+    unit: "-"
+    desc: "Bypass ratio"
+  farB:
+    idx: 16
+    symbol: "farB"
+    unit: "-"
+    desc: "Burner fuel-air ratio"
+  htBleed:
+    idx: 17
+    symbol: "htBleed"
+    unit: "-"
+    desc: "Bleed enthalpy"
+  Nf_dmd:
+    idx: 18
+    symbol: "Nf_dmd"
+    unit: "rpm"
+    desc: "Demanded fan speed"
+  PCNfR_dmd:
+    idx: 19
+    symbol: "PCNfR_dmd"
+    unit: "rpm"
+    desc: "Demanded corrected fan speed"
+  W31:
+    idx: 20
+    symbol: "W31"
+    unit: "lbm/s"
+    desc: "HPT coolant bleed"
+  W32:
+    idx: 21
+    symbol: "W32"
+    unit: "lbm/s"
+    desc: "LPT coolant bleed"
+
+# Cycle branch configuration defaults
+cycle_branch_targets:
+  - T24
+  - T30
+  - P30
+  - T50
+
+cycle_branch_optional_witnesses:
+  - Nf
+  - Nc
+  - Ps30

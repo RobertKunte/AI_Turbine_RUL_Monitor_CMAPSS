@@ -762,7 +762,7 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 train_world_model_universal_v3,
                 train_transformer_world_model_v1,
             )
-            from src.world_model_training import WorldModelTrainingConfig
+            from src.world_model_training import WorldModelTrainingConfig, CycleBranchConfig
             
             world_model_params = config.get('world_model_params', {})
             print(f"[DEBUG] world_model_params keys: {list(world_model_params.keys())}")
@@ -772,6 +772,29 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             # For WorldModelV1 variants we prefer an explicit "future_horizon"
             # if provided; otherwise fall back to the generic "horizon".
             wm_horizon = world_model_params.get('future_horizon', world_model_params.get('horizon', 40))
+
+            # Parse optional Cycle Branch config
+            cycle_params_dict = world_model_params.get("cycle_branch_params", {})
+            cycle_config = CycleBranchConfig(
+                enable=cycle_params_dict.get("enable", False),
+                targets=cycle_params_dict.get("targets", ["T24", "T30", "P30", "T50"]),
+                lambda_cycle=float(cycle_params_dict.get("lambda_cycle", 0.0)),
+                lambda_theta_smooth=float(cycle_params_dict.get("lambda_theta_smooth", 0.0)),
+                lambda_theta_mono=float(cycle_params_dict.get("lambda_theta_mono", 0.0)),
+                cycle_loss_type=str(cycle_params_dict.get("cycle_loss_type", "mse")),
+                cycle_huber_beta=float(cycle_params_dict.get("cycle_huber_beta", 1.0)),
+                cycle_ramp_epochs=int(cycle_params_dict.get("cycle_ramp_epochs", 0)),
+                nominal_head_type=str(cycle_params_dict.get("nominal_head_type", "mlp")),
+                nominal_head_hidden=int(cycle_params_dict.get("nominal_head_hidden", 32)),
+                param_head_hidden=int(cycle_params_dict.get("param_head_hidden", 64)),
+                param_head_num_layers=int(cycle_params_dict.get("param_head_num_layers", 2)),
+                pr_mode=str(cycle_params_dict.get("pr_mode", "per_cond")),
+                pr_head_hidden=int(cycle_params_dict.get("pr_head_hidden", 16)),
+                dp_nom_constant=float(cycle_params_dict.get("dp_nom_constant", 0.95)),
+                mono_on_eta_mods=bool(cycle_params_dict.get("mono_on_eta_mods", True)),
+                mono_on_dp_mod=bool(cycle_params_dict.get("mono_on_dp_mod", False)),
+                mono_eps=float(cycle_params_dict.get("mono_eps", 1e-4)),
+            )
 
             world_model_config = WorldModelTrainingConfig(
                 forecast_horizon=wm_horizon,
@@ -833,6 +856,8 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
                 hi_dyn_huber_beta=float(world_model_params.get('hi_dyn_huber_beta', 0.1)),
                 # Decoder type selection (World Model v3)
                 decoder_type=str(world_model_params.get('decoder_type', 'lstm')),
+                # Cycle Branch Config
+                cycle_branch=cycle_config,
             )
             # Additional world-model V1 specific loss weights (sensor / future HI / future RUL)
             # and architectural flags are stored as dynamic attributes on the
