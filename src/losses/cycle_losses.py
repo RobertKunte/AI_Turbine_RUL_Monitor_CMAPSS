@@ -222,8 +222,9 @@ def compute_theta_mono_loss(
     if mask is not None:
         if mask.dim() == 3 and mask.shape[-1] == 1:
             mask = mask.squeeze(-1)
-        mask_transitions = mask[:, 1:] * mask[:, :-1]
-        violations = violations * mask_transitions
+        mask_transitions = mask[:, 1:] * mask[:, :-1]  # (B, T-1)
+        # Unsqueeze to broadcast with violations (B, T-1, 6)
+        violations = violations * mask_transitions.unsqueeze(-1)
         valid_count = mask_transitions.sum().clamp(min=1.0)
         return violations.sum() / valid_count
     
