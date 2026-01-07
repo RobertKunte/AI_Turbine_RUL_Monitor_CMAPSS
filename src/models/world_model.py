@@ -1111,6 +1111,7 @@ class WorldModelUniversalV3(nn.Module):
             "traj": traj_outputs,  # (B, H, 1)
             "eol": eol_pred,       # (B, 1)
             "hi": hi_pred,         # (B, 1)
+            "enc_emb": enc_emb,    # (B, d_model) - Required for Cycle Branch
         }
         
         # Add quantile outputs for tf_cross decoder
