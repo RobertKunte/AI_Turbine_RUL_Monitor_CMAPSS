@@ -32,6 +32,93 @@ except ImportError:
     torch = None
 
 
+# =============================================================================
+# Theta Health Metrics (Batch Processing for Training Loop)
+# =============================================================================
+
+def compute_theta_health_batch(
+    m_t: "torch.Tensor",
+    bounds: tuple = ((0.85, 1.0), (0.85, 1.0), (0.85, 1.0), (0.85, 1.0), (0.85, 1.0), (0.90, 1.0)),
+    saturation_epsilon: float = 0.01,
+) -> Dict[str, Any]:
+    """Compute theta health metrics for a batch during training.
+    
+    Args:
+        m_t: Degradation modifiers tensor (B, T, 6) or (B, 6)
+        bounds: Tuple of (lower, upper) bounds for each of 6 params
+        saturation_epsilon: Fraction of range to consider "saturated" (default 1%)
+        
+    Returns:
+        Dict with:
+        - theta_min, theta_max, theta_mean: per-param stats (lists of 6)
+        - saturation_frac: fraction of values near bounds per param
+        - delta_l1_mean: mean absolute step change (smoothness)
+    """
+    if torch is None or m_t is None:
+        return {}
+    
+    # Convert to numpy for computation
+    if hasattr(m_t, "detach"):
+        m_np = m_t.detach().cpu().numpy()
+    else:
+        m_np = np.asarray(m_t)
+    
+    # Ensure 3D for consistency
+    if m_np.ndim == 2:
+        m_np = m_np[:, np.newaxis, :]  # (B, 1, 6)
+    
+    B, T, D = m_np.shape
+    param_names = ["m_fan", "m_lpc", "m_hpc", "m_hpt", "m_lpt", "m_dp"]
+    
+    result = {
+        "theta_min": [],
+        "theta_max": [],
+        "theta_mean": [],
+        "saturation_frac": [],
+    }
+    
+    for i in range(min(D, 6)):
+        vals = m_np[:, :, i].flatten()
+        result["theta_min"].append(float(vals.min()))
+        result["theta_max"].append(float(vals.max()))
+        result["theta_mean"].append(float(vals.mean()))
+        
+        # Saturation check
+        lb, ub = bounds[i] if i < len(bounds) else (0.85, 1.0)
+        eps_range = saturation_epsilon * (ub - lb)
+        near_low = (vals < lb + eps_range).mean()
+        near_high = (vals > ub - eps_range).mean()
+        result["saturation_frac"].append(float(near_low + near_high))
+    
+    # Smoothness: L1 of temporal differences
+    if T > 1:
+        diff = np.abs(m_np[:, 1:, :] - m_np[:, :-1, :])  # (B, T-1, 6)
+        result["delta_l1_mean"] = float(diff.mean())
+        result["delta_l1_max"] = float(diff.max())
+    else:
+        result["delta_l1_mean"] = 0.0
+        result["delta_l1_max"] = 0.0
+    
+    # Total saturation (any param)
+    result["saturation_frac_total"] = float(np.mean(result["saturation_frac"]))
+    
+    return result
+
+
+def format_theta_health_for_logging(health: Dict[str, Any]) -> str:
+    """Format theta health metrics for compact console logging."""
+    if not health:
+        return "theta_health: N/A"
+    
+    sat = health.get("saturation_frac_total", 0)
+    smooth = health.get("delta_l1_mean", 0)
+    means = health.get("theta_mean", [])
+    
+    mean_str = "/".join([f"{m:.3f}" for m in means[:6]]) if means else "N/A"
+    
+    return f"θ(sat={sat:.1%},Δ={smooth:.4f},μ={mean_str})"
+
+
 def run_cycle_branch_diagnostics(
     run_dir: Path,
     theta_data: Dict[str, np.ndarray],

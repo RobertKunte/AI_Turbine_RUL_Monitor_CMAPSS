@@ -83,6 +83,16 @@ except Exception as e:
     print(f"[CycleBranch] Import failed: {e}")
     CYCLE_BRANCH_AVAILABLE = False
 
+# Theta health metrics for cycle branch monitoring
+try:
+    from src.analysis.cycle_diagnostics import (
+        compute_theta_health_batch,
+        format_theta_health_for_logging,
+    )
+    THETA_HEALTH_AVAILABLE = True
+except ImportError:
+    THETA_HEALTH_AVAILABLE = False
+
 # Risk metrics for overestimation analysis (FD004 safety)
 try:
     from src.analysis.risk_metrics import (
@@ -1951,6 +1961,12 @@ def train_world_model_universal_v3(
         running_val_coverage_10_90_seq = 0.0
         n_val_quantile_batches = 0
         
+        # Cycle branch validation accumulators
+        running_val_cycle_loss = 0.0
+        running_val_cycle_per_sensor_sse = None  # Will be initialized on first batch
+        n_val_cycle_samples = 0
+        val_theta_health_accum = None  # For averaging theta health across batches
+        
         with torch.no_grad():
             for batch in val_loader:
                 if isinstance(batch, (tuple, list)) and len(batch) == 4:
@@ -2216,6 +2232,70 @@ def train_world_model_universal_v3(
                 running_val_eol_hi_weighted += weighted_eol_hi.item() * X_batch.size(0)
                 n_val_samples += X_batch.size(0)
                 
+                # B-Track: Cycle Branch validation metrics
+                if use_cycle_branch and cycle_branch_components is not None:
+                    enc_emb = outputs.get("enc_emb")
+                    if enc_emb is not None:
+                        try:
+                            # Forward pass through cycle branch (no grad already)
+                            cycle_pred, cycle_target, m_t, eta_nom, _ = cycle_branch_forward(
+                                components=cycle_branch_components,
+                                X_batch=X_batch,
+                                z_t=enc_emb,
+                                cond_ids=cond_batch if num_conditions > 1 else None,
+                                cfg=cycle_cfg,
+                                epoch=epoch,
+                            )
+                            
+                            # Compute validation cycle loss
+                            val_loss_cycle, val_cycle_metrics = cycle_branch_loss(
+                                components=cycle_branch_components,
+                                cycle_pred=cycle_pred,
+                                cycle_target=cycle_target,
+                                m_t=m_t,
+                                cfg=cycle_cfg,
+                                epoch=epoch,
+                                num_epochs=num_epochs,
+                                mask=mask_batch,
+                            )
+                            
+                            running_val_cycle_loss += val_loss_cycle.item() * X_batch.size(0)
+                            n_val_cycle_samples += X_batch.size(0)
+                            
+                            # Per-sensor SSE (Sum of Squared Errors)
+                            n_sensors = cycle_pred.shape[-1]
+                            if running_val_cycle_per_sensor_sse is None:
+                                running_val_cycle_per_sensor_sse = [0.0] * n_sensors
+                            
+                            for s_idx in range(n_sensors):
+                                pred_s = cycle_pred[..., s_idx]
+                                targ_s = cycle_target[..., s_idx]
+                                if mask_batch is not None:
+                                    mask_sq = mask_batch.squeeze(-1) if mask_batch.dim() == 3 else mask_batch
+                                    sse = ((pred_s - targ_s) ** 2 * mask_sq).sum().item()
+                                else:
+                                    sse = ((pred_s - targ_s) ** 2).sum().item()
+                                running_val_cycle_per_sensor_sse[s_idx] += sse
+                            
+                            # Theta health accumulation
+                            if THETA_HEALTH_AVAILABLE:
+                                batch_health = compute_theta_health_batch(m_t)
+                                if val_theta_health_accum is None:
+                                    val_theta_health_accum = batch_health.copy()
+                                    val_theta_health_accum["n_batches"] = 1
+                                else:
+                                    # Running average for scalar metrics
+                                    for key in ["delta_l1_mean", "saturation_frac_total"]:
+                                        if key in batch_health:
+                                            n = val_theta_health_accum["n_batches"]
+                                            val_theta_health_accum[key] = (
+                                                val_theta_health_accum.get(key, 0) * n + batch_health[key]
+                                            ) / (n + 1)
+                                    val_theta_health_accum["n_batches"] += 1
+                        except Exception as e:
+                            if epoch == 0:
+                                print(f"[CycleBranch] Val metrics error: {e}")
+                
                 # Accumulate quantile metrics (validation)
                 if decoder_type == "tf_cross" and val_loss_pinball is not None:
                     running_val_pinball_loss += val_loss_pinball.item() * X_batch.size(0)
@@ -2298,6 +2378,52 @@ def train_world_model_universal_v3(
             f"val_shape: {epoch_val_hi_early_slope_loss:.4f}+{epoch_val_hi_curvature_loss:.4f} (w: {epoch_val_shape_weighted:.4f}), "
             f"val_eol_hi: {epoch_val_eol_hi_loss:.4f} (w: {epoch_val_eol_hi_weighted:.4f})"
         )
+        
+        # B-Track: Cycle Branch validation metrics logging
+        if use_cycle_branch and n_val_cycle_samples > 0:
+            epoch_val_cycle_loss = running_val_cycle_loss / n_val_cycle_samples
+            
+            # Per-sensor RMSE
+            sensor_names = getattr(cycle_cfg, "targets", ["T24", "T30", "P30", "T50"])
+            per_sensor_rmse = []
+            if running_val_cycle_per_sensor_sse is not None:
+                for s_idx, sse in enumerate(running_val_cycle_per_sensor_sse):
+                    mse = sse / max(1, n_val_cycle_samples * horizon)  # Approximate sample count
+                    rmse = np.sqrt(mse)
+                    per_sensor_rmse.append(rmse)
+            
+            # Format per-sensor RMSE string
+            sensor_rmse_str = ", ".join([
+                f"{sensor_names[i] if i < len(sensor_names) else f'S{i}'}: {rmse:.4f}"
+                for i, rmse in enumerate(per_sensor_rmse)
+            ])
+            
+            # Theta health logging
+            theta_health_str = ""
+            if val_theta_health_accum is not None and THETA_HEALTH_AVAILABLE:
+                theta_health_str = format_theta_health_for_logging(val_theta_health_accum)
+            
+            # Cycle ramp factor
+            ramp_epochs = getattr(cycle_cfg, "cycle_ramp_epochs", 0)
+            if ramp_epochs > 0:
+                ramp_factor = min(1.0, (epoch + 1) / ramp_epochs)
+            else:
+                ramp_factor = 1.0
+            
+            print(f"  Cycle: val_loss={epoch_val_cycle_loss:.4f} (ramp={ramp_factor:.2f}) | "
+                  f"RMSE: {sensor_rmse_str} | {theta_health_str}")
+            
+            # Record to history
+            history.setdefault("val_cycle_loss", []).append(epoch_val_cycle_loss)
+            history.setdefault("val_cycle_ramp_factor", []).append(ramp_factor)
+            if val_theta_health_accum:
+                history.setdefault("val_theta_saturation", []).append(
+                    val_theta_health_accum.get("saturation_frac_total", 0.0)
+                )
+                history.setdefault("val_theta_smoothness", []).append(
+                    val_theta_health_accum.get("delta_l1_mean", 0.0)
+                )
+
 
         # --------------------------------------------------
         # Best checkpoint selection + early stopping (optionally EOL-aware)
@@ -2542,8 +2668,8 @@ def train_world_model_universal_v3(
             window_cfg=wc,
             target_cfg=tc,
             return_mask=False,
-            # For HI-Dynamics, we need paired samples (t, t+1)
-            return_paired_samples=use_hi_dynamics,
+            # Note: For train/val metric evaluation, we don't need paired samples
+            # (that's only for HI-Dynamics training loop, not metric computation)
         )
 
         X = built_split["X"]
@@ -2696,6 +2822,125 @@ def train_world_model_universal_v3(
                 print(format_risk_metrics_for_logging(risk_metrics_all))
         except Exception as e:
             print(f"[Warning] Could not compute risk metrics: {e}")
+    
+    # ===================================================================
+    # 8c. Compute test cycle metrics + theta health (if cycle branch enabled)
+    # ===================================================================
+    test_cycle_metrics = {}
+    test_theta_health = {}
+    
+    if use_cycle_branch and cycle_branch_components is not None and CYCLE_BRANCH_AVAILABLE:
+        try:
+            print("\n--- CYCLE BRANCH TEST METRICS ---")
+            
+            # Use test_loader if available, otherwise build from df_test
+            from src.data.windowing import build_test_windows_last
+            
+            # Build test windows
+            windows_test = build_test_windows_last(
+                df_test=df_test,
+                y_test_true=y_test_true,
+                feature_cols=feature_cols,
+                unit_col="UnitNumber",
+                time_col="TimeInCycles",
+                cond_col="ConditionID",
+                window_cfg=window_cfg,
+                target_cfg=target_cfg,
+            )
+            
+            X_test = torch.tensor(windows_test["X"], dtype=torch.float32).to(device)
+            cond_test = torch.tensor(windows_test["cond_ids"], dtype=torch.long).to(device) if num_conditions > 1 else None
+            
+            # Condition-wise scaling
+            X_test_scaled = X_test.clone()
+            cond_ids_np = windows_test["cond_ids"]
+            X_test_np = windows_test["X"]
+            X_scaled_np = np.empty_like(X_test_np, dtype=np.float32)
+            for cond in np.unique(cond_ids_np):
+                cond = int(cond)
+                idxs = np.where(cond_ids_np == cond)[0]
+                scaler = scaler_dict.get(cond, scaler_dict.get(0))
+                flat = X_test_np[idxs].reshape(-1, len(feature_cols))
+                X_scaled_np[idxs] = scaler.transform(flat).reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
+            X_test_scaled = torch.tensor(X_scaled_np, dtype=torch.float32).to(device)
+            
+            # Run model forward to get encoder embeddings
+            model.eval()
+            with torch.no_grad():
+                outputs_test = model(
+                    encoder_inputs=X_test_scaled,
+                    decoder_targets=None,
+                    teacher_forcing_ratio=0.0,
+                    horizon=horizon,
+                    cond_ids=cond_test,
+                )
+                
+                enc_emb = outputs_test.get("enc_emb")
+                
+                if enc_emb is not None:
+                    # Forward through cycle branch
+                    cycle_pred, cycle_target, m_t, eta_nom, _ = cycle_branch_forward(
+                        components=cycle_branch_components,
+                        X_batch=X_test_scaled,
+                        z_t=enc_emb,
+                        cond_ids=cond_test,
+                        cfg=cycle_cfg,
+                        epoch=num_epochs - 1,
+                    )
+                    
+                    # Compute per-sensor RMSE/MAE
+                    sensor_names = getattr(cycle_cfg, "targets", ["T24", "T30", "P30", "T50"])
+                    per_sensor_metrics = {}
+                    n_sensors = cycle_pred.shape[-1]
+                    
+                    for s_idx in range(min(n_sensors, len(sensor_names))):
+                        sensor_name = sensor_names[s_idx]
+                        pred_s = cycle_pred[..., s_idx].cpu().numpy().flatten()
+                        targ_s = cycle_target[..., s_idx].cpu().numpy().flatten()
+                        
+                        mse = float(np.mean((pred_s - targ_s) ** 2))
+                        mae = float(np.mean(np.abs(pred_s - targ_s)))
+                        rmse = float(np.sqrt(mse))
+                        
+                        per_sensor_metrics[sensor_name] = {
+                            "rmse_norm": rmse,
+                            "mae_norm": mae,
+                            "mse_norm": mse,
+                        }
+                        print(f"  {sensor_name}: RMSE={rmse:.4f}, MAE={mae:.4f}")
+                    
+                    test_cycle_metrics = {
+                        "enabled": True,
+                        "per_sensor": per_sensor_metrics,
+                    }
+                    
+                    # Compute theta health
+                    if THETA_HEALTH_AVAILABLE:
+                        test_theta_health = compute_theta_health_batch(m_t)
+                        print(f"  Theta: {format_theta_health_for_logging(test_theta_health)}")
+                        
+                        # Save theta_health_test.json
+                        theta_health_path = results_dir / "theta_health_test.json"
+                        with open(theta_health_path, "w") as f:
+                            json.dump(test_theta_health, f, indent=2)
+                        print(f"  Saved theta_health_test.json")
+                        
+                        # Also save val theta health if available
+                        if history.get("val_theta_saturation"):
+                            val_theta_health = {
+                                "saturation_frac_history": history.get("val_theta_saturation", []),
+                                "smoothness_history": history.get("val_theta_smoothness", []),
+                                "final_saturation_frac": history.get("val_theta_saturation", [])[-1] if history.get("val_theta_saturation") else None,
+                                "final_smoothness": history.get("val_theta_smoothness", [])[-1] if history.get("val_theta_smoothness") else None,
+                            }
+                            val_theta_path = results_dir / "theta_health_val.json"
+                            with open(val_theta_path, "w") as f:
+                                json.dump(val_theta_health, f, indent=2)
+                            print(f"  Saved theta_health_val.json")
+                else:
+                    print("  [Warning] enc_emb not available for cycle branch test metrics")
+        except Exception as e:
+            print(f"[Warning] Could not compute test cycle metrics: {e}")
     
     # ===================================================================
     # 8. Compute per-condition metrics
@@ -2886,6 +3131,22 @@ def train_world_model_universal_v3(
         },
         "risk_metrics_last": risk_metrics_last,
         "risk_metrics_all": risk_metrics_all,
+        # Cycle metrics (added for B2.2 aux head monitoring)
+        "cycle_metrics_last": {
+            "val": {
+                "loss_total": history.get("val_cycle_loss", [])[-1] if history.get("val_cycle_loss") else None,
+                "loss_history": history.get("val_cycle_loss", []),
+            },
+            "test": test_cycle_metrics,
+            "enabled": use_cycle_branch,
+        } if use_cycle_branch else None,
+        "theta_health_last": {
+            "val": {
+                "saturation_frac": history.get("val_theta_saturation", [])[-1] if history.get("val_theta_saturation") else None,
+                "smoothness_l1": history.get("val_theta_smoothness", [])[-1] if history.get("val_theta_smoothness") else None,
+            },
+            "test": test_theta_health if test_theta_health else None,
+        } if use_cycle_branch else None,
     }
     
     summary_path = results_dir / "summary.json"
