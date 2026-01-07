@@ -479,3 +479,206 @@ def compute_theta_bounds_stats(
     result["saturation_frac_total"] = total_sat / len(param_names)
     
     return result
+
+
+# =============================================================================
+# Engine Grouping by RUL Error (FD004 safety analysis)
+# =============================================================================
+
+def get_engine_groups_by_error(
+    engine_ids: List[int],
+    err_last: Dict[int, float],
+    n_per_group: int = 20,
+) -> Dict[str, List[int]]:
+    """Group engines by LAST RUL error for targeted diagnostics.
+    
+    Args:
+        engine_ids: List of all engine IDs
+        err_last: Dict mapping engine_id -> (pred_last - true_last)
+        n_per_group: Number of engines per group (default 20)
+        
+    Returns:
+        Dict with keys:
+        - 'worst20_over': Highest positive error (dangerous overestimation)
+        - 'worst20_under': Most negative error (underestimation)
+        - 'mid20': Smallest absolute error (best performing)
+    """
+    # Filter to engines with valid errors
+    valid_engines = [e for e in engine_ids if e in err_last]
+    if not valid_engines:
+        return {"worst20_over": [], "worst20_under": [], "mid20": []}
+    
+    n = min(n_per_group, len(valid_engines) // 3)
+    if n < 1:
+        n = min(n_per_group, len(valid_engines))
+    
+    # Sort by error
+    sorted_by_err = sorted(valid_engines, key=lambda e: err_last.get(e, 0))
+    sorted_by_abs = sorted(valid_engines, key=lambda e: abs(err_last.get(e, 0)))
+    
+    return {
+        "worst20_over": sorted_by_err[-n:],  # Highest positive error
+        "worst20_under": sorted_by_err[:n],   # Lowest (most negative) error
+        "mid20": sorted_by_abs[:n],           # Smallest absolute error
+    }
+
+
+def compute_theta_rul_correlations(
+    theta_data: Dict[str, np.ndarray],
+    err_last: Dict[int, float],
+    hi_data: Optional[Dict[int, np.ndarray]] = None,
+) -> Dict[str, float]:
+    """Compute correlations between degradation modifiers and RUL/HI errors.
+    
+    Args:
+        theta_data: Dict mapping engine_id -> theta trajectory (T, 6)
+        err_last: Dict mapping engine_id -> (pred_last - true_last) RUL error
+        hi_data: Optional dict mapping engine_id -> HI trajectory
+        
+    Returns:
+        Dict with correlation values (NaN if not computable)
+    """
+    param_names = ["fan", "lpc", "hpc", "hpt", "lpt", "dp"]
+    result = {}
+    
+    # Collect end values and slopes for each theta parameter
+    m_end = {p: [] for p in param_names}
+    m_delta = {p: [] for p in param_names}  # end - start
+    errors = []
+    valid_engines = []
+    
+    for eng_id, error in err_last.items():
+        eng_key = str(eng_id)
+        if eng_key in theta_data:
+            theta = theta_data[eng_key]
+            if theta.ndim == 2 and theta.shape[1] >= 6 and theta.shape[0] >= 2:
+                valid_engines.append(eng_id)
+                errors.append(error)
+                for i, p in enumerate(param_names):
+                    m_end[p].append(theta[-1, i])
+                    m_delta[p].append(theta[-1, i] - theta[0, i])
+    
+    if len(errors) < 5:
+        # Not enough data for meaningful correlations
+        for p in param_names:
+            result[f"corr_m_{p}_end_err"] = float("nan")
+            result[f"corr_delta_m_{p}_err"] = float("nan")
+        return result
+    
+    errors = np.array(errors)
+    
+    # Compute correlations
+    for p in param_names:
+        m_end_arr = np.array(m_end[p])
+        m_delta_arr = np.array(m_delta[p])
+        
+        # Pearson correlation with error handling
+        result[f"corr_m_{p}_end_err"] = _safe_pearson(m_end_arr, errors)
+        result[f"corr_delta_m_{p}_err"] = _safe_pearson(m_delta_arr, errors)
+    
+    # HI correlation if available
+    if hi_data:
+        hi_end = []
+        hi_slope = []
+        hi_errors = []
+        for eng_id in valid_engines:
+            if eng_id in hi_data:
+                hi = hi_data[eng_id]
+                if len(hi) >= 2:
+                    hi_end.append(hi[-1])
+                    # Slope as (end - start) / length
+                    hi_slope.append((hi[-1] - hi[0]) / len(hi))
+                    hi_errors.append(err_last[eng_id])
+        
+        if len(hi_end) >= 5:
+            result["corr_hi_end_err"] = _safe_pearson(np.array(hi_end), np.array(hi_errors))
+            result["corr_hi_slope_err"] = _safe_pearson(np.array(hi_slope), np.array(hi_errors))
+    
+    return result
+
+
+def _safe_pearson(x: np.ndarray, y: np.ndarray) -> float:
+    """Compute Pearson correlation with NaN handling for constant arrays."""
+    if len(x) < 2 or len(y) < 2:
+        return float("nan")
+    
+    x_std = np.std(x)
+    y_std = np.std(y)
+    
+    if x_std < 1e-10 or y_std < 1e-10:
+        return float("nan")
+    
+    try:
+        corr = np.corrcoef(x, y)[0, 1]
+        return float(corr) if np.isfinite(corr) else float("nan")
+    except Exception:
+        return float("nan")
+
+
+def generate_cycle_summary(
+    theta_data: Dict[str, np.ndarray],
+    residual_stats: Dict[str, Dict[str, float]],
+    engine_groups: Dict[str, List[int]],
+    err_last: Dict[int, float],
+    correlations: Dict[str, float],
+    bounds_stats: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Generate comprehensive cycle branch summary for cycle_summary.json.
+    
+    Args:
+        theta_data: Dict mapping engine_id -> theta trajectory
+        residual_stats: Per-sensor residual statistics
+        engine_groups: Engine grouping (worst20_over, worst20_under, mid20)
+        err_last: RUL errors per engine
+        correlations: Theta-RUL correlation values
+        bounds_stats: Optional theta bounds statistics
+        
+    Returns:
+        Comprehensive summary dict
+    """
+    summary = {
+        "per_sensor_metrics": residual_stats,
+        "engine_groups": {
+            group: [int(e) for e in engines]
+            for group, engines in engine_groups.items()
+        },
+        "correlations": correlations,
+    }
+    
+    # Add worst engine details
+    if engine_groups.get("worst20_over"):
+        worst_over = engine_groups["worst20_over"]
+        summary["worst_over_engines"] = [
+            {"engine_id": int(e), "error": float(err_last.get(e, 0))}
+            for e in worst_over[:10]  # Top 10
+        ]
+    
+    if engine_groups.get("worst20_under"):
+        worst_under = engine_groups["worst20_under"]
+        summary["worst_under_engines"] = [
+            {"engine_id": int(e), "error": float(err_last.get(e, 0))}
+            for e in worst_under[:10]
+        ]
+    
+    # Bounds and saturation
+    if bounds_stats:
+        summary["bounds_saturation"] = bounds_stats
+    
+    # Overall stats
+    if theta_data:
+        all_theta = []
+        for eng_key, theta in theta_data.items():
+            if theta.ndim == 2 and theta.shape[1] >= 6:
+                all_theta.append(theta)
+        
+        if all_theta:
+            concat = np.concatenate(all_theta, axis=0)
+            summary["theta_stats"] = {
+                "global_mean": [float(concat[:, i].mean()) for i in range(6)],
+                "global_std": [float(concat[:, i].std()) for i in range(6)],
+                "n_engines": len(all_theta),
+                "n_samples": concat.shape[0],
+            }
+    
+    return summary
+

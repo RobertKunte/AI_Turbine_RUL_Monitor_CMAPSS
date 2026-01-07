@@ -83,6 +83,17 @@ except Exception as e:
     print(f"[CycleBranch] Import failed: {e}")
     CYCLE_BRANCH_AVAILABLE = False
 
+# Risk metrics for overestimation analysis (FD004 safety)
+try:
+    from src.analysis.risk_metrics import (
+        compute_risk_metrics_last,
+        compute_risk_metrics_all,
+        format_risk_metrics_for_logging,
+    )
+    RISK_METRICS_AVAILABLE = True
+except ImportError:
+    RISK_METRICS_AVAILABLE = False
+
 
 def train_world_model_universal_v3(
     df_train: pd.DataFrame,
@@ -2662,6 +2673,31 @@ def train_world_model_universal_v3(
     print(f"  n_samples_all: {test_metrics.get('n_samples_all', 0)}")
     
     # ===================================================================
+    # 8b. Compute overestimation risk metrics (FD004 safety analysis)
+    # ===================================================================
+    risk_metrics_last = {}
+    risk_metrics_all = {}
+    
+    if RISK_METRICS_AVAILABLE:
+        try:
+            y_pred_last = test_metrics.get("y_pred_last", test_metrics.get("y_pred_eol", []))
+            y_true_last = test_metrics.get("y_true_last", test_metrics.get("y_true_eol", []))
+            
+            if len(y_pred_last) > 0 and len(y_true_last) > 0:
+                risk_metrics_last = compute_risk_metrics_last(y_true_last, y_pred_last)
+                print("\n--- RISK METRICS (LAST) ---")
+                print(format_risk_metrics_for_logging(risk_metrics_last))
+            
+            y_pred_all = test_metrics.get("y_pred_all", [])
+            y_true_all = test_metrics.get("y_true_all", [])
+            if len(y_pred_all) > 0 and len(y_true_all) > 0:
+                risk_metrics_all = compute_risk_metrics_all(y_true_all, y_pred_all)
+                print("\n--- RISK METRICS (ALL) ---")
+                print(format_risk_metrics_for_logging(risk_metrics_all))
+        except Exception as e:
+            print(f"[Warning] Could not compute risk metrics: {e}")
+    
+    # ===================================================================
     # 8. Compute per-condition metrics
     # ===================================================================
     print("\n[9] Computing per-condition metrics...")
@@ -2847,7 +2883,9 @@ def train_world_model_universal_v3(
                   "w_hi_dyn_smooth": w_hi_dyn_smooth,
                   "n_pairs_train": len(train_loader.dataset) if use_hi_dynamics else 0
              }
-        }
+        },
+        "risk_metrics_last": risk_metrics_last,
+        "risk_metrics_all": risk_metrics_all,
     }
     
     summary_path = results_dir / "summary.json"

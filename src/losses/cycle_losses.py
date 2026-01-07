@@ -79,16 +79,12 @@ def compute_cycle_loss(
     else:
         loss = F.mse_loss(pred, target, reduction="none")
     
-    # Debug
-    print(f"[Debug] Loss shape before mean: {loss.shape}")
+    # Average over targets dimension
     loss = loss.mean(dim=-1)  # (B, T) or (B,)
-    print(f"[Debug] Loss shape after mean: {loss.shape}")
     
     if mask is not None:
-        print(f"[Debug] Mask shape: {mask.shape}")
         if mask.dim() == 3 and mask.shape[-1] == 1:
-            mask = mask.squeeze(-1) # (B, T)
-        print(f"[Debug] Mask shape after squeeze: {mask.shape}")
+            mask = mask.squeeze(-1)  # (B, T)
         # Apply mask
         loss = loss * mask
         valid_count = mask.sum().clamp(min=1.0)
