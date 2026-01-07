@@ -689,6 +689,7 @@ def train_world_model_universal_v3(
                 feature_cols=feature_cols,
                 num_conditions=num_conditions,
                 device=device,
+                scaler_dict=scaler_dict,  # For condition-wise normalization
             )
             if cycle_branch_components is not None:
                 use_cycle_branch = True
@@ -1738,7 +1739,7 @@ def train_world_model_universal_v3(
                         epoch=epoch,
                     )
                     
-                    # Compute cycle loss
+                    # Compute cycle loss (with condition-wise normalization)
                     loss_cycle_branch, cycle_metrics = cycle_branch_loss(
                         components=cycle_branch_components,
                         cycle_pred=cycle_pred,
@@ -1748,6 +1749,7 @@ def train_world_model_universal_v3(
                         epoch=epoch,
                         num_epochs=num_epochs,
                         mask=mask_batch,
+                        cond_ids=cond_batch if num_conditions > 1 else torch.zeros(X_batch.size(0), dtype=torch.long, device=X_batch.device),
                     )
                     
                     loss += loss_cycle_branch
@@ -2257,6 +2259,7 @@ def train_world_model_universal_v3(
                                 epoch=epoch,
                                 num_epochs=num_epochs,
                                 mask=mask_batch,
+                                cond_ids=cond_batch if num_conditions > 1 else torch.zeros(X_batch.size(0), dtype=torch.long, device=X_batch.device),
                             )
                             
                             running_val_cycle_loss += val_loss_cycle.item() * X_batch.size(0)
