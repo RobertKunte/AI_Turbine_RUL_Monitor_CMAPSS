@@ -24,6 +24,7 @@ from typing import Optional, Tuple
 # Keep this list short in Colab to avoid long runtimes.
 RUN_NAMES = [
     "fd004_transformer_worldmodel_v1_cycle_test",
+    # "wm_v3_fd004_b22_cycle",  # Uncomment to run full B2.2 integration
 ]
 DEVICE = "cuda"
 

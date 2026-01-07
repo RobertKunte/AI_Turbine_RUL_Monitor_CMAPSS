@@ -5206,6 +5206,9 @@ def get_experiment_by_name(experiment_name: str) -> ExperimentConfig:
     if experiment_name == "fd004_transformer_worldmodel_v1_cycle_test":
         return get_fd004_transformer_worldmodel_v1_cycle_test_config()
     
+    if experiment_name == "wm_v3_fd004_b22_cycle":
+        return get_wm_v3_fd004_b22_cycle_config()
+    
     raise ValueError(f"Could not find experiment config for: {experiment_name}")
 
 
@@ -5242,6 +5245,53 @@ def get_fd004_transformer_worldmodel_v1_cycle_test_config() -> ExperimentConfig:
         "mono_on_eta_mods": True,
         "mono_on_dp_mod": False,
         "mono_eps": 1e-4,
+    }
+    
+    return config
+
+
+def get_wm_v3_fd004_b22_cycle_config() -> ExperimentConfig:
+    """
+    B2.2 + Cycle Branch Integration Config.
+    
+    Base: wm_v3_fd004_b22_hi_dyn_tf_cross_qr_config (UniversalV3, TF-Cross Decoder, QR Head)
+    Add: CycleBranch (Mode 1 Factorized) as auxiliary task.
+    
+    Goal:
+    - Train full B2.2 model with additional auxiliary cycle loss.
+    - Validate stability (<10% regression on primary metrics).
+    - Provide physically interpretable m(t) alongside HI.
+    """
+    config = get_wm_v3_fd004_b22_hi_dyn_tf_cross_qr_config()
+    config.experiment_name = "wm_v3_fd004_b22_cycle"
+    
+    # Cycle Branch Parameters
+    # Using defaults similar to test but tuned for B2.2 integration safety
+    config.world_model_params["cycle_branch_params"] = {
+        "enable": True,
+        "targets": ["T24", "T30", "P30", "T50"],
+        "optional_witnesses": ["Nf", "Nc", "Ps30"],
+        
+        # Loss weights
+        "lambda_cycle": 0.1,         # Start conservative
+        "lambda_theta_smooth": 0.1,  # Stronger smoothness for interpretation
+        "lambda_theta_mono": 0.05,   # Weak monotonicity
+        "lambda_power_balance": 0.01,# Weak power balance
+        
+        "cycle_loss_type": "huber",
+        "cycle_huber_beta": 0.1,
+        "cycle_ramp_epochs": 10,     # Safe 10-epoch ramp
+        
+        # Architecture
+        "nominal_head_type": "mlp",
+        "nominal_head_hidden": 32,
+        "param_head_hidden": 64,
+        "pr_mode": "head",
+        "pr_head_hidden": 16,
+        
+        # Physics constraints
+        "mono_on_eta_mods": True,
+        "mono_on_dp_mod": False,
     }
     
     return config

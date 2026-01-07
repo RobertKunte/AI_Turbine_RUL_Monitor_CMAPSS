@@ -15,6 +15,44 @@ import torch
 import torch.nn.functional as F
 
 
+def compute_power_balance_penalty(
+    work_balance: dict,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compute power balance penalty (HPT->HPC, LPT->Fan+LPC).
+    
+    Args:
+        work_balance: Dict with W_fan, W_lpc, W_hpc, W_hpt, W_lpt
+        mask: Optional mask (B, T)
+        
+    Returns:
+        Scalar penalty
+    """
+    keys = ["W_hpc", "W_hpt", "W_fan", "W_lpc", "W_lpt"]
+    for k in keys:
+        if k not in work_balance:
+            return torch.tensor(0.0)
+
+    W_hpc = work_balance["W_hpc"]
+    W_hpt = work_balance["W_hpt"]
+    W_fan_lpc = work_balance["W_fan"] + work_balance["W_lpc"]
+    W_lpt = work_balance["W_lpt"]
+    
+    # Relative error penalty (squared)
+    eps = 1e-6
+    penalty_hpt = ((W_hpt - W_hpc) / (W_hpc.abs() + eps)) ** 2
+    penalty_lpt = ((W_lpt - W_fan_lpc) / (W_fan_lpc.abs() + eps)) ** 2
+    
+    total_penalty = penalty_hpt + penalty_lpt
+    
+    if mask is not None:
+        total_penalty = total_penalty * mask
+        valid_count = mask.sum().clamp(min=1.0)
+        return total_penalty.sum() / valid_count
+    
+    return total_penalty.mean()
+
+
 def compute_cycle_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -265,16 +303,20 @@ class CycleBranchLoss(torch.nn.Module):
         mono_on_eta: bool = False,
         mono_on_dp: bool = False,
         mono_eps: float = 1e-4,
+        lambda_power_balance: float = 0.0,
+        target_names: Optional[list[str]] = None,
     ):
         super().__init__()
         self.lambda_cycle = lambda_cycle
         self.lambda_smooth = lambda_smooth
         self.lambda_mono = lambda_mono
+        self.lambda_power_balance = lambda_power_balance
         self.cycle_loss_type = cycle_loss_type
         self.cycle_huber_beta = cycle_huber_beta
         self.mono_on_eta = mono_on_eta
         self.mono_on_dp = mono_on_dp
         self.mono_eps = mono_eps
+        self.target_names = target_names or ["T24", "T30", "P30", "T50"]
     
     def forward(
         self,
@@ -283,6 +325,7 @@ class CycleBranchLoss(torch.nn.Module):
         theta_seq: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         epoch_frac: float = 1.0,
+        intermediates: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """Compute combined cycle branch loss.
         
@@ -317,6 +360,19 @@ class CycleBranchLoss(torch.nn.Module):
             mask=mask,
         )
         
+        # Power balance penalty
+        l_power = torch.tensor(0.0, device=cycle_pred.device)
+        if self.lambda_power_balance > 0 and intermediates is not None:
+             if "work_balance" in intermediates:
+                 l_power = compute_power_balance_penalty(intermediates["work_balance"], mask)
+        
+        # Per-sensor loss breakdown (for logging)
+        per_sensor_metrics = compute_cycle_loss_per_sensor(
+             cycle_pred, cycle_target, self.target_names,
+             loss_type=self.cycle_loss_type,
+             huber_beta=self.cycle_huber_beta
+        )
+        
         # Apply curriculum to cycle loss weight (ramp up over epochs)
         lambda_cycle_curr = self.lambda_cycle * epoch_frac
         
@@ -324,15 +380,20 @@ class CycleBranchLoss(torch.nn.Module):
         total = (
             lambda_cycle_curr * l_cycle +
             self.lambda_smooth * l_smooth +
-            self.lambda_mono * l_mono
+            self.lambda_mono * l_mono +
+            self.lambda_power_balance * l_power
         )
         
         components = {
             "cycle_loss": float(l_cycle.item()),
             "theta_smooth_loss": float(l_smooth.item()),
             "theta_mono_loss": float(l_mono.item()),
+            "power_balance_loss": float(l_power.item()),
             "lambda_cycle_effective": lambda_cycle_curr,
             "total_cycle_branch_loss": float(total.item()),
         }
+        # Add per-sensor metrics
+        for name, val in per_sensor_metrics.items():
+            components[f"cycle_loss_{name}"] = val
         
         return total, components

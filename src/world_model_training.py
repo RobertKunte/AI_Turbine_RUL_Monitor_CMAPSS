@@ -119,6 +119,7 @@ class CycleBranchConfig:
     
     # Semantic target sensor names (resolved via cmapss_sensors.yaml)
     targets: List[str] = field(default_factory=lambda: ["T24", "T30", "P30", "T50"])
+    optional_witnesses: List[str] = field(default_factory=lambda: ["Nf", "Nc", "Ps30"])  # optional
     
     # --------------------------------------------------
     # Loss weights
@@ -126,6 +127,7 @@ class CycleBranchConfig:
     lambda_cycle: float = 0.1
     lambda_theta_smooth: float = 0.05
     lambda_theta_mono: float = 0.01
+    lambda_power_balance: float = 0.0  # optional power balance penalty
     cycle_loss_type: Literal["mse", "huber"] = "huber"
     cycle_huber_beta: float = 0.1
     cycle_ramp_epochs: int = 10  # Curriculum: ramp lambda_cycle from 0 to full

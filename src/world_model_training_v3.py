@@ -77,6 +77,7 @@ try:
         log_cycle_branch_metrics,
         CycleBranchComponents,
     )
+    from src.analysis.cycle_artifacts import generate_cycle_artifacts
     CYCLE_BRANCH_AVAILABLE = True
 except Exception as e:
     print(f"[CycleBranch] Import failed: {e}")
@@ -5397,6 +5398,27 @@ def train_transformer_world_model_v1(
             print(f"[WorldModelV1] Saved metrics to {metrics_test_path}")
         except Exception as e:
             print(f"[WorldModelV1] Warning: could not save metrics_test.json: {e}")
+
+    # ------------------------------------------------------------------
+    # Cycle Branch Diagnostics
+    # ------------------------------------------------------------------
+    if use_cycle_branch and cycle_branch_components is not None and CYCLE_BRANCH_AVAILABLE:
+        try:
+            print("[CycleBranch] Generating artifacts...")
+            generate_cycle_artifacts(
+                components=cycle_branch_components,
+                loader=val_loader,
+                encoder=world_model,
+                cfg=world_model_config.cycle_branch,
+                run_dir=results_dir,
+                device=device,
+            )
+        except Exception as e:
+            print(f"[CycleBranch] Artifact generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    return best_val_loss
 
     return summary
 

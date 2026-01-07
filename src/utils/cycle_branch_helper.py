@@ -155,6 +155,8 @@ def initialize_cycle_branch(
         mono_on_eta=cfg.mono_on_eta_mods,
         mono_on_dp=cfg.mono_on_dp_mod,
         mono_eps=cfg.mono_eps,
+        lambda_power_balance=cfg.lambda_power_balance,
+        target_names=cfg.targets,
     )
     print(f"  CycleBranchLoss: λ_cycle={cfg.lambda_cycle}, λ_smooth={cfg.lambda_theta_smooth}")
     
@@ -227,11 +229,12 @@ def cycle_branch_forward(
         m_t = torch.ones_like(m_t)
     
     # Compute cycle predictions
-    cycle_pred = components.cycle_layer(
+    cycle_pred, layer_inter = components.cycle_layer(
         ops_t=ops_t,
         m_t=m_t,
         eta_nom=eta_nom,
         cond_ids=cond_ids,
+        return_intermediates=True,
     )
     
     intermediates = {
@@ -239,6 +242,7 @@ def cycle_branch_forward(
         "eta_nom": eta_nom,
         "m_t": m_t,
     }
+    intermediates.update(layer_inter)
     
     return cycle_pred, cycle_target, m_t, eta_nom, intermediates
 
@@ -252,6 +256,7 @@ def cycle_branch_loss(
     epoch: int,
     num_epochs: int,
     mask: Optional[torch.Tensor] = None,
+    intermediates: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compute cycle branch losses.
     
@@ -288,6 +293,7 @@ def cycle_branch_loss(
         theta_seq=theta_seq,
         mask=mask,
         epoch_frac=epoch_frac,
+        intermediates=intermediates,
     )
     
     return total_loss, metrics

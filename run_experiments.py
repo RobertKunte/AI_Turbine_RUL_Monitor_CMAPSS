@@ -778,9 +778,11 @@ def run_single_experiment(config: ExperimentConfig, device: torch.device) -> dic
             cycle_config = CycleBranchConfig(
                 enable=cycle_params_dict.get("enable", False),
                 targets=cycle_params_dict.get("targets", ["T24", "T30", "P30", "T50"]),
+                optional_witnesses=cycle_params_dict.get("optional_witnesses", ["Nf", "Nc", "Ps30"]),
                 lambda_cycle=float(cycle_params_dict.get("lambda_cycle", 0.0)),
                 lambda_theta_smooth=float(cycle_params_dict.get("lambda_theta_smooth", 0.0)),
                 lambda_theta_mono=float(cycle_params_dict.get("lambda_theta_mono", 0.0)),
+                lambda_power_balance=float(cycle_params_dict.get("lambda_power_balance", 0.0)),
                 cycle_loss_type=str(cycle_params_dict.get("cycle_loss_type", "mse")),
                 cycle_huber_beta=float(cycle_params_dict.get("cycle_huber_beta", 1.0)),
                 cycle_ramp_epochs=int(cycle_params_dict.get("cycle_ramp_epochs", 0)),
