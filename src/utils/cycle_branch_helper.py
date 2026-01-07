@@ -224,6 +224,12 @@ def cycle_branch_forward(
     # Get degradation modifiers
     m_t = components.param_head(z_t)
     
+    
+    # Expand m_t if sequence mode
+    if is_seq and m_t.dim() == 2:
+        T = ops_t.shape[1]
+        m_t = m_t.unsqueeze(1).expand(-1, T, -1)
+
     # Warmup: freeze m=1 during warmup epochs
     if cfg.deg_warmup_epochs > 0 and epoch < cfg.deg_warmup_epochs:
         m_t = torch.ones_like(m_t)
