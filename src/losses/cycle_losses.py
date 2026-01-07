@@ -46,6 +46,8 @@ def compute_power_balance_penalty(
     total_penalty = penalty_hpt + penalty_lpt
     
     if mask is not None:
+        if mask.dim() == 3 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
         total_penalty = total_penalty * mask
         valid_count = mask.sum().clamp(min=1.0)
         return total_penalty.sum() / valid_count
@@ -77,10 +79,15 @@ def compute_cycle_loss(
     else:
         loss = F.mse_loss(pred, target, reduction="none")
     
-    # Average over targets dimension
+    # Debug
+    # print(f"[Debug] Loss shape before mean: {loss.shape}")
     loss = loss.mean(dim=-1)  # (B, T) or (B,)
+    # print(f"[Debug] Loss shape after mean: {loss.shape}")
     
     if mask is not None:
+        # print(f"[Debug] Mask shape: {mask.shape}")
+        if mask.dim() == 3 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1) # (B, T)
         # Apply mask
         loss = loss * mask
         valid_count = mask.sum().clamp(min=1.0)
@@ -152,6 +159,8 @@ def compute_theta_smooth_loss(
     diff_sq = (diff ** 2).sum(dim=-1)  # (B, T-1)
     
     if mask is not None:
+        if mask.dim() == 3 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
         # Mask for valid transitions: both t and t-1 must be valid
         mask_transitions = mask[:, 1:] * mask[:, :-1]  # (B, T-1)
         diff_sq = diff_sq * mask_transitions
@@ -209,10 +218,9 @@ def compute_theta_mono_loss(
     # Apply parameter mask
     violations = violations * param_mask.unsqueeze(0).unsqueeze(0)  # (B, T-1, 6)
     
-    # Sum over parameters
-    violations = violations.sum(dim=-1)  # (B, T-1)
-    
     if mask is not None:
+        if mask.dim() == 3 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
         mask_transitions = mask[:, 1:] * mask[:, :-1]
         violations = violations * mask_transitions
         valid_count = mask_transitions.sum().clamp(min=1.0)
