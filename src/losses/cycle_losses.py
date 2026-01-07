@@ -340,6 +340,8 @@ class CycleBranchLoss(torch.nn.Module):
         mono_on_eta: Apply mono to eta modifiers
         mono_on_dp: Apply mono to dp modifier
         mono_eps: Epsilon for mono penalty
+        cycle_target_mean: Optional (num_conditions, 4) mean for condition-wise normalization
+        cycle_target_std: Optional (num_conditions, 4) std for condition-wise normalization
     """
     
     def __init__(
@@ -353,20 +355,37 @@ class CycleBranchLoss(torch.nn.Module):
         mono_on_dp: bool = False,
         mono_eps: float = 1e-4,
         lambda_power_balance: float = 0.0,
+        lambda_theta_prior: float = 0.001,
         target_names: Optional[list[str]] = None,
+        cycle_target_mean: Optional[torch.Tensor] = None,
+        cycle_target_std: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.lambda_cycle = lambda_cycle
         self.lambda_smooth = lambda_smooth
         self.lambda_mono = lambda_mono
         self.lambda_power_balance = lambda_power_balance
-        self.lambda_theta_prior = getattr(self, 'lambda_theta_prior', 0.001)  # Anti-saturation
+        self.lambda_theta_prior = lambda_theta_prior  # Anti-saturation
         self.cycle_loss_type = cycle_loss_type
         self.cycle_huber_beta = cycle_huber_beta
         self.mono_on_eta = mono_on_eta
         self.mono_on_dp = mono_on_dp
         self.mono_eps = mono_eps
         self.target_names = target_names or ["T24", "T30", "P30", "T50"]
+        
+        # Condition-wise normalization buffers (NOT learnable)
+        if cycle_target_mean is not None:
+            self.register_buffer("cycle_target_mean", cycle_target_mean)
+        else:
+            self.register_buffer("cycle_target_mean", None)
+            
+        if cycle_target_std is not None:
+            self.register_buffer("cycle_target_std", cycle_target_std)
+        else:
+            self.register_buffer("cycle_target_std", None)
+        
+        # Debug flag
+        self._debug_printed = False
     
     def forward(
         self,
@@ -376,23 +395,59 @@ class CycleBranchLoss(torch.nn.Module):
         mask: Optional[torch.Tensor] = None,
         epoch_frac: float = 1.0,
         intermediates: Optional[dict] = None,
+        cond_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """Compute combined cycle branch loss.
         
         Args:
-            cycle_pred: Predicted sensors (B, T, n_targets)
-            cycle_target: Target sensors (B, T, n_targets)
+            cycle_pred: Predicted sensors (B, T, n_targets) - RAW thermodynamic units
+            cycle_target: Target sensors (B, T, n_targets) - must be in SAME space as pred
             theta_seq: Degradation modifiers (B, T, 6)
             mask: Optional valid mask (B, T)
             epoch_frac: Fraction of total epochs (for curriculum)
+            intermediates: Optional dict with work_balance etc.
+            cond_ids: Condition IDs (B,) for condition-wise normalization
             
         Returns:
             total_loss: Scalar combined loss
             components: Dict with individual loss components
         """
-        # Cycle reconstruction loss
+        # =====================================================================
+        # Condition-wise normalization (Option A: fixed, no learnable params)
+        # =====================================================================
+        pred_norm = cycle_pred
+        target_norm = cycle_target
+        
+        if self.cycle_target_mean is not None and self.cycle_target_std is not None and cond_ids is not None:
+            # Get mean/std for each batch element based on cond_id
+            mean = self.cycle_target_mean[cond_ids]  # (B, 4)
+            std = self.cycle_target_std[cond_ids]    # (B, 4)
+            
+            # Expand for sequence dimension if needed
+            if cycle_pred.dim() == 3:
+                mean = mean.unsqueeze(1)  # (B, 1, 4)
+                std = std.unsqueeze(1)    # (B, 1, 4)
+            
+            # Normalize both pred and target
+            eps = 1e-6
+            pred_norm = (cycle_pred - mean) / (std + eps)
+            target_norm = (cycle_target - mean) / (std + eps)
+            
+            # Debug prints (once)
+            if not self._debug_printed:
+                with torch.no_grad():
+                    print("\n[CycleBranchLoss] Condition-wise Normalization Debug:")
+                    print(f"  cycle_pred (raw): mean={cycle_pred.mean():.2f}, std={cycle_pred.std():.2f}")
+                    print(f"  cycle_target (raw): mean={cycle_target.mean():.2f}, std={cycle_target.std():.2f}")
+                    print(f"  pred_norm: mean={pred_norm.mean():.4f}, std={pred_norm.std():.4f}")
+                    print(f"  target_norm: mean={target_norm.mean():.4f}, std={target_norm.std():.4f}")
+                    for i, name in enumerate(self.target_names[:cycle_pred.shape[-1]]):
+                        print(f"    {name} raw_pred={cycle_pred[..., i].mean():.2f}, norm_pred={pred_norm[..., i].mean():.4f}")
+                self._debug_printed = True
+        
+        # Cycle reconstruction loss (in normalized space)
         l_cycle = compute_cycle_loss(
-            cycle_pred, cycle_target,
+            pred_norm, target_norm,
             loss_type=self.cycle_loss_type,
             huber_beta=self.cycle_huber_beta,
             mask=mask,

@@ -50,6 +50,7 @@ def initialize_cycle_branch(
     feature_cols: List[str],
     num_conditions: int,
     device: torch.device,
+    scaler_dict: Optional[Dict[int, Any]] = None,
 ) -> Optional[CycleBranchComponents]:
     """Initialize cycle branch components.
     
@@ -59,6 +60,8 @@ def initialize_cycle_branch(
         feature_cols: List of feature column names
         num_conditions: Number of operating conditions
         device: PyTorch device
+        scaler_dict: Dict mapping condition_id -> fitted StandardScaler
+            (used for condition-wise normalization in loss)
         
     Returns:
         CycleBranchComponents or None if not enabled
@@ -135,7 +138,7 @@ def initialize_cycle_branch(
     ).to(device)
     print(f"  ParamHeadTheta6: z_dim={z_dim}, hidden={cfg.param_head_hidden}")
     
-    # 6. Initialize CycleLayerMVP
+    # 6. Initialize CycleLayerMVP (outputs RAW thermodynamic units)
     cycle_layer = CycleLayerMVP(
         n_targets=len(cfg.targets),
         num_conditions=num_conditions,
@@ -145,7 +148,30 @@ def initialize_cycle_branch(
     ).to(device)
     print(f"  CycleLayerMVP: n_targets={len(cfg.targets)}, pr_mode={cfg.pr_mode}")
     
-    # 7. Initialize loss function
+    # 7. Extract cycle target scaler stats for condition-wise normalization
+    cycle_target_mean = None
+    cycle_target_std = None
+    
+    try:
+        from src.utils.cycle_target_scaler import extract_cycle_target_stats
+        
+        if scaler_dict is not None and len(scaler_dict) > 0:
+            cycle_target_mean, cycle_target_std = extract_cycle_target_stats(
+                scaler_dict=scaler_dict,
+                feature_cols=feature_cols,
+                target_indices=target_indices,
+                num_conditions=num_conditions,
+            )
+            cycle_target_mean = cycle_target_mean.to(device)
+            cycle_target_std = cycle_target_std.to(device)
+            print(f"  Extracted cycle target stats: mean/std shape=({cycle_target_mean.shape})")
+            print(f"    Example cond=0 mean: {[f'{cycle_target_mean[0, i].item():.1f}' for i in range(min(4, cycle_target_mean.shape[-1]))]}")
+            print(f"    Example cond=0 std:  {[f'{cycle_target_std[0, i].item():.1f}' for i in range(min(4, cycle_target_std.shape[-1]))]}")
+    except Exception as e:
+        print(f"  ⚠️  Could not extract cycle target stats: {e}")
+        print(f"  Will use un-normalized loss (may cause scale mismatch)")
+    
+    # 8. Initialize loss function with scaler stats
     loss_fn = CycleBranchLoss(
         lambda_cycle=cfg.lambda_cycle,
         lambda_smooth=cfg.lambda_theta_smooth,
@@ -156,9 +182,12 @@ def initialize_cycle_branch(
         mono_on_dp=cfg.mono_on_dp_mod,
         mono_eps=cfg.mono_eps,
         lambda_power_balance=cfg.lambda_power_balance,
+        lambda_theta_prior=getattr(cfg, 'lambda_theta_prior', 0.001),
         target_names=cfg.targets,
+        cycle_target_mean=cycle_target_mean,
+        cycle_target_std=cycle_target_std,
     )
-    print(f"  CycleBranchLoss: λ_cycle={cfg.lambda_cycle}, λ_smooth={cfg.lambda_theta_smooth}")
+    print(f"  CycleBranchLoss: λ_cycle={cfg.lambda_cycle}, λ_smooth={cfg.lambda_theta_smooth}, λ_prior={getattr(cfg, 'lambda_theta_prior', 0.001)}")
     
     total_params = sum(
         p.numel() for p in 
@@ -177,6 +206,7 @@ def initialize_cycle_branch(
         target_indices=target_indices,
         ops_indices=ops_indices,
     )
+
 
 
 def cycle_branch_forward(
@@ -275,18 +305,21 @@ def cycle_branch_loss(
     num_epochs: int,
     mask: Optional[torch.Tensor] = None,
     intermediates: Optional[dict] = None,
+    cond_ids: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compute cycle branch losses.
     
     Args:
         components: CycleBranchComponents
-        cycle_pred: Predicted sensor values
-        cycle_target: Target sensor values
+        cycle_pred: Predicted sensor values (RAW thermodynamic units)
+        cycle_target: Target sensor values (RAW from X_batch)
         m_t: Degradation modifiers
         cfg: CycleBranchConfig
         epoch: Current epoch
         num_epochs: Total epochs
         mask: Optional valid mask
+        intermediates: Optional dict with cycle layer intermediates
+        cond_ids: Condition IDs (B,) for condition-wise normalization
         
     Returns:
         total_loss: Scalar loss
@@ -312,6 +345,7 @@ def cycle_branch_loss(
         mask=mask,
         epoch_frac=epoch_frac,
         intermediates=intermediates,
+        cond_ids=cond_ids,
     )
     
     return total_loss, metrics
