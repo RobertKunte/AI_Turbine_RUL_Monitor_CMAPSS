@@ -2265,20 +2265,19 @@ def train_world_model_universal_v3(
                             running_val_cycle_loss += val_loss_cycle.item() * X_batch.size(0)
                             n_val_cycle_samples += X_batch.size(0)
                             
-                            # Per-sensor SSE (Sum of Squared Errors)
-                            n_sensors = cycle_pred.shape[-1]
+                            # Per-sensor loss accumulation (SCALED space from val_cycle_metrics)
+                            # val_cycle_metrics contains keys like 'cycle_loss_T24' with Huber/MSE loss in scaled space
+                            sensor_names = getattr(cycle_cfg, "targets", ["T24", "T30", "P30", "T50"])
                             if running_val_cycle_per_sensor_sse is None:
-                                running_val_cycle_per_sensor_sse = [0.0] * n_sensors
+                                running_val_cycle_per_sensor_sse = {name: 0.0 for name in sensor_names}
+                                running_val_cycle_per_sensor_counts = {name: 0 for name in sensor_names}
                             
-                            for s_idx in range(n_sensors):
-                                pred_s = cycle_pred[..., s_idx]
-                                targ_s = cycle_target[..., s_idx]
-                                if mask_batch is not None:
-                                    mask_sq = mask_batch.squeeze(-1) if mask_batch.dim() == 3 else mask_batch
-                                    sse = ((pred_s - targ_s) ** 2 * mask_sq).sum().item()
-                                else:
-                                    sse = ((pred_s - targ_s) ** 2).sum().item()
-                                running_val_cycle_per_sensor_sse[s_idx] += sse
+                            for name in sensor_names:
+                                key = f"cycle_loss_{name}"
+                                if key in val_cycle_metrics:
+                                    # Accumulate loss * batch_size for weighted average
+                                    running_val_cycle_per_sensor_sse[name] += val_cycle_metrics[key] * X_batch.size(0)
+                                    running_val_cycle_per_sensor_counts[name] += X_batch.size(0)
                             
                             # Theta health accumulation
                             if THETA_HEALTH_AVAILABLE:
@@ -2386,20 +2385,23 @@ def train_world_model_universal_v3(
         if use_cycle_branch and n_val_cycle_samples > 0:
             epoch_val_cycle_loss = running_val_cycle_loss / n_val_cycle_samples
             
-            # Per-sensor RMSE
+            # Per-sensor RMSE_scaled (from scaled-space Huber/MSE loss)
             sensor_names = getattr(cycle_cfg, "targets", ["T24", "T30", "P30", "T50"])
-            per_sensor_rmse = []
-            if running_val_cycle_per_sensor_sse is not None:
-                for s_idx, sse in enumerate(running_val_cycle_per_sensor_sse):
-                    mse = sse / max(1, n_val_cycle_samples * horizon)  # Approximate sample count
-                    rmse = np.sqrt(mse)
-                    per_sensor_rmse.append(rmse)
+            per_sensor_rmse = {}
+            if running_val_cycle_per_sensor_sse is not None and isinstance(running_val_cycle_per_sensor_sse, dict):
+                for name in sensor_names:
+                    if name in running_val_cycle_per_sensor_sse:
+                        count = running_val_cycle_per_sensor_counts.get(name, 1)
+                        avg_loss = running_val_cycle_per_sensor_sse[name] / max(1, count)
+                        # RMSE_scaled = sqrt(avg_huber_loss) - approximation since Huber ≈ MSE for small errors
+                        rmse = np.sqrt(avg_loss) if avg_loss >= 0 else avg_loss
+                        per_sensor_rmse[name] = rmse
             
-            # Format per-sensor RMSE string
+            # Format per-sensor RMSE string (clearly labeled as scaled space)
             sensor_rmse_str = ", ".join([
-                f"{sensor_names[i] if i < len(sensor_names) else f'S{i}'}: {rmse:.4f}"
-                for i, rmse in enumerate(per_sensor_rmse)
-            ])
+                f"{name}: {rmse:.4f}"
+                for name, rmse in per_sensor_rmse.items()
+            ]) if per_sensor_rmse else "N/A"
             
             # Theta health logging
             theta_health_str = ""
@@ -2414,7 +2416,7 @@ def train_world_model_universal_v3(
                 ramp_factor = 1.0
             
             print(f"  Cycle: val_loss={epoch_val_cycle_loss:.4f} (ramp={ramp_factor:.2f}) | "
-                  f"RMSE: {sensor_rmse_str} | {theta_health_str}")
+                  f"RMSE_scaled: {sensor_rmse_str} | {theta_health_str}")
             
             # Record to history
             history.setdefault("val_cycle_loss", []).append(epoch_val_cycle_loss)

@@ -182,12 +182,12 @@ def initialize_cycle_branch(
         mono_on_dp=cfg.mono_on_dp_mod,
         mono_eps=cfg.mono_eps,
         lambda_power_balance=cfg.lambda_power_balance,
-        lambda_theta_prior=getattr(cfg, 'lambda_theta_prior', 0.001),
+        lambda_theta_prior=getattr(cfg, 'lambda_theta_prior', 0.01),  # Default 0.01 for anti-saturation
         target_names=cfg.targets,
         cycle_target_mean=cycle_target_mean,
         cycle_target_std=cycle_target_std,
     )
-    print(f"  CycleBranchLoss: λ_cycle={cfg.lambda_cycle}, λ_smooth={cfg.lambda_theta_smooth}, λ_prior={getattr(cfg, 'lambda_theta_prior', 0.001)}")
+    print(f"  CycleBranchLoss: λ_cycle={cfg.lambda_cycle}, λ_smooth={cfg.lambda_theta_smooth}, λ_prior={getattr(cfg, 'lambda_theta_prior', 0.01)}")
     
     total_params = sum(
         p.numel() for p in 

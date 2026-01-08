@@ -113,6 +113,25 @@ class TestCycleBranchLossScaledMode:
         assert "cond_ids" in str(excinfo.value)
 
 
+class TestLambdaThetaPriorConfig:
+    """Tests for lambda_theta_prior config plumbing."""
+    
+    def test_lambda_theta_prior_default_is_0_01(self):
+        """Default lambda_theta_prior should be 0.01."""
+        loss_fn = CycleBranchLoss()
+        assert loss_fn.lambda_theta_prior == 0.01, (
+            f"Expected lambda_theta_prior=0.01, got {loss_fn.lambda_theta_prior}"
+        )
+    
+    def test_lambda_theta_prior_custom_value_used(self):
+        """Custom lambda_theta_prior should be respected."""
+        loss_fn = CycleBranchLoss(lambda_theta_prior=0.05)
+        assert loss_fn.lambda_theta_prior == 0.05
+        
+        loss_fn2 = CycleBranchLoss(lambda_theta_prior=0.001)
+        assert loss_fn2.lambda_theta_prior == 0.001
+
+
 class TestPowerBalancePenaltyDevice:
     """Tests for compute_power_balance_penalty device handling."""
     
