@@ -66,6 +66,70 @@ def generate_cycle_artifacts(
     if len(preds) == 0:
         logger.warning("No cycle predictions collected.")
         return {}
+    
+    # =========================================================================
+    # SANITY DEBUG PRINTS (one-time)
+    # =========================================================================
+    sensor_names = list(components.target_col_map.keys()) if components.target_col_map else ["T24", "T30", "P30", "T50"]
+    
+    logger.info("\n[CycleBranch][ARTIFACT][Sanity] First-batch diagnostics:")
+    
+    # Cond_id distribution
+    unique_conds, counts = np.unique(cond_ids, return_counts=True)
+    cond_dist = {int(c): int(n) for c, n in zip(unique_conds, counts)}
+    logger.info(f"  cond_ids distribution: {cond_dist}")
+    
+    # Global stats (preds = pred_raw from cycle layer, targets = already scaled from dataset)
+    logger.info(f"  preds (pred_raw):   shape={preds.shape}, mean={preds.mean():.2f}, std={preds.std():.2f}")
+    logger.info(f"  targets (y_scaled): shape={targets.shape}, mean={targets.mean():.4f}, std={targets.std():.4f}")
+    
+    # Compute pred_scaled if scaler_stats available
+    if scaler_stats is not None and cond_ids is not None:
+        from src.utils.cycle_metrics_space import normalize_cycle_pred, denormalize_cycle_target
+        
+        # pred_scaled = normalize raw predictions
+        pred_scaled = normalize_cycle_pred(preds, cond_ids, scaler_stats)
+        
+        # y_true_raw = denormalize scaled targets  
+        targets_raw = denormalize_cycle_target(targets, cond_ids, scaler_stats)
+        
+        logger.info(f"  pred_scaled (computed): mean={pred_scaled.mean():.4f}, std={pred_scaled.std():.4f}")
+        logger.info(f"  targets_raw (computed): mean={targets_raw.mean():.2f}, std={targets_raw.std():.2f}")
+        
+        # Per-sensor stats
+        logger.info("  Per-sensor stats:")
+        for i, name in enumerate(sensor_names[:preds.shape[-1]]):
+            logger.info(f"    {name}:")
+            logger.info(f"      pred_raw:     mean={preds[..., i].mean():.2f}, std={preds[..., i].std():.2f}")
+            logger.info(f"      pred_scaled:  mean={pred_scaled[..., i].mean():.4f}, std={pred_scaled[..., i].std():.4f}")
+            logger.info(f"      target_scaled:mean={targets[..., i].mean():.4f}, std={targets[..., i].std():.4f}")
+            logger.info(f"      target_raw:   mean={targets_raw[..., i].mean():.2f}, std={targets_raw[..., i].std():.2f}")
+        
+        # Sample rows (first 5)
+        logger.info("  Sample rows (first 5):")
+        for idx in range(min(5, len(preds))):
+            for i, name in enumerate(sensor_names[:preds.shape[-1]]):
+                cid = cond_ids[idx] if preds.ndim == 2 else cond_ids[idx]
+                # Take first timestep if 3D
+                if preds.ndim == 3:
+                    p_raw_val = preds[idx, 0, i]
+                    p_sc_val = pred_scaled[idx, 0, i]
+                    t_sc_val = targets[idx, 0, i]
+                    t_raw_val = targets_raw[idx, 0, i]
+                else:
+                    p_raw_val = preds[idx, i]
+                    p_sc_val = pred_scaled[idx, i]
+                    t_sc_val = targets[idx, i]
+                    t_raw_val = targets_raw[idx, i]
+                logger.info(f"    [{idx}] {name}: cid={cid}, y_raw={t_raw_val:.1f}, p_raw={p_raw_val:.1f}, y_sc={t_sc_val:.3f}, p_sc={p_sc_val:.3f}")
+        
+        # Fail-fast check
+        mean_abs_scaled = np.abs(pred_scaled).mean()
+        if mean_abs_scaled > 50:
+            logger.error(f"  ERROR: pred_scaled looks unnormalized (mean_abs={mean_abs_scaled:.2f}). Check scaler stats!")
+            logger.error(f"  scaler_stats mean[0]={scaler_stats[0][0]}, std[0]={scaler_stats[1][0]}")
+    else:
+        logger.warning("  scaler_stats not available - cannot compute normalized metrics")
         
     # 2. Compute Metrics in specified space
     try:

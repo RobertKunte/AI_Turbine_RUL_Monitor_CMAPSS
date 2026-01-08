@@ -5709,6 +5709,16 @@ def train_transformer_world_model_v1(
     if use_cycle_branch and cycle_branch_components is not None and CYCLE_BRANCH_AVAILABLE:
         try:
             print("[CycleBranch] Generating artifacts...")
+            
+            # Extract scaler_stats from loss_fn buffers for consistent scaled metrics
+            scaler_stats = None
+            if hasattr(cycle_branch_components.loss_fn, 'cycle_target_mean'):
+                mean_buf = cycle_branch_components.loss_fn.cycle_target_mean
+                std_buf = cycle_branch_components.loss_fn.cycle_target_std
+                if mean_buf is not None and std_buf is not None:
+                    scaler_stats = (mean_buf.cpu().numpy(), std_buf.cpu().numpy())
+                    print(f"[CycleBranch] Using scaler_stats: mean shape={mean_buf.shape}, std shape={std_buf.shape}")
+            
             generate_cycle_artifacts(
                 components=cycle_branch_components,
                 loader=val_loader,
@@ -5716,6 +5726,8 @@ def train_transformer_world_model_v1(
                 cfg=world_model_config.cycle_branch,
                 run_dir=results_dir,
                 device=device,
+                scaler_stats=scaler_stats,  # NEW: pass scaler stats for scaled metrics
+                default_space="scaled",      # NEW: explicitly request scaled space
             )
         except Exception as e:
             print(f"[CycleBranch] Artifact generation failed: {e}")

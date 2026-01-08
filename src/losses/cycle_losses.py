@@ -633,13 +633,18 @@ class CycleBranchLoss(torch.nn.Module):
         
         components = {
             "cycle_loss": float(l_cycle.item()),
+            "cycle_loss_w": float((lambda_cycle_curr * l_cycle).item()),  # weighted
             "theta_smooth_loss": float(l_smooth.item()),
+            "theta_smooth_loss_w": float((self.lambda_smooth * l_smooth).item()),
             "theta_mono_loss": float(l_mono.item()),
             "power_balance_loss": float(l_power.item()),
             "theta_prior_loss": float(l_theta_prior.item()),
-            "theta_upper_loss": float(l_theta_upper.item()),  # NEW
-            "theta_upper_thr": self.theta_upper_thr,          # NEW: log threshold for reference
+            "theta_prior_loss_w": float((self.lambda_theta_prior * l_theta_prior).item()),
+            "theta_upper_loss": float(l_theta_upper.item()),  # raw
+            "theta_upper_loss_w": float((self.lambda_theta_upper * l_theta_upper).item()),  # weighted
+            "theta_upper_thr": self.theta_upper_thr,
             "lambda_cycle_effective": lambda_cycle_curr,
+            "lambda_theta_upper": self.lambda_theta_upper,
             "total_cycle_branch_loss": float(total.item()),
         }
         # Add per-sensor metrics
