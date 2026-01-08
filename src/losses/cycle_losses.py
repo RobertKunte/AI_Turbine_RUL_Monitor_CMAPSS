@@ -381,7 +381,7 @@ class CycleBranchLoss(torch.nn.Module):
         mono_on_dp: bool = False,
         mono_eps: float = 1e-4,
         lambda_power_balance: float = 0.0,
-        lambda_theta_prior: float = 0.01,  # Anti-saturation prior (default 0.01)
+        lambda_theta_prior: float = 0.05,  # Anti-saturation prior (default 0.05 for stronger effect)
         target_names: Optional[list[str]] = None,
         cycle_target_mean: Optional[torch.Tensor] = None,
         cycle_target_std: Optional[torch.Tensor] = None,

@@ -29,8 +29,15 @@ def generate_cycle_artifacts(
     run_dir: Path,
     device: torch.device,
     num_samples: int = 1000,
+    scaler_stats: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    default_space: str = "scaled",
 ) -> Dict[str, Any]:
     """Generate all cycle branch artifacts (metrics, plots, summary).
+    
+    SPACE CONTRACT:
+    - If scaler_stats is provided: compute metrics in scaled space (normalized)
+    - If scaler_stats is None and default_space="raw": compute raw metrics
+    - Fail-fast if default_space="scaled" but no scaler_stats
     
     Args:
         components: CycleBranchComponents
@@ -40,6 +47,8 @@ def generate_cycle_artifacts(
         run_dir: Run directory to save artifacts
         device: Device
         num_samples: Number of samples to use for detailed plotting
+        scaler_stats: Optional tuple of (mean, std) arrays for condition-wise normalization
+        default_space: "scaled" or "raw" - determines metric space
         
     Returns:
         Dict containing computed metrics
@@ -49,8 +58,8 @@ def generate_cycle_artifacts(
     
     logger.info(f"Generating cycle artifacts in {out_dir}...")
     
-    # 1. Collect predictions
-    preds, targets, m_seqs, eta_noms, eta_effs, ops_seqs = _collect_predictions(
+    # 1. Collect predictions (now also returns cond_ids)
+    preds, targets, m_seqs, eta_noms, eta_effs, ops_seqs, cond_ids = _collect_predictions(
         components, loader, encoder, cfg, device, max_batches=50
     )
     
@@ -58,12 +67,31 @@ def generate_cycle_artifacts(
         logger.warning("No cycle predictions collected.")
         return {}
         
-    # 2. Compute Metrics
-    metrics = _compute_metrics(preds, targets, components.target_col_map)
+    # 2. Compute Metrics in specified space
+    try:
+        metrics = _compute_metrics(
+            preds, targets, components.target_col_map,
+            scaler_stats=scaler_stats,
+            cond_ids=cond_ids,
+            space=default_space,
+        )
+    except ValueError as e:
+        # Fallback to raw space if scaled config missing
+        logger.warning(f"Could not compute scaled metrics: {e}. Falling back to raw space.")
+        metrics = _compute_metrics(
+            preds, targets, components.target_col_map,
+            scaler_stats=None,
+            cond_ids=None,
+            space="raw",
+        )
+    
+    # Add space annotation to printed output
+    from src.utils.cycle_metrics_space import format_cycle_metrics_for_print
+    logger.info(f"  {format_cycle_metrics_for_print(metrics)}")
     
     # Save metrics JSON
     with open(out_dir / "metrics_cycle.json", "w") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(metrics, f, indent=2, default=str)
         
     # Save metrics CSV
     metrics_df = pd.DataFrame(metrics).transpose()
@@ -87,8 +115,13 @@ def _collect_predictions(
     cfg: CycleBranchConfig,
     device: torch.device,
     max_batches: int = 20,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict, np.ndarray]:
-    """Run inference to collect batches of data."""
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict, np.ndarray, np.ndarray]:
+    """Run inference to collect batches of data.
+    
+    Returns:
+        Tuple of (preds, targets, m_seqs, eta_noms, eta_effs, ops_seqs, cond_ids)
+        All numpy arrays with shape (N, T, D) or similar
+    """
     components.cycle_layer.eval()
     components.nominal_head.eval()
     components.param_head.eval()
@@ -99,6 +132,7 @@ def _collect_predictions(
     all_m = []
     all_eta_nom = []
     all_ops = []
+    all_cond_ids = []  # NEW: collect condition IDs
     
     # Can't easily stack dicts of intermediates, so detailed eta/work analysis 
     # might be limited to what we explicitly extract here or last batch.
@@ -125,6 +159,9 @@ def _collect_predictions(
             X = X.to(device)
             if cond_ids is not None:
                 cond_ids = cond_ids.to(device)
+            else:
+                # Default to condition 0 if not provided
+                cond_ids = torch.zeros(X.size(0), dtype=torch.long, device=device)
                 
             # Encoder forward (need z_t sequence)
             # Assuming UniversalEncoderV3 style or V2
@@ -162,6 +199,7 @@ def _collect_predictions(
             all_m.append(m_t.cpu().numpy())
             all_eta_nom.append(eta_nom.cpu().numpy())
             all_ops.append(inter["ops_t"].cpu().numpy())
+            all_cond_ids.append(cond_ids.cpu().numpy())  # NEW: collect cond_ids
             
             if i == 0 and "eta_eff" in inter:
                 # Capture first batch eta dict structure for reference/debug
@@ -169,7 +207,7 @@ def _collect_predictions(
                 last_eta_eff = {k: v.cpu().numpy() for k,v in inter["eta_eff"].items()}
 
     if not all_preds:
-        return [], [], [], [], {}, []
+        return [], [], [], [], {}, [], []
 
     return (
         np.concatenate(all_preds, axis=0),
@@ -178,39 +216,61 @@ def _collect_predictions(
         np.concatenate(all_eta_nom, axis=0),
         last_eta_eff, # Return just one batch for detailed eta plots to save memory
         np.concatenate(all_ops, axis=0),
+        np.concatenate(all_cond_ids, axis=0),  # NEW: return cond_ids
     )
 
 
-def _compute_metrics(preds, targets, col_map):
-    """Compute MSE/MAE/Huber per sensor."""
-    # Flatten (N, T, 4) -> (N*T, 4)
-    preds_f = preds.reshape(-1, preds.shape[-1])
-    targets_f = targets.reshape(-1, targets.shape[-1])
+def _compute_metrics(
+    preds: np.ndarray,
+    targets: np.ndarray,
+    col_map: Dict[str, str],
+    scaler_stats: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    cond_ids: Optional[np.ndarray] = None,
+    space: str = "scaled",
+) -> Dict[str, Dict[str, Any]]:
+    """Compute MSE/MAE/RMSE per sensor in specified space.
     
-    metrics = {}
-    sensor_names = list(col_map.keys()) # T24, T30, etc.
+    SPACE CONTRACT:
+    - If space="scaled" and scaler_stats+cond_ids provided: normalize raw preds before comparison
+    - If space="raw": compare raw preds (requires targets to be denormalized)
+    - Fail-fast if space="scaled" but missing normalization config
     
-    for i, name in enumerate(sensor_names):
-        if i >= preds_f.shape[1]: 
-            break
-        p = preds_f[:, i]
-        t = targets_f[:, i]
+    Args:
+        preds: Raw predictions from cycle layer (N, T, n_targets)
+        targets: Targets (already scaled if cycle_target_space="scaled")
+        col_map: Dict mapping sensor names to column names
+        scaler_stats: Tuple of (mean, std) arrays, each (num_conditions, n_targets)
+        cond_ids: Condition IDs (N,) for each sample
+        space: "scaled" or "raw" - determines output metric space
         
-        mse = np.mean((p - t)**2)
-        mae = np.mean(np.abs(p - t))
-        
-        metrics[name] = {
-            "MSE": float(mse),
-            "MAE": float(mae),
-            "RMSE": float(np.sqrt(mse)),
-        }
+    Returns:
+        Dict with per-sensor metrics including space annotation
+    """
+    from src.utils.cycle_metrics_space import (
+        normalize_cycle_pred,
+        compute_cycle_metrics,
+        validate_cycle_space_config,
+    )
     
-    # Overall
-    metrics["Overall"] = {
-        "MSE": float(np.mean((preds_f - targets_f)**2)),
-        "MAE": float(np.mean(np.abs(preds_f - targets_f)))
-    }
-    return metrics
+    sensor_names = list(col_map.keys())
+    
+    # Validate config
+    if space == "scaled":
+        validate_cycle_space_config(space, scaler_stats, cond_ids, "cycle_artifacts._compute_metrics")
+        # Normalize raw preds to scaled space
+        preds_compare = normalize_cycle_pred(preds, cond_ids, scaler_stats)
+        targets_compare = targets  # Already scaled
+    else:
+        # Raw space comparison - targets need to be denormalized
+        from src.utils.cycle_metrics_space import denormalize_cycle_target
+        if scaler_stats is not None and cond_ids is not None:
+            targets_compare = denormalize_cycle_target(targets, cond_ids, scaler_stats)
+        else:
+            targets_compare = targets
+        preds_compare = preds
+    
+    # Compute metrics using shared helper
+    return compute_cycle_metrics(preds_compare, targets_compare, sensor_names, space=space)
 
 
 def _plot_residuals(preds, targets, col_map, out_dir):

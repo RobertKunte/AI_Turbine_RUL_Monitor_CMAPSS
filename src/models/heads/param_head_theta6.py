@@ -112,8 +112,13 @@ class ParamHeadTheta6(nn.Module):
         # Forward through MLP
         raw = self.mlp(z_flat)  # (B*T, 6)
         
-        # Apply sigmoid scaling to enforce bounds
-        m_t = self.m_min + self.m_range * torch.sigmoid(raw)
+        # Apply eps-bounded sigmoid to prevent saturation
+        # Standard sigmoid maps to (0, 1), but we constrain to [0.02, 0.98]
+        # This ensures m never reaches exactly the bounds, preserving gradient flow
+        u = torch.sigmoid(raw)
+        u = u * 0.96 + 0.02  # Maps [0.02, 0.98] - never hits extremes
+        
+        m_t = self.m_min + self.m_range * u
         
         # Reshape back
         return m_t.reshape(*input_shape, 6)
