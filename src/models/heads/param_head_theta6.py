@@ -74,21 +74,26 @@ class ParamHeadTheta6(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights for near-1.0 output at start (healthy state)."""
+        """Initialize weights for mid-range output at start (degraded state).
+        
+        Key insight: We want θ to start ~0.92 (mid-range) so gradients flow.
+        If θ starts near 1.0 (healthy), it saturates and gradients vanish.
+        
+        sigmoid(-0.5) ≈ 0.38 → m = 0.85 + 0.38 * 0.15 ≈ 0.91
+        """
         for m in self.mlp.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                # Small weights for stability
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
                 if m.bias is not None:
-                    # Initialize bias to produce sigmoid output near 1.0
-                    # sigmoid(2.0) ≈ 0.88, which maps to m ≈ 0.98 for eta bounds
-                    nn.init.constant_(m.bias, 0.5)
+                    nn.init.constant_(m.bias, 0.0)  # Neutral bias for hidden layers
         
-        # Override final layer bias for near-healthy initialization
+        # Override final layer for mid-range θ initialization
         final_layer = self.mlp[-1]
         if hasattr(final_layer, "bias") and final_layer.bias is not None:
-            # sigmoid(2.0) ≈ 0.88 -> m ≈ min + 0.88 * range
-            # For eta: 0.85 + 0.88 * 0.15 ≈ 0.98
-            nn.init.constant_(final_layer.bias, 2.0)
+            # sigmoid(-0.5) ≈ 0.38 → m ≈ min + 0.38 * range
+            # For eta: 0.85 + 0.38 * 0.15 ≈ 0.91 (mid-range, not saturated)
+            nn.init.constant_(final_layer.bias, -0.5)
     
     def forward(self, z_t: torch.Tensor) -> torch.Tensor:
         """Compute degradation modifiers from latent representation.

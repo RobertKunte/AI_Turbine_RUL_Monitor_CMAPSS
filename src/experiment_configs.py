@@ -5277,7 +5277,7 @@ def get_wm_v3_fd004_b22_cycle_config() -> ExperimentConfig:
         "lambda_theta_smooth": 0.1,    # Smoothness for interpretation
         "lambda_theta_mono": 0.05,     # Weak monotonicity
         "lambda_power_balance": 0.01,  # Weak power balance
-        "lambda_theta_prior": 0.003,   # Anti-saturation prior
+        "lambda_theta_prior": 0.01,    # Anti-saturation prior (increased from 0.003)
         
         "cycle_loss_type": "huber",
         "cycle_huber_beta": 0.1,

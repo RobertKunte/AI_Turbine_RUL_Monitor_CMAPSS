@@ -115,10 +115,19 @@ class CycleLayerMVP(nn.Module):
             self.register_buffer("pr_min", torch.tensor([1.1, 1.1, 5.0]))
             self.register_buffer("pr_max", torch.tensor([2.0, 3.0, 20.0]))
         
-        # NOTE: CycleLayerMVP outputs RAW thermodynamic units (°R, PSIA).
-        # Normalization is done externally using condition-wise scaler stats
-        # for consistency with the StandardScaler'd training targets.
-        # No learnable output normalization here ("Option A").
+        # ================================================================
+        # Learnable output affine mapping: physics_output → sensor_space
+        # ================================================================
+        # The physics model outputs values in a theoretical thermodynamic space
+        # that doesn't match the actual CMAPSS sensor ranges.
+        # These learnable parameters bridge the gap:
+        #   sensor_pred = physics_pred * output_scale + output_bias
+        # 
+        # Initialize as identity transform (scale=1, bias=0).
+        # During training, these learn to map physics space → sensor space.
+        # ================================================================
+        self.output_bias = nn.Parameter(torch.zeros(n_targets))
+        self.output_scale = nn.Parameter(torch.ones(n_targets))
     
     def _safe_lower_bound(
         self,
@@ -410,8 +419,16 @@ class CycleLayerMVP(nn.Module):
         # Reshape back to (B, T, 4)
         cycle_pred = cycle_pred.reshape(B, T, self.n_targets)
         
-        # NOTE: cycle_pred is in RAW thermodynamic units (°R, PSIA).
-        # Normalization is done externally using condition-wise scaler stats.
+        # ================================================================
+        # Apply learnable affine mapping: physics -> sensor space
+        # ================================================================
+        # cycle_pred is initially in physics thermodynamic space (°R, PSIA).
+        # The learnable output_scale and output_bias bridge the gap between
+        # physics model outputs and actual CMAPSS sensor data ranges.
+        # After this transform, cycle_pred should be in the same raw space
+        # as the original sensor data (before StandardScaler was applied).
+        # ================================================================
+        cycle_pred = cycle_pred * self.output_scale + self.output_bias
         
         if not is_seq:
             cycle_pred = cycle_pred.squeeze(1)  # (B, n_targets)

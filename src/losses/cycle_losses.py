@@ -31,7 +31,9 @@ def compute_power_balance_penalty(
     keys = ["W_hpc", "W_hpt", "W_fan", "W_lpc", "W_lpt"]
     for k in keys:
         if k not in work_balance:
-            return torch.tensor(0.0)
+            # Device-safe zero return: use first available tensor's device
+            ref_device = next((v.device for v in work_balance.values() if hasattr(v, 'device')), torch.device('cpu'))
+            return torch.zeros((), device=ref_device)
 
     W_hpc = work_balance["W_hpc"]
     W_hpt = work_balance["W_hpt"]
@@ -57,33 +59,41 @@ def compute_power_balance_penalty(
 
 def compute_theta_prior_loss(
     m_t: torch.Tensor,
-    upper_bound: float = 0.995,
-    lower_bound: float = 0.90,
+    upper_bound: float = 0.98,
+    lower_bound: float = 0.88,
+    center_target: float = 0.92,
     mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute anti-saturation prior for theta (degradation modifiers).
     
-    Penalizes m(t) values that approach the upper bound (prevents m=1 collapse)
-    and optionally pushes away from lower bound.
-    
-    L_prior = mean(ReLU(m_t - upper_bound)) + 0.1 * mean(ReLU(lower_bound - m_t))
+    Combines:
+    1. Hard upper penalty: ReLU(m_t - upper_bound) - prevents m=1 saturation
+    2. Weak lower penalty: ReLU(lower_bound - m_t) - prevents m=0 collapse  
+    3. Soft center pull: 0.1 * (m_t - center)^2 - continuous gradient toward mid-range
     
     Args:
         m_t: Degradation modifiers (B, T, 6) or (B, 6)
-        upper_bound: Soft upper limit (default 0.995)
-        lower_bound: Soft lower limit (default 0.90)
+        upper_bound: Soft upper limit (default 0.98)
+        lower_bound: Soft lower limit (default 0.88)
+        center_target: Target mid-range value (default 0.92)
         mask: Optional mask (B, T) or (B, T, 1)
         
     Returns:
         Scalar prior loss
     """
-    # Upper bound penalty: ReLU(m_t - upper_bound)
-    upper_penalty = F.relu(m_t - upper_bound)
+    # 1. Upper bound penalty (asymmetric - STRONGER to prevent m=1.0)
+    # Quadratic penalty above threshold for stronger gradient
+    exc_upper = F.relu(m_t - upper_bound)
+    upper_penalty = exc_upper ** 2 * 10.0  # Quadratic, 10x weight
     
-    # Lower bound penalty (weaker): 0.1 * ReLU(lower_bound - m_t)
-    lower_penalty = 0.1 * F.relu(lower_bound - m_t)
+    # 2. Lower bound penalty (weaker, linear)
+    lower_penalty = 0.5 * F.relu(lower_bound - m_t)
     
-    total_penalty = upper_penalty + lower_penalty
+    # 3. Center regularization (soft L2 pull toward mid-range)
+    # This provides gradient even when not at bounds
+    center_penalty = 0.1 * (m_t - center_target) ** 2
+    
+    total_penalty = upper_penalty + lower_penalty + center_penalty
     
     # Average over theta dimensions
     total_penalty = total_penalty.mean(dim=-1)  # (B, T) or (B,)
@@ -142,15 +152,20 @@ def compute_cycle_loss_per_sensor(
     sensor_names: list[str],
     loss_type: Literal["mse", "huber"] = "huber",
     huber_beta: float = 0.1,
+    mask: Optional[torch.Tensor] = None,
 ) -> dict[str, float]:
     """Compute per-sensor cycle loss for diagnostics.
     
+    SPACE CONTRACT: pred and target MUST be in the same space (both scaled).
+    This function is called with pred_used and target_used from CycleBranchLoss.forward().
+    
     Args:
-        pred: (B, T, n_targets)
-        target: (B, T, n_targets)
+        pred: (B, T, n_targets) - MUST be in scaled space (pred_used)
+        target: (B, T, n_targets) - MUST be in scaled space (target_used)
         sensor_names: List of sensor names matching target dimension
         loss_type: 'mse' or 'huber'
         huber_beta: Huber beta
+        mask: Optional mask (B, T) for valid timesteps
         
     Returns:
         Dict mapping sensor name to loss value
@@ -159,10 +174,21 @@ def compute_cycle_loss_per_sensor(
     for i, name in enumerate(sensor_names):
         p = pred[..., i]
         t = target[..., i]
+        
         if loss_type == "huber":
-            loss = F.huber_loss(p, t, reduction="mean", delta=huber_beta)
+            per_elem_loss = F.huber_loss(p, t, reduction="none", delta=huber_beta)
         else:
-            loss = F.mse_loss(p, t, reduction="mean")
+            per_elem_loss = (p - t) ** 2
+        
+        if mask is not None:
+            # Apply mask for valid timesteps
+            mask_squeezed = mask.squeeze(-1) if mask.dim() == 3 else mask
+            per_elem_loss = per_elem_loss * mask_squeezed
+            valid_count = mask_squeezed.sum().clamp(min=1.0)
+            loss = per_elem_loss.sum() / valid_count
+        else:
+            loss = per_elem_loss.mean()
+        
         result[name] = float(loss.item())
     return result
 
@@ -443,9 +469,28 @@ class CycleBranchLoss(torch.nn.Module):
             else:
                 # "scaled" mode: target is already StandardScaled, use as-is
                 target_used = cycle_target
+        else:
+            # FAIL-FAST: scaled mode requires normalization config
+            if self.cycle_target_space == "scaled":
+                # Check what's missing and provide helpful error
+                missing = []
+                if self.cycle_target_mean is None:
+                    missing.append("cycle_target_mean")
+                if self.cycle_target_std is None:
+                    missing.append("cycle_target_std")  
+                if cond_ids is None:
+                    missing.append("cond_ids")
+                raise ValueError(
+                    f"[CycleBranchLoss] cycle_target_space='scaled' but normalization config missing: {missing}. "
+                    f"Either pass scaler_dict to initialize_cycle_branch() and cond_ids to forward(), "
+                    f"or set cycle_target_space='raw' if targets are not pre-scaled."
+                )
             
-            # Debug prints at epochs 0 and 2
-            should_debug = (epoch == 0 and not self._debug_printed) or (epoch == 2)
+            # Debug prints at epochs 0 and 2 (once per epoch)
+            should_debug = (
+                (epoch == 0 and not self._debug_printed) or 
+                (epoch == 2 and not getattr(self, '_epoch2_debug_printed', False))
+            )
             if should_debug:
                 with torch.no_grad():
                     tgt_mean = cycle_target.mean().item()
@@ -471,13 +516,15 @@ class CycleBranchLoss(torch.nn.Module):
                     theta_mean = theta_seq.mean().item()
                     theta_min = theta_seq.min().item()
                     theta_max = theta_seq.max().item()
-                    near_upper = (theta_seq > 0.99).float().mean().item() * 100
-                    near_lower = (theta_seq < 0.91).float().mean().item() * 100
+                    near_upper = (theta_seq > 0.98).float().mean().item() * 100
+                    near_lower = (theta_seq < 0.88).float().mean().item() * 100
                     sat_frac = near_upper + near_lower
                     print(f"  Theta: mean={theta_mean:.4f}, range=[{theta_min:.4f}, {theta_max:.4f}], sat_frac={sat_frac:.1f}%")
                     
                     if epoch == 0:
                         self._debug_printed = True
+                    elif epoch == 2:
+                        self._epoch2_debug_printed = True
         
         # Cycle reconstruction loss (in normalized space)
         l_cycle = compute_cycle_loss(
@@ -505,11 +552,13 @@ class CycleBranchLoss(torch.nn.Module):
              if "work_balance" in intermediates:
                  l_power = compute_power_balance_penalty(intermediates["work_balance"], mask)
         
-        # Per-sensor loss breakdown (for logging)
+        # Per-sensor loss breakdown (for logging) - MUST use scaled tensors
+        # Space contract: pred_used and target_used are both in scaled space
         per_sensor_metrics = compute_cycle_loss_per_sensor(
-             cycle_pred, cycle_target, self.target_names,
+             pred_used, target_used, self.target_names,
              loss_type=self.cycle_loss_type,
-             huber_beta=self.cycle_huber_beta
+             huber_beta=self.cycle_huber_beta,
+             mask=mask,
         )
         
         # Apply curriculum to cycle loss weight (ramp up over epochs)
