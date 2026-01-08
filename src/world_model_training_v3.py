@@ -38,7 +38,7 @@ except ImportError as exc:
     ) from exc
 
 try:
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import StandardScaler, MinMaxScaler
 except ImportError as exc:
     raise ImportError(
         "scikit-learn is required for preprocessing. Please install scikit-learn."
@@ -65,6 +65,12 @@ from src.models.transformer_world_model_v1 import TransformerWorldModelV1
 from src.utils.feature_pipeline_contract import (
     derive_feature_pipeline_config_from_feature_cols,
     validate_feature_pipeline_config,
+)
+from src.utils.unit_conversions import ThermoConfig
+from src.analysis.thermo_sanity import (
+    compute_thermo_sanity_report,
+    save_thermo_sanity_report,
+    print_thermo_sanity_summary,
 )
 
 # B-Track: Cycle Branch imports (conditional to avoid import errors if not used)
@@ -402,62 +408,183 @@ def train_world_model_universal_v3(
     print(f"  Train samples: {len(X_train_split)}, Val samples: {len(X_val)}")
     
     # ===================================================================
-    # 3. Condition-wise scaling
+    # 3. Condition-wise scaling (WITH OPERATING SETTINGS FIX)
     # ===================================================================
     print("\n[3] Applying condition-wise feature scaling...")
+
+    # CRITICAL FIX: Identify operating settings indices
+    # Operating settings (Setting1, Setting2, Setting3) must be normalized to [0,1]
+    # NOT Z-scored, because CycleLayerMVP expects physical [0,1] range
+    ops_cols = ["Setting1", "Setting2", "Setting3"]
+    ops_indices = [i for i, col in enumerate(feature_cols) if col in ops_cols]
+    non_ops_indices = [i for i in range(len(feature_cols)) if i not in ops_indices]
+
+    has_ops = len(ops_indices) > 0
+    if has_ops:
+        print(f"  Operating settings found at indices: {ops_indices}")
+        print(f"  Will apply [0,1] normalization to ops, StandardScaler to other {len(non_ops_indices)} features")
+
     scaler_dict = {}
     X_train_scaled = X_train_split.clone()
     X_val_scaled = X_val.clone()
-    
+
     if use_condition_wise_scaling:
         X_train_np = X_train_split.numpy()
         X_val_np = X_val.numpy()
         cond_ids_train_np = cond_ids_train_split.numpy()
         cond_ids_val_np = cond_ids_val.numpy()
-        
+
         for cond in unique_conditions:
             cond = int(cond)
             train_mask = (cond_ids_train_np == cond)
             val_mask = (cond_ids_val_np == cond)
-            
-            scaler = StandardScaler()
-            # Fit on train data for this condition
-            X_train_cond_flat = X_train_np[train_mask].reshape(-1, X_train_np.shape[-1])
-            scaler.fit(X_train_cond_flat)
-            scaler_dict[cond] = scaler
-            
+
+            if has_ops:
+                # Separate scaling for ops vs features
+
+                scaler_features = StandardScaler()
+                scaler_ops = MinMaxScaler(feature_range=(0, 1))
+
+                # Fit on train data for this condition
+                X_train_cond = X_train_np[train_mask]  # (N, T, F)
+                X_train_features_flat = X_train_cond[:, :, non_ops_indices].reshape(-1, len(non_ops_indices))
+                X_train_ops_flat = X_train_cond[:, :, ops_indices].reshape(-1, len(ops_indices))
+
+                scaler_features.fit(X_train_features_flat)
+                scaler_ops.fit(X_train_ops_flat)
+
+                scaler_dict[cond] = {
+                    'features': scaler_features,
+                    'ops': scaler_ops,
+                    'ops_indices': ops_indices,
+                    'non_ops_indices': non_ops_indices,
+                }
+            else:
+                # Original behavior - all features StandardScaled
+                scaler = StandardScaler()
+                # Fit on train data for this condition
+                X_train_cond_flat = X_train_np[train_mask].reshape(-1, X_train_np.shape[-1])
+                scaler.fit(X_train_cond_flat)
+                scaler_dict[cond] = scaler
+
             # Transform train
             if train_mask.any():
-                X_train_scaled[train_mask] = torch.tensor(
-                    scaler.transform(X_train_cond_flat).reshape(-1, past_len, len(feature_cols)),
-                    dtype=torch.float32
-                )
-            
+                if has_ops:
+                    # Apply separate scalers for features and ops
+                    X_train_cond = X_train_np[train_mask]  # (N, T, F)
+                    X_train_scaled_cond = np.empty_like(X_train_cond)
+
+                    # Transform features
+                    X_train_features_flat = X_train_cond[:, :, non_ops_indices].reshape(-1, len(non_ops_indices))
+                    X_train_scaled_cond[:, :, non_ops_indices] = scaler_features.transform(
+                        X_train_features_flat
+                    ).reshape(-1, past_len, len(non_ops_indices))
+
+                    # Transform ops
+                    X_train_ops_flat = X_train_cond[:, :, ops_indices].reshape(-1, len(ops_indices))
+                    X_train_scaled_cond[:, :, ops_indices] = scaler_ops.transform(
+                        X_train_ops_flat
+                    ).reshape(-1, past_len, len(ops_indices))
+
+                    X_train_scaled[train_mask] = torch.tensor(X_train_scaled_cond, dtype=torch.float32)
+                else:
+                    # Original behavior (no ops separation)
+                    X_train_scaled[train_mask] = torch.tensor(
+                        scaler.transform(X_train_cond_flat).reshape(-1, past_len, len(feature_cols)),
+                        dtype=torch.float32
+                    )
+
             # Transform val
             if val_mask.any():
-                X_val_cond_flat = X_val_np[val_mask].reshape(-1, X_val_np.shape[-1])
-                X_val_scaled[val_mask] = torch.tensor(
-                    scaler.transform(X_val_cond_flat).reshape(-1, past_len, len(feature_cols)),
-                    dtype=torch.float32
-                )
+                X_val_cond = X_val_np[val_mask]  # (N, T, F)
+                if has_ops:
+                    # Apply separate scalers for features and ops
+                    X_val_scaled_cond = np.empty_like(X_val_cond)
+
+                    # Transform features
+                    X_val_features_flat = X_val_cond[:, :, non_ops_indices].reshape(-1, len(non_ops_indices))
+                    X_val_scaled_cond[:, :, non_ops_indices] = scaler_features.transform(
+                        X_val_features_flat
+                    ).reshape(-1, past_len, len(non_ops_indices))
+
+                    # Transform ops
+                    X_val_ops_flat = X_val_cond[:, :, ops_indices].reshape(-1, len(ops_indices))
+                    X_val_scaled_cond[:, :, ops_indices] = scaler_ops.transform(
+                        X_val_ops_flat
+                    ).reshape(-1, past_len, len(ops_indices))
+
+                    X_val_scaled[val_mask] = torch.tensor(X_val_scaled_cond, dtype=torch.float32)
+                else:
+                    # Original behavior
+                    X_val_cond_flat = X_val_cond.reshape(-1, X_val_cond.shape[-1])
+                    X_val_scaled[val_mask] = torch.tensor(
+                        scaler.transform(X_val_cond_flat).reshape(-1, past_len, len(feature_cols)),
+                        dtype=torch.float32
+                    )
         
         print(f"  Fitted {len(scaler_dict)} condition-wise scalers")
     else:
         # Global scaling
-        scaler = StandardScaler()
-        X_train_flat = X_train_split.numpy().reshape(-1, len(feature_cols))
-        scaler.fit(X_train_flat)
-        scaler_dict[0] = scaler
-        
-        X_train_scaled = torch.tensor(
-            scaler.transform(X_train_flat).reshape(-1, past_len, len(feature_cols)),
-            dtype=torch.float32
-        )
-        X_val_flat = X_val.numpy().reshape(-1, len(feature_cols))
-        X_val_scaled = torch.tensor(
-            scaler.transform(X_val_flat).reshape(-1, past_len, len(feature_cols)),
-            dtype=torch.float32
-        )
+        if has_ops:
+            # Separate scalers for features and ops
+            scaler_features = StandardScaler()
+            scaler_ops = MinMaxScaler(feature_range=(0, 1))
+
+            X_train_np = X_train_split.numpy()
+            X_val_np = X_val.numpy()
+
+            # Fit on train data
+            X_train_features_flat = X_train_np[:, :, non_ops_indices].reshape(-1, len(non_ops_indices))
+            X_train_ops_flat = X_train_np[:, :, ops_indices].reshape(-1, len(ops_indices))
+
+            scaler_features.fit(X_train_features_flat)
+            scaler_ops.fit(X_train_ops_flat)
+
+            scaler_dict[0] = {
+                'features': scaler_features,
+                'ops': scaler_ops,
+                'ops_indices': ops_indices,
+                'non_ops_indices': non_ops_indices,
+            }
+
+            # Transform train
+            X_train_scaled = np.empty_like(X_train_np)
+            X_train_scaled[:, :, non_ops_indices] = scaler_features.transform(
+                X_train_features_flat
+            ).reshape(-1, past_len, len(non_ops_indices))
+            X_train_scaled[:, :, ops_indices] = scaler_ops.transform(
+                X_train_ops_flat
+            ).reshape(-1, past_len, len(ops_indices))
+            X_train_scaled = torch.tensor(X_train_scaled, dtype=torch.float32)
+
+            # Transform val
+            X_val_features_flat = X_val_np[:, :, non_ops_indices].reshape(-1, len(non_ops_indices))
+            X_val_ops_flat = X_val_np[:, :, ops_indices].reshape(-1, len(ops_indices))
+
+            X_val_scaled = np.empty_like(X_val_np)
+            X_val_scaled[:, :, non_ops_indices] = scaler_features.transform(
+                X_val_features_flat
+            ).reshape(-1, past_len, len(non_ops_indices))
+            X_val_scaled[:, :, ops_indices] = scaler_ops.transform(
+                X_val_ops_flat
+            ).reshape(-1, past_len, len(ops_indices))
+            X_val_scaled = torch.tensor(X_val_scaled, dtype=torch.float32)
+        else:
+            # Original behavior (no ops separation)
+            scaler = StandardScaler()
+            X_train_flat = X_train_split.numpy().reshape(-1, len(feature_cols))
+            scaler.fit(X_train_flat)
+            scaler_dict[0] = scaler
+
+            X_train_scaled = torch.tensor(
+                scaler.transform(X_train_flat).reshape(-1, past_len, len(feature_cols)),
+                dtype=torch.float32
+            )
+            X_val_flat = X_val.numpy().reshape(-1, len(feature_cols))
+            X_val_scaled = torch.tensor(
+                scaler.transform(X_val_flat).reshape(-1, past_len, len(feature_cols)),
+                dtype=torch.float32
+            )
     
     # Save scaler
     import pickle
@@ -698,7 +825,25 @@ def train_world_model_universal_v3(
                 print("[CycleBranch] Initialization failed, continuing without cycle branch")
         else:
             print("[CycleBranch] cycle_branch.enable=True but module not available")
-    
+
+    # Initialize ThermoConfig for sanity checks
+    thermo_config = ThermoConfig(
+        sensor_units={
+            "T24": "RANKINE",
+            "T30": "RANKINE",
+            "P30": "PSIA",
+            "T50": "RANKINE",
+            "T2": "RANKINE",
+            "P2": "PSIA",
+            "P15": "PSIA",
+        },
+        temp_bounds_K=(200.0, 2000.0),
+        pressure_bounds_Pa=(1e4, 1e8),
+        strict_mode=False,  # Don't fail training, just warn
+        warn_if_viol_frac=0.01,
+        fail_if_viol_frac=0.05,
+    )
+
     # ===================================================================
     # 6. Training loop
     # ===================================================================
@@ -1758,6 +1903,39 @@ def train_world_model_universal_v3(
                     for k, v in cycle_metrics.items():
                         epoch_metrics.setdefault(f"cycle_{k}", 0.0)
                         epoch_metrics[f"cycle_{k}"] += v
+
+                    # Thermo sanity check (run at specific epochs and first batch)
+                    if batch_idx == 0 and epoch in [0, 2, 5, 10, 20, 50, 100]:
+                        with torch.no_grad():
+                            # Get scaler stats for denormalization
+                            scaler_stats = (
+                                cycle_branch_components.loss_fn.cycle_target_mean.cpu().numpy(),
+                                cycle_branch_components.loss_fn.cycle_target_std.cpu().numpy(),
+                            )
+
+                            # Compute thermo sanity report
+                            try:
+                                thermo_report = compute_thermo_sanity_report(
+                                    cycle_pred=cycle_pred.cpu().numpy(),
+                                    cycle_target=cycle_target.cpu().numpy(),
+                                    m_t=m_t.cpu().numpy() if m_t is not None else None,
+                                    eta_nom=eta_nom.cpu().numpy() if eta_nom is not None else None,
+                                    cond_ids=cond_batch.cpu().numpy() if cond_batch is not None else np.zeros(cycle_pred.shape[0], dtype=int),
+                                    scaler_stats=scaler_stats,
+                                    sensor_names=cycle_cfg.targets,
+                                    epoch=epoch,
+                                    step=global_step,
+                                    config=thermo_config,
+                                )
+
+                                # Save report
+                                save_thermo_sanity_report(thermo_report, results_dir, epoch)
+
+                                # Print summary
+                                print_thermo_sanity_summary(thermo_report)
+
+                            except Exception as e:
+                                print(f"[THERMO SANITY] Warning: Failed to generate report: {e}")
 
             # NaN/Inf guard
             if not torch.isfinite(loss):
@@ -2865,8 +3043,33 @@ def train_world_model_universal_v3(
                 cond = int(cond)
                 idxs = np.where(cond_ids_np == cond)[0]
                 scaler = scaler_dict.get(cond, scaler_dict.get(0))
-                flat = X_test_np[idxs].reshape(-1, len(feature_cols))
-                X_scaled_np[idxs] = scaler.transform(flat).reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
+
+                # Check if scaler is a dict (split ops/features) or a single StandardScaler
+                if isinstance(scaler, dict):
+                    # Split scaler structure
+                    X_test_cond = X_test_np[idxs]  # (N, T, F)
+                    X_test_scaled_cond = np.empty_like(X_test_cond)
+
+                    non_ops_indices = scaler['non_ops_indices']
+                    ops_indices = scaler['ops_indices']
+
+                    # Transform features
+                    X_test_features_flat = X_test_cond[:, :, non_ops_indices].reshape(-1, len(non_ops_indices))
+                    X_test_scaled_cond[:, :, non_ops_indices] = scaler['features'].transform(
+                        X_test_features_flat
+                    ).reshape(-1, int(past_len), len(non_ops_indices))
+
+                    # Transform ops
+                    X_test_ops_flat = X_test_cond[:, :, ops_indices].reshape(-1, len(ops_indices))
+                    X_test_scaled_cond[:, :, ops_indices] = scaler['ops'].transform(
+                        X_test_ops_flat
+                    ).reshape(-1, int(past_len), len(ops_indices))
+
+                    X_scaled_np[idxs] = X_test_scaled_cond.astype(np.float32)
+                else:
+                    # Original single scaler
+                    flat = X_test_np[idxs].reshape(-1, len(feature_cols))
+                    X_scaled_np[idxs] = scaler.transform(flat).reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
             X_test_scaled = torch.tensor(X_scaled_np, dtype=torch.float32).to(device)
             
             # Run model forward to get encoder embeddings
@@ -2964,7 +3167,32 @@ def train_world_model_universal_v3(
                         with open(theta_health_path, "w") as f:
                             json.dump(test_theta_health, f, indent=2)
                         print(f"  Saved theta_health_test.json")
-                        
+
+                    # Generate test-time thermo sanity report
+                    try:
+                        thermo_report_test = compute_thermo_sanity_report(
+                            cycle_pred=cycle_pred_np,  # Already in numpy, raw units
+                            cycle_target=cycle_target.cpu().numpy(),
+                            m_t=m_t.cpu().numpy() if m_t is not None else None,
+                            eta_nom=eta_nom.cpu().numpy() if eta_nom is not None else None,
+                            cond_ids=cond_test_np,
+                            scaler_stats=scaler_stats,
+                            sensor_names=sensor_names,
+                            epoch=num_epochs,
+                            step=-1,  # Test phase marker
+                            config=thermo_config,
+                        )
+
+                        # Save test thermo sanity report
+                        save_thermo_sanity_report(thermo_report_test, results_dir, epoch=999)
+
+                        # Print summary
+                        print_thermo_sanity_summary(thermo_report_test)
+
+                    except Exception as e:
+                        print(f"[THERMO SANITY TEST] Warning: Failed to generate test report: {e}")
+
+                    if THETA_HEALTH_AVAILABLE:
                         # Also save val theta health if available
                         if history.get("val_theta_saturation"):
                             val_theta_health = {
