@@ -2892,27 +2892,62 @@ def train_world_model_universal_v3(
                         cfg=cycle_cfg,
                         epoch=num_epochs - 1,
                     )
-                    
-                    # Compute per-sensor RMSE/MAE
+
+                    # ===== P0 FIX: Normalize predictions to scaled space =====
+                    from src.utils.cycle_metrics_space import normalize_cycle_pred
+
+                    # Extract scaler stats from loss_fn
+                    mean_buf = cycle_branch_components.loss_fn.cycle_target_mean  # (C, 4)
+                    std_buf = cycle_branch_components.loss_fn.cycle_target_std    # (C, 4)
+
+                    # Convert to numpy
+                    scaler_stats = (mean_buf.cpu().numpy(), std_buf.cpu().numpy())
+
+                    # Normalize predictions to scaled space
+                    cycle_pred_np = cycle_pred.cpu().numpy()
+                    cond_test_np = cond_test.cpu().numpy()
+
+                    cycle_pred_scaled = normalize_cycle_pred(
+                        pred_raw=cycle_pred_np,
+                        cond_ids=cond_test_np,
+                        scaler_stats=scaler_stats,
+                        eps=1e-6
+                    )
+
+                    # P1 FIX: Fail-fast validation
+                    mean_abs_pred_scaled = np.abs(cycle_pred_scaled).mean()
+                    if mean_abs_pred_scaled > 50:
+                        raise ValueError(
+                            f"[TEST] pred_scaled looks unnormalized (mean_abs={mean_abs_pred_scaled:.2f}). "
+                            f"Expected O(1) in scaled space. Check scaler_stats wiring."
+                        )
+
+                    # Verify scaler_stats are available
+                    if cycle_branch_components.loss_fn.cycle_target_mean is None:
+                        raise ValueError("[TEST] cycle_target_mean not available in loss_fn - cannot normalize predictions!")
+                    # ===== End P0/P1 fixes =====
+
+                    # Compute per-sensor RMSE/MAE (now in consistent scaled space)
                     sensor_names = getattr(cycle_cfg, "targets", ["T24", "T30", "P30", "T50"])
                     per_sensor_metrics = {}
-                    n_sensors = cycle_pred.shape[-1]
-                    
+                    n_sensors = cycle_pred_scaled.shape[-1]
+
                     for s_idx in range(min(n_sensors, len(sensor_names))):
                         sensor_name = sensor_names[s_idx]
-                        pred_s = cycle_pred[..., s_idx].cpu().numpy().flatten()
-                        targ_s = cycle_target[..., s_idx].cpu().numpy().flatten()
-                        
+                        pred_s = cycle_pred_scaled[..., s_idx].flatten()  # Now scaled
+                        targ_s = cycle_target[..., s_idx].cpu().numpy().flatten()  # Already scaled
+
                         mse = float(np.mean((pred_s - targ_s) ** 2))
                         mae = float(np.mean(np.abs(pred_s - targ_s)))
                         rmse = float(np.sqrt(mse))
-                        
+
                         per_sensor_metrics[sensor_name] = {
-                            "rmse_norm": rmse,
-                            "mae_norm": mae,
-                            "mse_norm": mse,
+                            "RMSE_scaled": rmse,  # Renamed for clarity
+                            "MAE_scaled": mae,
+                            "MSE_scaled": mse,
+                            "space": "scaled",  # Explicit annotation
                         }
-                        print(f"  {sensor_name}: RMSE={rmse:.4f}, MAE={mae:.4f}")
+                        print(f"  {sensor_name}: RMSE_scaled={rmse:.4f}, MAE_scaled={mae:.4f}")
                     
                     test_cycle_metrics = {
                         "enabled": True,

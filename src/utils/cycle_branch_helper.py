@@ -308,9 +308,29 @@ def cycle_branch_forward(
                 
                 pred_scaled = (cycle_pred - cond_mean) / (cond_std + 1e-6)
                 print(f"  pred_scaled:   mean={pred_scaled.mean():.4f}, std={pred_scaled.std():.4f}")
+
+                # ===== P1 FIX: Additional diagnostics =====
+                # Check condition distribution
+                unique_conds, cond_counts = torch.unique(cond_ids, return_counts=True)
+                print(f"  Condition distribution: {dict(zip(unique_conds.tolist(), cond_counts.tolist()))}")
+
+                # Check scaler stats for this batch's conditions
+                batch_mean = mean_buf[cond_ids].mean(dim=0)  # (4,) average across batch
+                batch_std = std_buf[cond_ids].mean(dim=0)
+                print(f"  Scaler stats (batch avg): mean={batch_mean.tolist()}, std={batch_std.tolist()}")
+
+                # Residual stats
+                residual = pred_scaled - cycle_target
+                print(f"  Residual (pred-target): mean={residual.mean():.4f}, std={residual.std():.4f}")
+
+                # Range checks
+                print(f"  pred_raw range: [{cycle_pred.min():.1f}, {cycle_pred.max():.1f}]")
+                print(f"  pred_scaled range: [{pred_scaled.min():.3f}, {pred_scaled.max():.3f}]")
+                print(f"  target_scaled range: [{cycle_target.min():.3f}, {cycle_target.max():.3f}]")
+                # ===== End P1 fix =====
             else:
                 print(f"  pred_scaled:   N/A (no scaler stats available)")
-            
+
             # Per-sensor stats
             target_names = ["T24", "T30", "P30", "T50"]
             for i, name in enumerate(target_names[:cycle_target.shape[-1]]):
