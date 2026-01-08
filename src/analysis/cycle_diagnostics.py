@@ -83,12 +83,17 @@ def compute_theta_health_batch(
         result["theta_max"].append(float(vals.max()))
         result["theta_mean"].append(float(vals.mean()))
         
-        # Saturation check
+        # Saturation check - UPDATED for eps-bounded sigmoid
+        # With eps-bounded sigmoid, m can't exactly hit bounds, so use absolute thresholds
+        # "Saturated upper" = m > 0.995 (very close to max, effectively stuck)
+        # "Saturated lower" = m < lower_bound + 0.01
         lb, ub = bounds[i] if i < len(bounds) else (0.85, 1.0)
-        eps_range = saturation_epsilon * (ub - lb)
-        near_low = (vals < lb + eps_range).mean()
-        near_high = (vals > ub - eps_range).mean()
+        near_low = (vals < lb + 0.01).mean()      # Within 0.01 of lower bound
+        near_high = (vals > 0.995).mean()         # Above 0.995 (upper saturation)
         result["saturation_frac"].append(float(near_low + near_high))
+        
+        # Also add p95 for visibility
+        result.setdefault("theta_p95", []).append(float(np.percentile(vals, 95)))
     
     # Smoothness: L1 of temporal differences
     if T > 1:
@@ -99,7 +104,7 @@ def compute_theta_health_batch(
         result["delta_l1_mean"] = 0.0
         result["delta_l1_max"] = 0.0
     
-    # Total saturation (any param)
+    # Total saturation (any param) - fraction above 0.995
     result["saturation_frac_total"] = float(np.mean(result["saturation_frac"]))
     
     return result
@@ -113,10 +118,12 @@ def format_theta_health_for_logging(health: Dict[str, Any]) -> str:
     sat = health.get("saturation_frac_total", 0)
     smooth = health.get("delta_l1_mean", 0)
     means = health.get("theta_mean", [])
+    p95s = health.get("theta_p95", [])
     
     mean_str = "/".join([f"{m:.3f}" for m in means[:6]]) if means else "N/A"
+    p95_str = "/".join([f"{p:.3f}" for p in p95s[:6]]) if p95s else "N/A"
     
-    return f"θ(sat={sat:.1%},Δ={smooth:.4f},μ={mean_str})"
+    return f"θ(sat%={sat:.1%}, Δ={smooth:.4f}, μ={mean_str}, p95={p95_str})"
 
 
 def run_cycle_branch_diagnostics(

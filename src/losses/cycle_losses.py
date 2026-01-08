@@ -108,6 +108,41 @@ def compute_theta_prior_loss(
     return total_penalty.mean()
 
 
+def compute_theta_upper_loss(
+    m_t: torch.Tensor,
+    threshold: float = 0.97,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compute asymmetric upper-penalty for theta to prevent m→1.0 drift.
+    
+    This is a SEPARATE loss from theta_prior to allow independent tuning.
+    With eps-bounded sigmoid, m can't hit 1.0 exactly, but it can drift to ~0.997.
+    This penalty pushes m away from the upper region toward mid-range.
+    
+    Args:
+        m_t: Degradation modifiers (B, T, 6) or (B, 6)
+        threshold: Values above this are penalized (default 0.97)
+        mask: Optional mask (B, T) or (B, T, 1)
+        
+    Returns:
+        Scalar upper penalty loss (mean squared exceedance above threshold)
+    """
+    # Quadratic penalty for values above threshold
+    exc = F.relu(m_t - threshold)
+    upper_penalty = exc ** 2
+    
+    # Average over theta dimensions
+    upper_penalty = upper_penalty.mean(dim=-1)  # (B, T) or (B,)
+    
+    if mask is not None:
+        if mask.dim() == 3 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
+        upper_penalty = upper_penalty * mask
+        valid_count = mask.sum().clamp(min=1.0)
+        return upper_penalty.sum() / valid_count
+    
+    return upper_penalty.mean()
+
 def compute_cycle_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -382,6 +417,8 @@ class CycleBranchLoss(torch.nn.Module):
         mono_eps: float = 1e-4,
         lambda_power_balance: float = 0.0,
         lambda_theta_prior: float = 0.05,  # Anti-saturation prior (default 0.05 for stronger effect)
+        lambda_theta_upper: float = 0.2,   # Asymmetric upper-penalty (NEW, default 0.2)
+        theta_upper_thr: float = 0.97,     # Upper penalty threshold (NEW, default 0.97)
         target_names: Optional[list[str]] = None,
         cycle_target_mean: Optional[torch.Tensor] = None,
         cycle_target_std: Optional[torch.Tensor] = None,
@@ -393,6 +430,8 @@ class CycleBranchLoss(torch.nn.Module):
         self.lambda_mono = lambda_mono
         self.lambda_power_balance = lambda_power_balance
         self.lambda_theta_prior = lambda_theta_prior  # Anti-saturation
+        self.lambda_theta_upper = lambda_theta_upper  # NEW: asymmetric upper penalty
+        self.theta_upper_thr = theta_upper_thr        # NEW: threshold for upper penalty
         self.cycle_loss_type = cycle_loss_type
         self.cycle_huber_beta = cycle_huber_beta
         self.mono_on_eta = mono_on_eta
@@ -462,6 +501,16 @@ class CycleBranchLoss(torch.nn.Module):
             
             # Always normalize pred (raw -> scaled)
             pred_used = (cycle_pred - mean) / (std + eps)
+            
+            # FAIL-FAST: pred_scaled should be O(1) if normalization worked
+            mean_abs = pred_used.abs().mean().item()
+            if mean_abs > 50:
+                raise ValueError(
+                    f"[CycleBranchLoss] pred_scaled looks unnormalized (mean_abs={mean_abs:.2f}). "
+                    f"Expected O(1) in scaled space. Check cond_ids/scaler_stats wiring. "
+                    f"pred_raw mean={cycle_pred.mean().item():.2f}, "
+                    f"scaler mean[0]={mean[0, 0, 0].item() if mean.dim() == 3 else mean[0, 0].item():.2f}"
+                )
             
             # Only normalize target if in "raw" mode
             if self.cycle_target_space == "raw":
@@ -567,13 +616,19 @@ class CycleBranchLoss(torch.nn.Module):
         # Theta prior (anti-saturation)
         l_theta_prior = compute_theta_prior_loss(theta_seq, mask=mask)
         
+        # Theta upper penalty (NEW: asymmetric upper-bound penalty)
+        l_theta_upper = compute_theta_upper_loss(
+            theta_seq, threshold=self.theta_upper_thr, mask=mask
+        )
+        
         # Combine
         total = (
             lambda_cycle_curr * l_cycle +
             self.lambda_smooth * l_smooth +
             self.lambda_mono * l_mono +
             self.lambda_power_balance * l_power +
-            self.lambda_theta_prior * l_theta_prior
+            self.lambda_theta_prior * l_theta_prior +
+            self.lambda_theta_upper * l_theta_upper  # NEW
         )
         
         components = {
@@ -582,6 +637,8 @@ class CycleBranchLoss(torch.nn.Module):
             "theta_mono_loss": float(l_mono.item()),
             "power_balance_loss": float(l_power.item()),
             "theta_prior_loss": float(l_theta_prior.item()),
+            "theta_upper_loss": float(l_theta_upper.item()),  # NEW
+            "theta_upper_thr": self.theta_upper_thr,          # NEW: log threshold for reference
             "lambda_cycle_effective": lambda_cycle_curr,
             "total_cycle_branch_loss": float(total.item()),
         }

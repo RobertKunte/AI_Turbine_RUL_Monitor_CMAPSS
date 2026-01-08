@@ -279,16 +279,46 @@ def cycle_branch_forward(
         "m_t": m_t,
     }
     
-    # Debug: print scale stats once at epoch 0
+    # Debug: print scale stats once at epoch 0 (now shows raw AND scaled)
     if epoch == 0 and not hasattr(components, '_target_debug_printed'):
         with torch.no_grad():
             print("\n[CycleBranch] Target Scale Debug (epoch 0):")
-            print(f"  cycle_target: mean={cycle_target.mean():.4f}, std={cycle_target.std():.4f}")
-            print(f"  cycle_pred:   mean={cycle_pred.mean():.4f}, std={cycle_pred.std():.4f}")
+            
+            # Get scaler stats from loss_fn if available
+            has_scaler = (
+                hasattr(components.loss_fn, 'cycle_target_mean') and 
+                components.loss_fn.cycle_target_mean is not None and
+                cond_ids is not None
+            )
+            
+            # Global stats: target (scaled), pred (raw)
+            print(f"  target_scaled: mean={cycle_target.mean():.4f}, std={cycle_target.std():.4f}")
+            print(f"  pred_raw:      mean={cycle_pred.mean():.2f}, std={cycle_pred.std():.2f}")
+            
+            # Compute pred_scaled if scaler available
+            if has_scaler:
+                mean_buf = components.loss_fn.cycle_target_mean  # (C, 4)
+                std_buf = components.loss_fn.cycle_target_std    # (C, 4)
+                cond_mean = mean_buf[cond_ids]  # (B, 4)
+                cond_std = std_buf[cond_ids]    # (B, 4)
+                
+                if cycle_pred.dim() == 3:  # (B, T, 4)
+                    cond_mean = cond_mean.unsqueeze(1)  # (B, 1, 4)
+                    cond_std = cond_std.unsqueeze(1)
+                
+                pred_scaled = (cycle_pred - cond_mean) / (cond_std + 1e-6)
+                print(f"  pred_scaled:   mean={pred_scaled.mean():.4f}, std={pred_scaled.std():.4f}")
+            else:
+                print(f"  pred_scaled:   N/A (no scaler stats available)")
+            
+            # Per-sensor stats
             target_names = ["T24", "T30", "P30", "T50"]
             for i, name in enumerate(target_names[:cycle_target.shape[-1]]):
-                print(f"    {name} target: mean={cycle_target[..., i].mean():.4f}, std={cycle_target[..., i].std():.4f}")
-                print(f"    {name} pred:   mean={cycle_pred[..., i].mean():.4f}, std={cycle_pred[..., i].std():.4f}")
+                print(f"  {name}:")
+                print(f"    target_scaled: mean={cycle_target[..., i].mean():.4f}, std={cycle_target[..., i].std():.4f}")
+                print(f"    pred_raw:      mean={cycle_pred[..., i].mean():.2f}, std={cycle_pred[..., i].std():.2f}")
+                if has_scaler:
+                    print(f"    pred_scaled:   mean={pred_scaled[..., i].mean():.4f}, std={pred_scaled[..., i].std():.4f}")
         components._target_debug_printed = True
     intermediates.update(layer_inter)
     
