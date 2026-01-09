@@ -1968,10 +1968,13 @@ def train_world_model_universal_v3(
                             )
 
                             # Compute thermo sanity report
+                            # SPACE CONTRACT:
+                            # - cycle_pred: RAW from CycleLayerMVP (°R, psia)
+                            # - cycle_target: SCALED from X_batch (z-scored, ~N(0,1))
                             try:
                                 thermo_report = compute_thermo_sanity_report(
-                                    cycle_pred=cycle_pred.cpu().numpy(),
-                                    cycle_target=cycle_target.cpu().numpy(),
+                                    cycle_pred_raw=cycle_pred.cpu().numpy(),  # RAW imperial
+                                    cycle_target_scaled=cycle_target.cpu().numpy(),  # SCALED from X_batch
                                     m_t=m_t.cpu().numpy() if m_t is not None else None,
                                     eta_nom=eta_nom.cpu().numpy() if eta_nom is not None else None,
                                     cond_ids=cond_batch.cpu().numpy() if cond_batch is not None else np.zeros(cycle_pred.shape[0], dtype=int),
@@ -3225,10 +3228,11 @@ def train_world_model_universal_v3(
                         print(f"  Saved theta_health_test.json")
 
                     # Generate test-time thermo sanity report
+                    # SPACE CONTRACT: cycle_pred_np is RAW, cycle_target is SCALED
                     try:
                         thermo_report_test = compute_thermo_sanity_report(
-                            cycle_pred=cycle_pred_np,  # Already in numpy, raw units
-                            cycle_target=cycle_target.cpu().numpy(),
+                            cycle_pred_raw=cycle_pred_np,  # RAW imperial from CycleLayerMVP
+                            cycle_target_scaled=cycle_target.cpu().numpy(),  # SCALED from X_batch
                             m_t=m_t.cpu().numpy() if m_t is not None else None,
                             eta_nom=eta_nom.cpu().numpy() if eta_nom is not None else None,
                             cond_ids=cond_test_np,

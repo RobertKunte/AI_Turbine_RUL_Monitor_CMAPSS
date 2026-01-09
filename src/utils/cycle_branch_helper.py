@@ -267,12 +267,14 @@ def cycle_branch_forward(
     is_seq = X_batch.dim() == 3
     
     # Extract operating settings
+    # NOTE: X_batch is SCALED (z-scored features, [0,1] ops)
+    # Therefore cycle_target is also SCALED (not raw imperial units)
     if is_seq:
-        ops_t = X_batch[:, :, components.ops_indices]  # (B, T, 3)
-        cycle_target = X_batch[:, :, components.target_indices]  # (B, T, n_targets)
+        ops_t = X_batch[:, :, components.ops_indices]  # (B, T, 3) - [0,1] normalized
+        cycle_target = X_batch[:, :, components.target_indices]  # (B, T, n_targets) - SCALED
     else:
         ops_t = X_batch[:, components.ops_indices]  # (B, 3)
-        cycle_target = X_batch[:, components.target_indices]  # (B, n_targets)
+        cycle_target = X_batch[:, components.target_indices]  # (B, n_targets) - SCALED
     
     # Get nominal efficiencies
     if components.nominal_head.head_type == "table":
