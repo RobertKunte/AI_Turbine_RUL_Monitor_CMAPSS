@@ -482,42 +482,81 @@ class CycleBranchLoss(torch.nn.Module):
             components: Dict with individual loss components
         """
         # =====================================================================
-        # Condition-wise normalization (Option A: fixed, no learnable params)
+        # Condition-wise normalization (C1 Contract: compute in scaled space)
+        # - cycle_pred (input): RAW thermodynamic units from CycleLayerMVP
+        # - cycle_target (input): Already scaled from X_batch pipeline
+        # - cycle_pred_scaled: Normalized predictions (O(1))
+        # - cycle_target_scaled: Target for loss (already scaled)
         # =====================================================================
-        pred_used = cycle_pred
-        target_used = cycle_target
+        cycle_pred_scaled = cycle_pred  # Will be normalized below
+        cycle_target_scaled = cycle_target
         
         if self.cycle_target_mean is not None and self.cycle_target_std is not None and cond_ids is not None:
             # Get mean/std for each batch element based on cond_id
-            mean = self.cycle_target_mean[cond_ids]  # (B, 4)
-            std = self.cycle_target_std[cond_ids]    # (B, 4)
+            mu_batch = self.cycle_target_mean[cond_ids]  # (B, 4)
+            sigma_batch = self.cycle_target_std[cond_ids]    # (B, 4)
             
             # Expand for sequence dimension if needed
             if cycle_pred.dim() == 3:
-                mean = mean.unsqueeze(1)  # (B, 1, 4)
-                std = std.unsqueeze(1)    # (B, 1, 4)
+                mu_batch = mu_batch.unsqueeze(1)  # (B, 1, 4)
+                sigma_batch = sigma_batch.unsqueeze(1)    # (B, 1, 4)
             
             eps = 1e-6
             
-            # Always normalize pred (raw -> scaled)
-            pred_used = (cycle_pred - mean) / (std + eps)
+            # C1: Normalize pred (raw -> scaled)
+            cycle_pred_scaled = (cycle_pred - mu_batch) / (sigma_batch + eps)
+            
+            # C1 Validation (epoch 0 only): Check scaling worked correctly
+            if epoch == 0 and not self._debug_printed:
+                with torch.no_grad():
+                    print(f"\n[CycleBranchLoss] C1 Contract Validation (epoch 0):")
+                    print("="*70)
+                    
+                    # Scaler stats
+                    print(f"  μ_batch[0]: {mu_batch[0].squeeze().tolist()}")
+                    print(f"  σ_batch[0]: {sigma_batch[0].squeeze().tolist()}")
+                    print(f"  μ_abs_mean={mu_batch.abs().mean().item():.1f}, σ_mean={sigma_batch.mean().item():.1f}")
+                    
+                    # pred raw vs scaled
+                    print(f"\n  cycle_pred (RAW):    mean={cycle_pred.mean().item():.2f}, std={cycle_pred.std().item():.2f}")
+                    print(f"  cycle_pred_scaled:   mean={cycle_pred_scaled.mean().item():.4f}, std={cycle_pred_scaled.std().item():.4f}")
+                    print(f"  cycle_target_scaled: mean={cycle_target_scaled.mean().item():.4f}, std={cycle_target_scaled.std().item():.4f}")
+                    
+                    # Per-sensor
+                    print(f"\n  Per-sensor:")
+                    for i, name in enumerate(self.target_names[:min(4, cycle_pred.shape[-1])]):
+                        p_raw = cycle_pred[..., i].mean().item()
+                        p_scl = cycle_pred_scaled[..., i].mean().item()
+                        t_scl = cycle_target_scaled[..., i].mean().item()
+                        print(f"    {name}: raw={p_raw:.1f}, scaled={p_scl:.3f}, target={t_scl:.3f}")
+                    
+                    print("="*70)
+                    self._debug_printed = True
             
             # FAIL-FAST: pred_scaled should be O(1) if normalization worked
-            mean_abs = pred_used.abs().mean().item()
-            if mean_abs > 50:
+            pred_scaled_abs_mean = cycle_pred_scaled.abs().mean().item()
+            if pred_scaled_abs_mean > 10:
                 raise ValueError(
-                    f"[CycleBranchLoss] pred_scaled looks unnormalized (mean_abs={mean_abs:.2f}). "
-                    f"Expected O(1) in scaled space. Check cond_ids/scaler_stats wiring. "
+                    f"[CycleBranchLoss] C1 VIOLATION: pred_scaled.abs().mean()={pred_scaled_abs_mean:.2f} > 10. "
+                    f"Expected O(1) in scaled space. Check scaler stats wiring. "
                     f"pred_raw mean={cycle_pred.mean().item():.2f}, "
-                    f"scaler mean[0]={mean[0, 0, 0].item() if mean.dim() == 3 else mean[0, 0].item():.2f}"
+                    f"μ[0]={mu_batch[0].squeeze()[0].item():.2f}, "
+                    f"σ[0]={sigma_batch[0].squeeze()[0].item():.2f}"
+                )
+            
+            # FAIL-FAST: sigma should not be identity
+            sigma_mean = sigma_batch.mean().item()
+            if sigma_mean < 2:
+                raise ValueError(
+                    f"[CycleBranchLoss] C1 VIOLATION: σ_batch.mean()={sigma_mean:.2f} < 2. "
+                    f"Scaler stats look like identity transform. Check extract_cycle_target_stats."
                 )
             
             # Only normalize target if in "raw" mode
             if self.cycle_target_space == "raw":
-                target_used = (cycle_target - mean) / (std + eps)
-            else:
-                # "scaled" mode: target is already StandardScaled, use as-is
-                target_used = cycle_target
+                cycle_target_scaled = (cycle_target - mu_batch) / (sigma_batch + eps)
+            # else: "scaled" mode - target is already StandardScaled, use as-is
+
         else:
             # FAIL-FAST: scaled mode requires normalization config
             if self.cycle_target_space == "scaled":
@@ -548,18 +587,18 @@ class CycleBranchLoss(torch.nn.Module):
                     print(f"\n[CycleBranchLoss] Epoch {epoch} Debug (cycle_target_space={self.cycle_target_space}):")
                     print(f"  cycle_pred (raw): mean={cycle_pred.mean():.2f}, std={cycle_pred.std():.2f}")
                     print(f"  cycle_target:     mean={tgt_mean:.4f}, std={tgt_std:.4f}")
-                    print(f"  pred_used:        mean={pred_used.mean():.4f}, std={pred_used.std():.4f}")
-                    print(f"  target_used:      mean={target_used.mean():.4f}, std={target_used.std():.4f}")
+                    print(f"  cycle_pred_scaled:  mean={cycle_pred_scaled.mean():.4f}, std={cycle_pred_scaled.std():.4f}")
+                    print(f"  cycle_target_scaled: mean={cycle_target_scaled.mean():.4f}, std={cycle_target_scaled.std():.4f}")
                     
                     # Per-sensor stats
                     print(f"  Per-sensor (scaled space):")
                     for i, name in enumerate(self.target_names[:cycle_pred.shape[-1]]):
-                        pred_m = pred_used[..., i].mean().item()
-                        pred_s = pred_used[..., i].std().item()
-                        tgt_m = target_used[..., i].mean().item()
-                        tgt_s = target_used[..., i].std().item()
+                        pred_m = cycle_pred_scaled[..., i].mean().item()
+                        pred_s = cycle_pred_scaled[..., i].std().item()
+                        tgt_m = cycle_target_scaled[..., i].mean().item()
+                        tgt_s = cycle_target_scaled[..., i].std().item()
                         delta = abs(pred_m - tgt_m)
-                        print(f"    {name}: pred_used({pred_m:.4f}±{pred_s:.2f}) vs target_used({tgt_m:.4f}±{tgt_s:.2f}) Δmean={delta:.4f}")
+                        print(f"    {name}: pred({pred_m:.4f}±{pred_s:.2f}) vs target({tgt_m:.4f}±{tgt_s:.2f}) Δ={delta:.4f}")
                     
                     # Theta stats
                     theta_mean = theta_seq.mean().item()
@@ -575,9 +614,9 @@ class CycleBranchLoss(torch.nn.Module):
                     elif epoch == 2:
                         self._epoch2_debug_printed = True
         
-        # Cycle reconstruction loss (in normalized space)
+        # Cycle reconstruction loss (in scaled space - C1 contract)
         l_cycle = compute_cycle_loss(
-            pred_used, target_used,
+            cycle_pred_scaled, cycle_target_scaled,
             loss_type=self.cycle_loss_type,
             huber_beta=self.cycle_huber_beta,
             mask=mask,
@@ -601,10 +640,9 @@ class CycleBranchLoss(torch.nn.Module):
              if "work_balance" in intermediates:
                  l_power = compute_power_balance_penalty(intermediates["work_balance"], mask)
         
-        # Per-sensor loss breakdown (for logging) - MUST use scaled tensors
-        # Space contract: pred_used and target_used are both in scaled space
+        # Per-sensor loss breakdown (for logging) - MUST use scaled tensors (C1)
         per_sensor_metrics = compute_cycle_loss_per_sensor(
-             pred_used, target_used, self.target_names,
+             cycle_pred_scaled, cycle_target_scaled, self.target_names,
              loss_type=self.cycle_loss_type,
              huber_beta=self.cycle_huber_beta,
              mask=mask,

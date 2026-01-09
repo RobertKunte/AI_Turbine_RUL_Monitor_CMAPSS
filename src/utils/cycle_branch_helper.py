@@ -149,27 +149,56 @@ def initialize_cycle_branch(
     print(f"  CycleLayerMVP: n_targets={len(cfg.targets)}, pr_mode={cfg.pr_mode}")
     
     # 7. Extract cycle target scaler stats for condition-wise normalization
+    # This is CRITICAL for C1 contract - stats must be valid, non-identity
     cycle_target_mean = None
     cycle_target_std = None
     
-    try:
-        from src.utils.cycle_target_scaler import extract_cycle_target_stats
-        
-        if scaler_dict is not None and len(scaler_dict) > 0:
-            cycle_target_mean, cycle_target_std = extract_cycle_target_stats(
-                scaler_dict=scaler_dict,
-                feature_cols=feature_cols,
-                target_indices=target_indices,
-                num_conditions=num_conditions,
-            )
-            cycle_target_mean = cycle_target_mean.to(device)
-            cycle_target_std = cycle_target_std.to(device)
-            print(f"  Extracted cycle target stats: mean/std shape=({cycle_target_mean.shape})")
-            print(f"    Example cond=0 mean: {[f'{cycle_target_mean[0, i].item():.1f}' for i in range(min(4, cycle_target_mean.shape[-1]))]}")
-            print(f"    Example cond=0 std:  {[f'{cycle_target_std[0, i].item():.1f}' for i in range(min(4, cycle_target_std.shape[-1]))]}")
-    except Exception as e:
-        print(f"  ⚠️  Could not extract cycle target stats: {e}")
-        print(f"  Will use un-normalized loss (may cause scale mismatch)")
+    from src.utils.cycle_target_scaler import extract_cycle_target_stats
+    
+    if scaler_dict is None or len(scaler_dict) == 0:
+        raise ValueError(
+            "[CycleBranch] scaler_dict is None or empty! "
+            "Cannot initialize cycle branch without scaler stats. "
+            "Ensure scaler_dict is passed to initialize_cycle_branch()."
+        )
+    
+    # Detect scaler format for debug
+    sample_entry = next(iter(scaler_dict.values()))
+    scaler_format = "dict" if isinstance(sample_entry, dict) else "legacy"
+    print(f"  Scaler format detected: {scaler_format}")
+    
+    if scaler_format == "dict":
+        keys = list(sample_entry.keys())
+        print(f"    Dict keys: {keys}")
+        if 'non_ops_indices' in sample_entry:
+            print(f"    non_ops_indices len: {len(sample_entry['non_ops_indices'])}")
+            print(f"    ops_indices len: {len(sample_entry.get('ops_indices', []))}")
+    
+    # Extract stats - this will raise ValueError on failure (no silent fallback)
+    cycle_target_mean, cycle_target_std = extract_cycle_target_stats(
+        scaler_dict=scaler_dict,
+        feature_cols=feature_cols,
+        target_indices=target_indices,
+        num_conditions=num_conditions,
+    )
+    cycle_target_mean = cycle_target_mean.to(device)
+    cycle_target_std = cycle_target_std.to(device)
+    
+    # C1 Debug: Print extracted stats
+    print(f"  ✓ Extracted cycle target stats: shape=({cycle_target_mean.shape})")
+    for c in range(min(3, num_conditions)):  # Show first 3 conditions
+        print(f"    Cond {c} μ: {[f'{cycle_target_mean[c, i].item():.1f}' for i in range(cycle_target_mean.shape[-1])]}")
+        print(f"    Cond {c} σ: {[f'{cycle_target_std[c, i].item():.1f}' for i in range(cycle_target_std.shape[-1])]}")
+    
+    # Validate non-identity (double-check C1 contract)
+    mu_abs = cycle_target_mean.abs().mean().item()
+    sigma_mean = cycle_target_std.mean().item()
+    print(f"    μ_abs_mean={mu_abs:.1f}, σ_mean={sigma_mean:.1f}")
+    if mu_abs < 10 or sigma_mean < 2:
+        print(f"    ⚠️ WARNING: Stats may be too small for typical cycle targets!")
+    else:
+        print(f"    ✓ Stats validated (non-identity)")
+
     
     # 8. Initialize loss function with scaler stats
     loss_fn = CycleBranchLoss(
