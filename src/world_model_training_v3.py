@@ -1924,7 +1924,7 @@ def train_world_model_universal_v3(
                                     scaler_stats=scaler_stats,
                                     sensor_names=cycle_cfg.targets,
                                     epoch=epoch,
-                                    step=global_step,
+                                    step=batch_idx,
                                     config=thermo_config,
                                 )
 
