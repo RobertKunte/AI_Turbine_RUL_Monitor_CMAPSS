@@ -111,6 +111,60 @@ except ImportError:
     RISK_METRICS_AVAILABLE = False
 
 
+def apply_condition_scaling(
+    X: np.ndarray,
+    scaler_entry: any,
+    feature_cols: List[str],
+) -> np.ndarray:
+    """Apply scaling using either legacy StandardScaler or new dict format.
+    
+    Handles two scaler formats:
+    - Legacy: scaler_entry is a StandardScaler
+    - New: scaler_entry = {'features': StandardScaler, 'ops': MinMaxScaler,
+                           'non_ops_indices': [...], 'ops_indices': [...]}
+    
+    Args:
+        X: Input array of shape (N, F) where F = len(feature_cols)
+        scaler_entry: Either StandardScaler or dict with scalers
+        feature_cols: List of feature column names
+        
+    Returns:
+        X_scaled: Scaled array of same shape as X
+    """
+    if isinstance(scaler_entry, dict):
+        # New dict format with separate ops/features scalers
+        features_scaler = scaler_entry.get('features')
+        ops_scaler = scaler_entry.get('ops')
+        non_ops_indices = scaler_entry.get('non_ops_indices', [])
+        ops_indices = scaler_entry.get('ops_indices', [])
+        
+        if features_scaler is None:
+            raise ValueError(
+                f"[apply_condition_scaling] Dict format but missing 'features' key. "
+                f"Keys: {list(scaler_entry.keys())}"
+            )
+        
+        X_scaled = np.empty_like(X, dtype=np.float32)
+        
+        # Scale non-ops features
+        if len(non_ops_indices) > 0:
+            X_non_ops = X[:, non_ops_indices]
+            X_scaled[:, non_ops_indices] = features_scaler.transform(X_non_ops)
+        
+        # Scale ops features (if ops_scaler exists)
+        if len(ops_indices) > 0 and ops_scaler is not None:
+            X_ops = X[:, ops_indices]
+            X_scaled[:, ops_indices] = ops_scaler.transform(X_ops)
+        elif len(ops_indices) > 0:
+            # No ops_scaler, keep original values
+            X_scaled[:, ops_indices] = X[:, ops_indices]
+        
+        return X_scaled
+    else:
+        # Legacy format: scaler_entry is StandardScaler directly
+        return scaler_entry.transform(X)
+
+
 def train_world_model_universal_v3(
     df_train: pd.DataFrame,
     df_test: pd.DataFrame,
@@ -2695,9 +2749,10 @@ def train_world_model_universal_v3(
                     for cond in np.unique(built_val["cond_ids"]):
                         cond = int(cond)
                         idxs = np.where(built_val["cond_ids"] == cond)[0]
-                        scaler = scaler_dict.get(cond, scaler_dict.get(0))
+                        scaler_entry = scaler_dict.get(cond, scaler_dict.get(0))
                         flat = X_val_quick[idxs].reshape(-1, len(feature_cols))
-                        X_val_scaled_quick[idxs] = scaler.transform(flat).reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
+                        scaled_flat = apply_condition_scaling(flat, scaler_entry, feature_cols)
+                        X_val_scaled_quick[idxs] = scaled_flat.reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
                     
                     X_val_t_quick = torch.tensor(X_val_scaled_quick, dtype=torch.float32).to(device)
                     cond_val_t_quick = torch.tensor(built_val["cond_ids"], dtype=torch.long).to(device) if num_conditions > 1 else None
@@ -2874,9 +2929,10 @@ def train_world_model_universal_v3(
         for cond in np.unique(cond_ids):
             cond = int(cond)
             idxs = np.where(cond_ids == cond)[0]
-            scaler = scaler_dict.get(cond, scaler_dict.get(0))
+            scaler_entry = scaler_dict.get(cond, scaler_dict.get(0))
             flat = X[idxs].reshape(-1, len(feature_cols))
-            X_scaled[idxs] = scaler.transform(flat).reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
+            scaled_flat = apply_condition_scaling(flat, scaler_entry, feature_cols)
+            X_scaled[idxs] = scaled_flat.reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
 
         X_t = torch.tensor(X_scaled, dtype=torch.float32).to(device)
         cond_t = torch.tensor(cond_ids, dtype=torch.long).to(device) if num_conditions > 1 else None
@@ -6440,9 +6496,10 @@ def evaluate_world_model_v3_eol(
     for cond in np.unique(cond_ids_np):
         cond = int(cond)
         idxs = np.where(cond_ids_np == cond)[0]
-        scaler = scaler_dict.get(cond, scaler_dict.get(0))
+        scaler_entry = scaler_dict.get(cond, scaler_dict.get(0))
         flat = X[idxs].reshape(-1, len(feature_cols))
-        X_scaled[idxs] = scaler.transform(flat).reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
+        scaled_flat = apply_condition_scaling(flat, scaler_entry, feature_cols)
+        X_scaled[idxs] = scaled_flat.reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
 
     X_t = torch.tensor(X_scaled, dtype=torch.float32).to(device)
     cond_t = torch.tensor(cond_ids_np, dtype=torch.long).to(device) if num_conditions > 1 else None
@@ -6514,9 +6571,10 @@ def evaluate_world_model_v3_eol(
         for cond in np.unique(cond_ids_all):
             cond = int(cond)
             idxs = np.where(cond_ids_all == cond)[0]
-            scaler = scaler_dict.get(cond, scaler_dict.get(0))
+            scaler_entry = scaler_dict.get(cond, scaler_dict.get(0))
             flat = X_all[idxs].reshape(-1, len(feature_cols))
-            X_all_scaled[idxs] = scaler.transform(flat).reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
+            scaled_flat = apply_condition_scaling(flat, scaler_entry, feature_cols)
+            X_all_scaled[idxs] = scaled_flat.reshape(-1, int(past_len), len(feature_cols)).astype(np.float32)
 
         X_all_t = torch.tensor(X_all_scaled, dtype=torch.float32).to(device)
         cond_all_t = torch.tensor(cond_ids_all, dtype=torch.long).to(device) if num_conditions > 1 else None
